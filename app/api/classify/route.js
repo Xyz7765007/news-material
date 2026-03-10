@@ -211,17 +211,24 @@ async function dedupTasks(taskGroups) {
       const completion = await openai.chat.completions.create({
         model: "gpt-4.1-mini",
         temperature: 0,
-        max_tokens: 300,
+        max_tokens: 600,
         messages: [
-          { role: "system", content: `You are a deduplication engine. Given a list of B2B signal tasks for the same company, identify which ones are semantically duplicated (same underlying event/signal described differently). Return ONLY a JSON object: {"keep": [0, 2, 5], "removed": [{"idx": 1, "duplicate_of": 0, "reason": "same hiring event"}]}. Keep the task with the highest score when merging duplicates. ONLY remove true duplicates where the underlying real-world event is the same.` },
+          { role: "system", content: `You are a deduplication engine. Given a list of B2B signal tasks for the same company, identify which ones are semantically duplicated (same underlying event/signal described differently). Return ONLY a JSON object: {"keep": [0, 2, 5]}. Keep the task with the highest score when merging duplicates. ONLY remove true duplicates where the underlying real-world event is the same. No markdown.` },
           { role: "user", content: `Company: ${group.company}\n\nTasks:\n${taskList}` }
         ],
       });
 
       const text = completion.choices[0]?.message?.content || "{}";
       const cleaned = text.replace(/```json\n?|```/g, "").trim();
-      const data = JSON.parse(cleaned);
-      const keepIdxs = data.keep || group.tasks.map((_, i) => i);
+      let keepIdxs;
+      try {
+        const data = JSON.parse(cleaned);
+        keepIdxs = data.keep || group.tasks.map((_, i) => i);
+      } catch (_) {
+        // Try extracting keep array from truncated JSON
+        const m = cleaned.match(/\[[\d,\s]+\]/);
+        keepIdxs = m ? JSON.parse(m[0]) : group.tasks.map((_, i) => i);
+      }
       results.push(...keepIdxs.map(i => group.tasks[i]?.idx).filter(i => i !== undefined));
     } catch (e) {
       console.error("AI dedup error for", group.company, ":", e.message);

@@ -540,7 +540,7 @@ export default function SignalScope() {
       const scores=sig.relevanceScores||{};
       for(const tid of(sig.matchedTaskIds||[])){
         const td=taskDefs.find(t=>t.id===tid);if(!td)continue;
-        const score=scores[tid]||Math.round((sig.confidence||0.7)*100)||50;
+        const score=Math.max(0,Math.min(100,parseInt(scores[tid]||Math.round((sig.confidence||0.7)*100))||50));
         if(score<threshold)continue;
         const newTask={Company:company.name,"Task Rule":td.name,Score:score,"Scan Target":td.scanTarget||"accounts",Signal:sig.headline||"",Source:sig.source||"",URL:sig.url||"","Task Type":sig.taskType||"news",Date:sig.date?sig.date.slice(0,10):new Date().toISOString().slice(0,10),Created:new Date().toISOString()};
         // Instant dedup: fingerprint + URL + fuzzy against existing + buffer

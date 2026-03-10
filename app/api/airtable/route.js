@@ -65,8 +65,21 @@ async function listRecords(baseId, table, params = {}) {
 // Cache to avoid re-checking fields on every write within the same request
 const _ensuredFieldsCache = new Map(); // key: baseId+table, value: Set of field names
 
+// Known field type overrides — autoEnsure uses these instead of defaulting to singleLineText
+const FIELD_TYPE_MAP = {
+  "Score": { type: "number", options: { precision: 0 } },
+  "Top N": { type: "number", options: { precision: 0 } },
+  "URL": { type: "url" },
+  "Description": { type: "multilineText" },
+  "Scoring Prompt": { type: "multilineText" },
+  "Scoring Fields": { type: "multilineText" },
+  "Keywords": { type: "multilineText" },
+  "Job Title Keywords": { type: "multilineText" },
+  "Signal": { type: "multilineText" },
+  "Tables": { type: "multilineText" },
+};
+
 async function autoEnsureFields(baseId, table, records) {
-  // Extract all field names from the records being written
   const fieldNames = new Set();
   for (const r of records) {
     const fields = r.fields || r;
@@ -81,8 +94,15 @@ async function autoEnsureFields(baseId, table, records) {
   const toEnsure = [...fieldNames].filter(f => !cached.has(f));
   if (!toEnsure.length) return;
 
+  // Build field defs with correct types
+  const fieldDefs = toEnsure.map(name => {
+    const override = FIELD_TYPE_MAP[name];
+    if (override) return { name, ...override };
+    return { name, type: "singleLineText" };
+  });
+
   try {
-    await ensureCustomFields(baseId, table, toEnsure);
+    await ensureCustomFields(baseId, table, fieldDefs);
     toEnsure.forEach(f => cached.add(f));
     _ensuredFieldsCache.set(cacheKey, cached);
   } catch (e) {
@@ -497,25 +517,25 @@ async function runTopXScoring(baseId, rule) {
 
     try {
       const openai = new OpenAI({ apiKey: OPENAI_KEY });
-      const BATCH = 10;
+      const BATCH = 5; // smaller batches to avoid token truncation
       for (let i = 0; i < candidates.length; i += BATCH) {
         const batch = candidates.slice(i, i + BATCH);
         const recordSummaries = batch.map((item, idx) => {
           const f = item.record.fields || {};
           const dataStr = Object.entries(f)
             .filter(([_, v]) => v !== null && v !== undefined && v !== "")
-            .map(([k, v]) => `${k}: ${String(v).slice(0, 200)}`)
+            .map(([k, v]) => `${k}: ${String(v).slice(0, 150)}`)
             .join(" | ");
-          return `[${idx}] ${item.name} — ${dataStr} — Numeric Score: ${item.numericScore}/100`;
+          return `[${idx}] ${item.name} — ${dataStr}`;
         }).join("\n");
 
         const completion = await openai.chat.completions.create({
           model: "gpt-4.1-mini",
           temperature: 0.2,
-          max_tokens: 800,
+          max_tokens: 2048,
           messages: [
-            { role: "system", content: `You are a B2B lead/account scoring engine. Score each record from 0-100 based on the user's criteria. Consider ALL the data provided for each record, including the numeric fields and any other context. Return ONLY a JSON array of objects: [{"idx": 0, "score": 85, "reason": "brief 1-line reason"}, ...]. One entry per record, same order as input. No markdown, no backticks.` },
-            { role: "user", content: `Scoring Criteria:\n${scoringPrompt}\n\nScoring Fields (weighted): ${scoringFields.map(sf => `${sf.field} (${sf.weight}%)`).join(", ")}\n\nRecords:\n${recordSummaries}` }
+            { role: "system", content: `You are a B2B lead/account scoring engine. Score each record from 0-100 based on the user's criteria. Consider ALL data provided. Return ONLY a JSON array: [{"idx":0,"score":85,"reason":"max 15 words"},...]. Keep reasons under 15 words. One entry per record. No markdown.` },
+            { role: "user", content: `Scoring Criteria:\n${scoringPrompt}\n\n${scoringFields.length > 0 ? "Scoring Fields (weighted): " + scoringFields.map(sf => sf.field + " (" + sf.weight + "%)").join(", ") + "\n\n" : ""}Records:\n${recordSummaries}` }
           ],
         });
 
@@ -526,11 +546,26 @@ async function runTopXScoring(baseId, rule) {
           for (const as of aiScores) {
             if (as.idx !== undefined && as.score !== undefined && batch[as.idx]) {
               batch[as.idx].aiScore = Math.max(0, Math.min(100, Math.round(as.score)));
-              batch[as.idx].aiReason = as.reason || "";
+              batch[as.idx].aiReason = (as.reason || as.tier || "").slice(0, 100);
             }
           }
-        } catch (e) {
-          console.error("AI scoring parse error:", e.message);
+        } catch (parseErr) {
+          // Attempt to recover truncated JSON — extract what we can
+          console.warn("AI scoring parse error, attempting recovery:", parseErr.message);
+          try {
+            // Find all complete objects in truncated JSON
+            const objMatches = cleaned.matchAll(/\{"idx"\s*:\s*(\d+)\s*,\s*"score"\s*:\s*(\d+)/g);
+            for (const m of objMatches) {
+              const idx = parseInt(m[1]);
+              const score = parseInt(m[2]);
+              if (batch[idx]) {
+                batch[idx].aiScore = Math.max(0, Math.min(100, score));
+                batch[idx].aiReason = "AI scored (partial recovery)";
+              }
+            }
+          } catch (recoveryErr) {
+            console.error("AI scoring recovery also failed:", recoveryErr.message);
+          }
         }
       }
 
@@ -561,20 +596,25 @@ async function runTopXScoring(baseId, rule) {
 
   scored.sort((a, b) => b.compositeScore - a.compositeScore);
   const fieldList = scoringFields.map(sf => sf.field).join(", ");
-  const tasks = scored.slice(0, topN).map(item => ({
-    Company: item.name,
-    "Task Rule": rule.name || "Top X",
-    Score: item.compositeScore,
-    "Scan Target": scanTarget,
-    Signal: useAI && item.aiReason
-      ? `AI: ${item.aiReason} (numeric: ${item.numericScore}, AI: ${item.aiScore})`
-      : `Top ${topN} by weighted score (${fieldList})`,
-    Source: useAI ? "Top X + AI Scoring" : "Top X Scoring",
-    URL: "",
-    "Task Type": "top_x",
-    Date: new Date().toISOString().slice(0, 10),
-    Created: new Date().toISOString(),
-  }));
+  const tasks = scored.slice(0, topN).map(item => {
+    const score = parseInt(item.compositeScore) || 0;
+    const aiScore = parseInt(item.aiScore) || 0;
+    const numScore = parseInt(item.numericScore) || 0;
+    return {
+      Company: item.name,
+      "Task Rule": rule.name || "Top X",
+      Score: Math.max(0, Math.min(100, score)),
+      "Scan Target": scanTarget,
+      Signal: useAI && item.aiReason
+        ? `AI: ${item.aiReason} (numeric: ${numScore}, AI: ${aiScore})`
+        : `Top ${topN} by weighted score${fieldList ? " (" + fieldList + ")" : ""}`,
+      Source: useAI ? "Top X + AI Scoring" : "Top X Scoring",
+      URL: "",
+      "Task Type": "top_x",
+      Date: new Date().toISOString().slice(0, 10),
+      Created: new Date().toISOString(),
+    };
+  });
   return { tasks, totalRecords: records.length, topN, aiScored: !!useAI };
 }
 
