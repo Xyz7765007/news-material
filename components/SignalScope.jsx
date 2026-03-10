@@ -1059,8 +1059,17 @@ function RuleEditor({rule,onSave,onClose,availableFields}){
   {/* AI Scoring Prompt */}
   <div style={{padding:14,border:"1px solid rgba(191,163,90,.2)",borderRadius:8,background:"rgba(191,163,90,.03)"}}>
     <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}><span>🧠</span><span style={{fontSize:11,fontWeight:600,color:"var(--acc)"}}>AI SCORING PROMPT</span><span style={{fontSize:9,color:"var(--t3)",fontWeight:400}}>{f.scoringFields.length>0?"(optional)":"(required without scoring fields)"}</span></div>
-    <div style={{fontSize:10,color:"var(--t3)",marginBottom:8,lineHeight:1.5}}>AI reads ALL fields on each record (not just scoring fields) and scores 0-100 based on your criteria. You can use this alone (pure AI scoring) or alongside weighted fields (blended 40% numeric + 60% AI).</div>
-    <textarea className="inp ta" value={f.scoringPrompt} onChange={e=>sF(p=>({...p,scoringPrompt:e.target.value}))} placeholder="e.g. Score leads 0-100 based on how likely they are to need our marketing automation product. Prioritize companies with large marketing teams (50+), active hiring in marketing ops, and mid-market size (200-2000 employees). Penalize companies that are too small (<50) or enterprise (>10000)." style={{minHeight:80,fontSize:11,background:"var(--card)"}}/>
+    <div style={{fontSize:10,color:"var(--t3)",marginBottom:8,lineHeight:1.6}}>
+      Describe your scoring criteria in plain language. AI reads ALL fields on each record and scores 0-100. You can use this alone (pure AI scoring) or alongside weighted fields (blended 40% numeric + 60% AI).
+    </div>
+    <div style={{fontSize:10,color:"var(--t3)",marginBottom:10,lineHeight:1.6,padding:10,background:"var(--hover)",borderRadius:6}}>
+      <div style={{fontWeight:600,color:"var(--t2)",marginBottom:4}}>📋 Prompt format guide</div>
+      <div style={{marginBottom:4}}>Your prompt should describe <strong style={{color:"var(--t2)"}}>what makes a lead/account high-priority vs low-priority</strong>. The AI will return a score (0-100) and a short reason for each record.</div>
+      <div style={{marginBottom:4}}>✅ <strong style={{color:"var(--t2)"}}>Do:</strong> Define scoring tiers (e.g. 80-100 = hot, 60-79 = warm), reference specific fields (e.g. "prioritize marketing team size &gt; 50"), include override rules.</div>
+      <div style={{marginBottom:4}}>❌ <strong style={{color:"var(--t2)"}}>Don't:</strong> Ask AI to return custom JSON, custom formatting, or multi-field outputs. The system handles the output format — just describe your criteria.</div>
+      <div>💡 <strong style={{color:"var(--t2)"}}>Tip:</strong> The more specific you are about thresholds and weights, the more consistent the scores. E.g. "Score 90+ if ACV &gt; 8 AND relevance &gt; 7" beats "score high if they look good".</div>
+    </div>
+    <textarea className="inp ta" value={f.scoringPrompt} onChange={e=>sF(p=>({...p,scoringPrompt:e.target.value}))} placeholder={"Score leads 0-100 based on fit for our product.\n\nScoring tiers:\n• 80-100: High ACV (7+), strong relevance (7+), large teams\n• 60-79: Moderate ACV, good relevance, mid-size teams\n• 40-59: Mixed signals, worth nurturing\n• Below 40: Weak fit, deprioritize\n\nOverride: If relevance < 3, cap at 30. If ACV > 8 AND relevance > 7, add +10 bonus."} style={{minHeight:100,fontSize:11,background:"var(--card)"}}/>
   </div>
   </>)}
 
@@ -1118,13 +1127,23 @@ function ExportModal({ tasks, accounts, leads, onClose }) {
     return true;
   });
 
-  // Lookup maps for enrichment — match by company name (lowercase)
+  // Lookup maps for enrichment — multi-key to handle both account and lead-targeted tasks
+  // For lead-targeted Top X: task.Company = lead's Name (person name)
+  // For account-targeted scans: task.Company = account's Name (company name)
   const acctMap = {};
-  (accounts || []).forEach(a => { const n = (a.fields?.Name || "").toLowerCase().trim(); if (n) acctMap[n] = a.fields; });
-  const leadMap = {};
+  (accounts || []).forEach(a => {
+    const n = (a.fields?.Name || "").toLowerCase().trim();
+    if (n) acctMap[n] = a.fields;
+  });
+
+  // Lead lookup by BOTH Name (person) and Company - so we match regardless of what task.Company contains
+  const leadByName = {};
+  const leadByCompany = {};
   (leads || []).forEach(l => {
-    const n = (l.fields?.Company || l.fields?.Name || "").toLowerCase().trim();
-    if (n) { if (!leadMap[n]) leadMap[n] = l.fields; }
+    const name = (l.fields?.Name || "").toLowerCase().trim();
+    const company = (l.fields?.Company || "").toLowerCase().trim();
+    if (name) leadByName[name] = l.fields;
+    if (company && !leadByCompany[company]) leadByCompany[company] = l.fields;
   });
 
   const allExportCols = [...selectedCols, ...enrichAcct.map(c => "Acct: " + c), ...enrichLead.map(c => "Lead: " + c)];
@@ -1136,8 +1155,14 @@ function ExportModal({ tasks, accounts, leads, onClose }) {
     filteredTasks.forEach(t => {
       const f = t.fields || {};
       const co = (f.Company || "").toLowerCase().trim();
-      const ad = acctMap[co] || {};
-      const ld = leadMap[co] || {};
+
+      // Try matching lead by name first (Top X on leads), then by company
+      const ld = leadByName[co] || leadByCompany[co] || {};
+
+      // Try matching account directly, or chain via lead's Company field
+      const leadCompany = (ld.Company || "").toLowerCase().trim();
+      const ad = acctMap[co] || (leadCompany ? acctMap[leadCompany] : {}) || {};
+
       const row = allExportCols.map(c => {
         if (c.startsWith("Acct: ")) return String(ad[c.slice(6)] || "");
         if (c.startsWith("Lead: ")) return String(ld[c.slice(6)] || "");

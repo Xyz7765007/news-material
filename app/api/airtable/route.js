@@ -549,7 +549,7 @@ async function runTopXScoring(baseId, rule) {
   });
 
   // ─── Step 2: AI scoring (only if prompt provided + OpenAI key) ──
-  // Pre-sort by numeric score, only AI-score top candidates (3x topN)
+  const hasNumeric = scoringFields.length > 0;
   let useAI = scoringPrompt && OPENAI_KEY;
   if (useAI) {
     scored.sort((a, b) => b.numericScore - a.numericScore);
@@ -614,8 +614,35 @@ async function runTopXScoring(baseId, rule) {
         }
       }
 
+      // Retry any unscored candidates individually (handles batch parse failures)
+      const unscored = candidates.filter(item => item.aiScore === undefined);
+      if (unscored.length > 0 && unscored.length <= 20) {
+        console.log(`Retrying ${unscored.length} unscored records individually`);
+        for (const item of unscored) {
+          try {
+            const f = item.record.fields || {};
+            const dataStr = Object.entries(f)
+              .filter(([_, v]) => v !== null && v !== undefined && v !== "")
+              .map(([k, v]) => `${k}: ${String(v).slice(0, 200)}`)
+              .join(" | ");
+            const retry = await openai.chat.completions.create({
+              model: "gpt-4.1-mini", temperature: 0.2, max_tokens: 200,
+              messages: [
+                { role: "system", content: `Score this B2B lead/account from 0-100. Return ONLY: {"score":85,"reason":"max 15 words"}` },
+                { role: "user", content: `Criteria:\n${scoringPrompt}\n\nRecord: ${item.name} — ${dataStr}` }
+              ],
+            });
+            const rt = (retry.choices[0]?.message?.content || "").replace(/```json\n?|```/g, "").trim();
+            const rd = JSON.parse(rt);
+            if (rd.score !== undefined) {
+              item.aiScore = Math.max(0, Math.min(100, Math.round(rd.score)));
+              item.aiReason = (rd.reason || rd.tier || "").slice(0, 100);
+            }
+          } catch (e) { /* individual retry failed, keep unscored */ }
+        }
+      }
+
       // Final score: if numeric fields exist, blend 40% numeric + 60% AI. Otherwise pure AI.
-      const hasNumeric = scoringFields.length > 0;
       for (const item of candidates) {
         if (item.aiScore !== undefined) {
           item.compositeScore = hasNumeric
@@ -650,9 +677,11 @@ async function runTopXScoring(baseId, rule) {
       "Task Rule": rule.name || "Top X",
       Score: Math.max(0, Math.min(100, score)),
       "Scan Target": scanTarget,
-      Signal: useAI && item.aiReason
-        ? `AI: ${item.aiReason} (numeric: ${numScore}, AI: ${aiScore})`
-        : `Top ${topN} by weighted score${fieldList ? " (" + fieldList + ")" : ""}`,
+      Signal: item.aiReason
+        ? `AI: ${item.aiReason} (${hasNumeric ? "numeric: " + numScore + ", " : ""}AI: ${aiScore})`
+        : hasNumeric
+          ? `Ranked by weighted score${fieldList ? " (" + fieldList + ")" : ""}: ${numScore}/100`
+          : `AI score pending — record included by position`,
       Source: useAI ? "Top X + AI Scoring" : "Top X Scoring",
       URL: "",
       "Task Type": "top_x",
