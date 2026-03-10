@@ -320,56 +320,59 @@ async function classify(signals, taskDefs, companyName, mode) {
     }).join("\n\n");
 
   const prompt = mode === "jobs"
-    ? `You evaluate job postings against signal task definitions. Be EXTREMELY strict.
+    ? `You evaluate job postings against signal task definitions. Be precise and accurate.
 
-HARD RULES — violating any one of these means score 0, do NOT include:
-1. THE JOB TITLE IS THE PRIMARY GATE. If the title doesn't match the role type, REJECT regardless of description.
-   - "Temporary Manager, Compensation" is NOT an "Interim CMO" — it's an HR/comp role
-   - "Marketing Coordinator" is NOT a "Senior marketing leadership hire"
-   - "SEO Manager" is NOT a "Marketing Transformation / AI Marketing" role unless AI/transformation is in the title
-   - Only score 70+ if the JOB TITLE itself contains the target role keywords
-2. Seniority must match. Junior/mid roles CANNOT match senior/executive signals.
-   - Manager ≠ Director ≠ VP ≠ C-level. Don't stretch across 2+ levels.
-3. Department must match. Compensation/HR/Operations/Finance roles are NEVER marketing roles.
-4. "Temporary" or "Contract" in a NON-marketing role does NOT make it an "Interim CMO" match.
-5. Use each task's ScoringCriteria as the definitive guide. If the criteria says "score below 50 if X" — enforce it.
+Your job is to find REAL matches. Most batches will have at least a few matches — if you're returning empty for everything, you're being too cautious.
 
-Score strictly: 90-100 only for exact title+seniority match. 70-89 for strong adjacent match. Below 70 = do NOT include.
+MATCHING RULES:
+1. The JOB TITLE is the primary signal. It should align with the role type the task describes.
+   - Exact title match (e.g. "CMO" for "CMO opening") → score 90-100
+   - Strong adjacent match (e.g. "VP Marketing" for "CMO opening") → score 70-89
+   - Related but weaker (e.g. "Marketing Director" for "CMO opening") → score 50-69
+2. Seniority should roughly match. Don't stretch 2+ levels (Coordinator → CMO).
+3. Department must be relevant. HR/Compensation/Finance roles are NOT marketing roles.
+4. Use each task's ScoringCriteria when provided — it defines what scores high vs low.
+
+COMMON MISTAKES TO AVOID (score below 40 for these):
+- "Temporary Manager, Compensation" matching "Interim CMO" — wrong department entirely
+- "SEO Specialist" matching "Marketing Transformation / AI Marketing" — wrong specialization
+- Junior coordinator roles matching C-level signals
+
 Return ONLY JSON array: [{"newsIndex":0,"matches":[{"taskId":"j1","relevanceScore":85}]}]
-Omit signals with zero matches or all scores below 70. No markdown.`
-    : `You evaluate news articles against signal task definitions for company "${companyName}". Be EXTREMELY strict.
+Include matches scoring 50+. Omit only truly unrelated signals. No markdown.`
+    : `You evaluate news articles against signal task definitions for company "${companyName}". Be precise and accurate.
 
-HARD RULES — violating any one of these means score 0, do NOT include:
-1. SUBJECT MUST MATCH THE SIGNAL TYPE:
-   - "Senior marketer exits" — the person MUST be a marketer (CMO, VP Marketing, etc). A robotics leader, engineer, or CEO is NOT a marketer.
-   - "New non-traditional entrants" — the article must be about a NEW company threatening ${companyName}'s market, NOT about ${companyName} doing something new. ${companyName} is the INCUMBENT being threatened.
-   - "Executive speaking on effectiveness" — must be about a speaking engagement on effectiveness/ROI, not any executive mention.
-2. THE ARTICLE MUST DESCRIBE THE ACTUAL EVENT, not just share keywords:
-   - A company launching a product ≠ "brand repositioning"
-   - A partnership ≠ a "new entrant threatening" the incumbent
-   - An executive making any statement ≠ "publicly reframes success metrics"
-3. DIRECTION MATTERS:
-   - For "entrant" signals: the subject must be the NEW entrant, not the incumbent
-   - For "exit" signals: the subject must be LEAVING, not joining
-   - For "outperform" signals: emerging markets must actually outperform, not just grow
-4. REJECT DUPLICATES: If two articles cover the exact same event, only match the first one.
-5. Use each task's ScoringCriteria as the definitive guide. Enforce rejection criteria aggressively.
-6. When in doubt: DO NOT MATCH. Returning zero matches is often the correct answer.
+Your job is to find REAL matches. Real signals DO exist and should be surfaced. If an article genuinely describes the event a task is tracking, MATCH IT confidently.
 
-Score strictly: 90-100 for direct explicit match. 70-89 for strong match. Below 70 = do NOT include.
+MATCHING RULES:
+1. The article should describe the SPECIFIC type of event the task tracks:
+   - "Reckitt earnings: emerging markets lead growth" matches "Emerging markets outperform core" → 90+
+   - "CMO steps down after 10 months" matches "Senior marketer exits within 12 months" → 90+
+   - "Company X launches agency review" matches "Agency review or consolidation" → 90+
+2. The subject/person/company must be in the right role relative to the signal:
+   - For "exits" — the person leaving must be the TYPE of executive the task describes (marketer, not engineer)
+   - For "new entrants" — the article is about a company entering ${companyName}'s market to compete, not about ${companyName} itself
+3. Score 70+ for strong matches, 50-69 for partial/indirect, below 50 for weak.
+
+COMMON MISTAKES TO AVOID (score below 40 for these):
+- A non-marketer (robotics leader, engineer) matched to "senior marketer exits"
+- The incumbent (${companyName}) doing something new matched to "new non-traditional entrants"
+- A partnership matched to "new entrant threatening" the incumbent
+- Generic company news that just shares a keyword
+
 Return ONLY JSON array: [{"newsIndex":0,"matches":[{"taskId":"n1","relevanceScore":85}]}]
-Omit signals with zero matches or all scores below 70. No markdown.`;
+Include matches scoring 50+. Omit only truly unrelated signals. No markdown.`;
 
   try {
     const c = await openai.chat.completions.create({
-      model: "gpt-4.1", temperature: 0.1, max_tokens: 3000,
+      model: "gpt-4.1-mini", temperature: 0.15, max_tokens: 3000,
       messages: [
         { role: "system", content: prompt },
         { role: "user", content: `Company: ${companyName}\n\nSignals:\n${signalList}\n\nTasks:\n${taskList}` },
       ],
     });
     const text = c.choices[0]?.message?.content || "[]";
-    console.log(`  [CLASSIFY] Raw AI response (${mode}): ${text.slice(0, 300)}`);
+    console.log(`  [CLASSIFY-RAW] ${mode} for ${companyName}: ${text.slice(0, 500)}`);
     let cls; try { cls = JSON.parse(text.replace(/```json\n?|```/g, "").trim()); } catch { const m = text.match(/\[[\s\S]*\]/); cls = m ? JSON.parse(m[0]) : []; }
     if (!Array.isArray(cls)) return [];
     const valid = new Set(taskDefs.map(t => t.id));
@@ -384,8 +387,7 @@ Omit signals with zero matches or all scores below 70. No markdown.`;
       // Handle new format: { matches: [{ taskId, relevanceScore }] }
       if (entry.matches?.length) {
         for (const m of entry.matches) {
-          // Enforce minimum 70 — anything below is noise
-          if (valid.has(m.taskId) && m.relevanceScore >= 70) {
+          if (valid.has(m.taskId) && m.relevanceScore >= 50) {
             matchedIds.push(m.taskId);
             scores[m.taskId] = Math.min(100, Math.max(0, m.relevanceScore));
           }
@@ -394,7 +396,7 @@ Omit signals with zero matches or all scores below 70. No markdown.`;
       // Handle old format: { matchedTaskIds: [...], confidence: 0.85 }
       else if (entry.matchedTaskIds?.length) {
         const confScore = Math.round((entry.confidence || 0.7) * 100);
-        if (confScore >= 70) {
+        if (confScore >= 50) {
           for (const id of entry.matchedTaskIds) {
             if (valid.has(id)) {
               matchedIds.push(id);
@@ -413,8 +415,8 @@ Omit signals with zero matches or all scores below 70. No markdown.`;
 
     // Log summary
     const matched = result.filter(s => s.matchedTaskIds.length > 0);
-    const dropped = cls.filter(x => x.matches?.some(m => m.relevanceScore > 0 && m.relevanceScore < 70));
-    console.log(`  [SUMMARY] ${signals.length} signals → ${matched.length} matched, ${dropped.length} dropped (score < 70)`);
+    const dropped = cls.filter(x => x.matches?.some(m => m.relevanceScore > 0 && m.relevanceScore < 50));
+    console.log(`  [SUMMARY] ${signals.length} signals → ${matched.length} matched, ${dropped.length} dropped (score < 50)`);
 
     return result;
   } catch (e) {
