@@ -306,10 +306,10 @@ async function classify(signals, taskDefs, companyName, mode) {
   const taskList = taskDefs
     .map(t => {
       let entry = `ID:"${t.id}" | "${t.name}" | Keywords:[${(t.keywords || []).join(", ")}]`;
-      if (t.jobTitleKeywords) entry += ` | JobTitles:[${t.jobTitleKeywords.join(", ")}]`;
-      if (t.scoringPrompt) entry += `\n    ScoringCriteria: ${t.scoringPrompt}`;
+      if (t.jobTitleKeywords?.length) entry += ` | RequiredJobTitles:[${t.jobTitleKeywords.join(", ")}]`;
+      if (t.scoringPrompt) entry += `\n    ScoringCriteria: ${t.scoringPrompt.slice(0, 600)}`;
       return entry;
-    }).join("\n");
+    }).join("\n\n");
 
   const signalList = signals
     .map((n, i) => {
@@ -320,36 +320,49 @@ async function classify(signals, taskDefs, companyName, mode) {
     }).join("\n\n");
 
   const prompt = mode === "jobs"
-    ? `You evaluate job postings against signal task definitions and score their relevance.
+    ? `You evaluate job postings against signal task definitions. Be EXTREMELY strict.
 
-For each signal, check ALL tasks. If a signal matches a task, score it 0-100:
-- 90-100: Exact match (e.g. "CMO" posting matches "CMO opening" task)
-- 70-89: Strong match (e.g. "VP Marketing" matches "CMO opening" task)
-- 50-69: Partial match (e.g. "Marketing Manager" matches "CMO opening" task)
-- 30-49: Weak match (e.g. "Digital Marketing Specialist" matches "CMO opening" task)
-- 0-29: Not relevant
+HARD RULES — violating any one of these means score 0, do NOT include:
+1. THE JOB TITLE IS THE PRIMARY GATE. If the title doesn't match the role type, REJECT regardless of description.
+   - "Temporary Manager, Compensation" is NOT an "Interim CMO" — it's an HR/comp role
+   - "Marketing Coordinator" is NOT a "Senior marketing leadership hire"
+   - "SEO Manager" is NOT a "Marketing Transformation / AI Marketing" role unless AI/transformation is in the title
+   - Only score 70+ if the JOB TITLE itself contains the target role keywords
+2. Seniority must match. Junior/mid roles CANNOT match senior/executive signals.
+   - Manager ≠ Director ≠ VP ≠ C-level. Don't stretch across 2+ levels.
+3. Department must match. Compensation/HR/Operations/Finance roles are NEVER marketing roles.
+4. "Temporary" or "Contract" in a NON-marketing role does NOT make it an "Interim CMO" match.
+5. Use each task's ScoringCriteria as the definitive guide. If the criteria says "score below 50 if X" — enforce it.
 
-Use each task's ScoringCriteria if provided. If not provided, score based on job title, keywords, seniority, and description alignment.
-
+Score strictly: 90-100 only for exact title+seniority match. 70-89 for strong adjacent match. Below 70 = do NOT include.
 Return ONLY JSON array: [{"newsIndex":0,"matches":[{"taskId":"j1","relevanceScore":85}]}]
-Omit signals with zero matches. No markdown.`
-    : `You evaluate news articles against signal task definitions and score their relevance.
+Omit signals with zero matches or all scores below 70. No markdown.`
+    : `You evaluate news articles against signal task definitions for company "${companyName}". Be EXTREMELY strict.
 
-For each signal, check ALL tasks. If a signal matches a task, score it 0-100:
-- 90-100: Direct, explicit match (article directly covers the task topic)
-- 70-89: Strong match (article strongly implies the task signal)
-- 50-69: Partial match (article is related but indirect)
-- 30-49: Weak match (tangentially related)
-- 0-29: Not relevant
+HARD RULES — violating any one of these means score 0, do NOT include:
+1. SUBJECT MUST MATCH THE SIGNAL TYPE:
+   - "Senior marketer exits" — the person MUST be a marketer (CMO, VP Marketing, etc). A robotics leader, engineer, or CEO is NOT a marketer.
+   - "New non-traditional entrants" — the article must be about a NEW company threatening ${companyName}'s market, NOT about ${companyName} doing something new. ${companyName} is the INCUMBENT being threatened.
+   - "Executive speaking on effectiveness" — must be about a speaking engagement on effectiveness/ROI, not any executive mention.
+2. THE ARTICLE MUST DESCRIBE THE ACTUAL EVENT, not just share keywords:
+   - A company launching a product ≠ "brand repositioning"
+   - A partnership ≠ a "new entrant threatening" the incumbent
+   - An executive making any statement ≠ "publicly reframes success metrics"
+3. DIRECTION MATTERS:
+   - For "entrant" signals: the subject must be the NEW entrant, not the incumbent
+   - For "exit" signals: the subject must be LEAVING, not joining
+   - For "outperform" signals: emerging markets must actually outperform, not just grow
+4. REJECT DUPLICATES: If two articles cover the exact same event, only match the first one.
+5. Use each task's ScoringCriteria as the definitive guide. Enforce rejection criteria aggressively.
+6. When in doubt: DO NOT MATCH. Returning zero matches is often the correct answer.
 
-Use each task's ScoringCriteria if provided. If not provided, score based on headline, content, and keyword alignment.
-
+Score strictly: 90-100 for direct explicit match. 70-89 for strong match. Below 70 = do NOT include.
 Return ONLY JSON array: [{"newsIndex":0,"matches":[{"taskId":"n1","relevanceScore":85}]}]
-Omit signals with zero matches. No markdown.`;
+Omit signals with zero matches or all scores below 70. No markdown.`;
 
   try {
     const c = await openai.chat.completions.create({
-      model: "gpt-4.1-mini", temperature: 0.15, max_tokens: 3000,
+      model: "gpt-4.1", temperature: 0.1, max_tokens: 3000,
       messages: [
         { role: "system", content: prompt },
         { role: "user", content: `Company: ${companyName}\n\nSignals:\n${signalList}\n\nTasks:\n${taskList}` },
@@ -371,7 +384,8 @@ Omit signals with zero matches. No markdown.`;
       // Handle new format: { matches: [{ taskId, relevanceScore }] }
       if (entry.matches?.length) {
         for (const m of entry.matches) {
-          if (valid.has(m.taskId) && m.relevanceScore > 0) {
+          // Enforce minimum 70 — anything below is noise
+          if (valid.has(m.taskId) && m.relevanceScore >= 70) {
             matchedIds.push(m.taskId);
             scores[m.taskId] = Math.min(100, Math.max(0, m.relevanceScore));
           }
@@ -379,10 +393,13 @@ Omit signals with zero matches. No markdown.`;
       }
       // Handle old format: { matchedTaskIds: [...], confidence: 0.85 }
       else if (entry.matchedTaskIds?.length) {
-        for (const id of entry.matchedTaskIds) {
-          if (valid.has(id)) {
-            matchedIds.push(id);
-            scores[id] = Math.round((entry.confidence || 0.7) * 100);
+        const confScore = Math.round((entry.confidence || 0.7) * 100);
+        if (confScore >= 70) {
+          for (const id of entry.matchedTaskIds) {
+            if (valid.has(id)) {
+              matchedIds.push(id);
+              scores[id] = confScore;
+            }
           }
         }
       }

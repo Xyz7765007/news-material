@@ -8,19 +8,31 @@ async function classifyNews(newsItem, taskDefs, companyName) {
   const taskList = taskDefs
     .map(
       (t) =>
-        `ID:${t.id} | "${t.name}" | Keywords: ${(t.keywords || []).join(", ")} | Sources: ${(t.sources || []).join(", ")}`
+        `ID:${t.id} | "${t.name}" | Keywords: ${(t.keywords || []).join(", ")} | Sources: ${(t.sources || []).join(", ")}${t.scoringPrompt ? "\nScoring Criteria: " + t.scoringPrompt.slice(0, 300) : ""}`
     )
-    .join("\n");
+    .join("\n\n");
 
   try {
     const completion = await openai.chat.completions.create({
       model: "gpt-4.1",
-      temperature: 0.2,
-      max_tokens: 500,
+      temperature: 0.1,
+      max_tokens: 600,
       messages: [
         {
           role: "system",
-          content: `You are a B2B signal classification engine. Given a news headline about a company and a list of task definitions, determine which tasks (if any) this news item triggers. Consider keyword matches, semantic relevance, and signal intent. Return ONLY a JSON object: {"matchedTaskIds": ["id1", "id2"], "confidence": 0.0-1.0, "reasoning": "brief explanation"}. If no tasks match, return {"matchedTaskIds": [], "confidence": 0, "reasoning": "No relevant signal detected"}.`,
+          content: `You are a STRICT B2B signal classification engine. Given a news headline about a company and task definitions with scoring criteria, determine which tasks (if any) this news item triggers.
+
+CRITICAL RULES — apply these before matching:
+1. The signal must match the SPECIFIC event type described in the task, not just share keywords
+2. The person/subject in the news must match the role type the task tracks (e.g. a "robotics leader" is NOT a "senior marketer")
+3. If the task says "new non-traditional entrants" — the company in the headline must BE the new entrant threatening incumbents, not an incumbent doing something new
+4. If the task tracks exits/departures — the person must hold the specific role type mentioned (CMO ≠ engineering lead)
+5. General company news that happens to contain a keyword is NOT a match
+6. When in doubt, DO NOT MATCH. False negatives are far better than false positives.
+7. Use each task's Scoring Criteria to judge fit — if the signal would score below 60 per those criteria, do NOT include it.
+
+Return ONLY a JSON object: {"matchedTaskIds": ["id1"], "confidence": 0.0-1.0, "reasoning": "brief explanation"}
+If no tasks match (WHICH IS OFTEN THE CORRECT ANSWER), return: {"matchedTaskIds": [], "confidence": 0, "reasoning": "No relevant signal"}`,
         },
         {
           role: "user",
@@ -152,24 +164,57 @@ RULES:
 }
 
 async function generateScoringPrompt(taskName, taskDescription, taskKeywords, taskSources, taskJobTitleKeywords) {
+  const isJobPost = (taskSources || []).some(s => s === "Job Posts");
+  const isNews = (taskSources || []).some(s => ["News","New Hires","Social","Exits / Promotions","Custom","Earnings","SEC Filings"].includes(s));
+  const sourceType = isJobPost && isNews ? "news articles AND job postings" : isJobPost ? "job postings" : "news articles";
+
   try {
     const completion = await openai.chat.completions.create({
       model: "gpt-4.1",
-      temperature: 0.3,
-      max_tokens: 500,
+      temperature: 0.25,
+      max_tokens: 1500,
       messages: [
         {
           role: "system",
-          content: `You generate scoring criteria prompts for a B2B signal intelligence tool. Given a task definition, create a clear, specific scoring prompt that an AI will use to rate the relevance of signals (news articles or job postings) from 0-100.
+          content: `You generate scoring criteria prompts for a B2B signal intelligence tool. Given a task definition, create a STRICT, precise scoring prompt that an AI will use to rate the relevance of ${sourceType} from 0-100.
 
-The prompt should:
-1. Clearly define what constitutes a 90-100 (exact match), 70-89 (strong), 50-69 (partial), and below 50 (weak/irrelevant)
-2. Reference specific titles, keywords, or themes from the task
-3. Be 3-5 sentences, detailed enough that a different AI can score consistently using it
-4. Be written in second person ("Rate this signal...")
-5. Include specific examples of what scores 90+ vs 70+ vs below 50
+Your prompt MUST include ALL of these sections in this order:
 
-Return ONLY the scoring prompt text, nothing else. No quotes, no explanation.`,
+1. **Opening**: "Rate this signal on how directly it [describes what the signal must show]."
+
+2. **Subject requirement**: Who or what must the signal be about? Be explicit:
+   - For role-based signals: specify exact titles that qualify (and which DON'T)
+   - For market signals: specify the DIRECTION (who is the subject — new entrant vs incumbent, the company leaving vs joining)
+   - For event signals: specify what the event IS vs what it ISN'T
+
+3. **Score 90-100**: Exact match. Include 1-2 concrete headline examples in quotes.
+
+4. **Score 70-89**: Strong but not exact. What's missing vs a 90+?
+
+5. **Score 50-69**: Tangential. Shares keywords but wrong context.
+
+6. **Score BELOW 50 (MOST IMPORTANT SECTION)**: Explicit rejection rules. List 3-5 specific patterns that look like matches but AREN'T. These are the tricky false positives.
+${isJobPost ? `
+   Common job post false positives to address:
+   - Adjacent department roles (HR/Compensation/Operations that share keywords with marketing)
+   - Junior roles matching senior signals (Coordinator ≠ Director ≠ VP ≠ C-level)
+   - The word "temporary" or "contract" in a non-marketing role does NOT make it an "interim CMO"
+   - SEO/Content/Social media specialists are NOT "Marketing Transformation" or "AI Marketing" roles unless the title explicitly says so
+` : ""}
+${isNews ? `
+   Common news false positives to address:
+   - The target company doing something new ≠ "new entrant" (the signal is about someone ELSE entering THEIR market)
+   - A person from a different department leaving ≠ "senior marketer exits" (verify the person's actual role)
+   - A company partnership ≠ "new entrant threatening" (partnership means they're working together, not competing)
+   - Any executive making any statement ≠ "exec reframes success metrics" (must be specifically about changing KPIs)
+   - General company news that shares a keyword is NOT a match (keyword co-occurrence ≠ signal relevance)
+` : ""}
+
+7. **Examples with scores**: 3 examples including at least 1 false positive that should score below 40.
+
+The prompt should be 200-350 words. The #1 quality metric is PRECISION over RECALL — it's much better to miss a real signal than to surface a wrong one. When in doubt, the prompt should drive scores LOWER.
+
+Return ONLY the scoring prompt text. No quotes, no explanation, no markdown.`,
         },
         {
           role: "user",
@@ -187,7 +232,7 @@ Signal Sources: ${(taskSources || []).join(", ") || "N/A"}`,
     console.error("Scoring prompt generation error:", e);
     const kws = [...(taskKeywords || []), ...(taskJobTitleKeywords || [])].slice(0, 5).join(", ");
     return {
-      scoringPrompt: `Rate the relevance of this signal for detecting "${taskName}" at the target company. Score 90-100 if it directly matches key indicators (${kws}). Score 70-89 for strong thematic alignment. Score 50-69 for partial or indirect relevance. Score below 50 if unrelated.`,
+      scoringPrompt: `Rate the relevance of this signal for detecting "${taskName}" at the target company. Score 90-100 ONLY if it directly and explicitly matches the core signal (${kws}). Score 70-89 for strong alignment with minor gaps. Score 50-69 for partial relevance. Score below 50 — and be aggressive here — if the signal is only tangentially related, uses similar keywords in a different context, or describes a different type of event/role than what this task tracks. When in doubt, score lower.`,
     };
   }
 }
