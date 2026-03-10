@@ -374,7 +374,7 @@ Omit signals with zero matches or all scores below 70. No markdown.`;
     if (!Array.isArray(cls)) return [];
     const valid = new Set(taskDefs.map(t => t.id));
 
-    return signals.map((sig, i) => {
+    const result = signals.map((sig, i) => {
       const entry = cls.find(x => x.newsIndex === i);
       if (!entry) return { ...sig, matchedTaskIds: [], confidence: 0, relevanceScores: {} };
       
@@ -407,11 +407,16 @@ Omit signals with zero matches or all scores below 70. No markdown.`;
       if (matchedIds.length === 0) return { ...sig, matchedTaskIds: [], confidence: 0, relevanceScores: {} };
       
       const maxScore = Math.max(...Object.values(scores), 0);
-      if (matchedIds.length > 0) {
-        console.log(`  [CLASSIFY] Signal ${i}: ${matchedIds.map(id => `${id}=${scores[id]}`).join(", ")}`);
-      }
+      console.log(`  [MATCH] Signal ${i}: "${(sig.headline||"").slice(0,60)}" → ${matchedIds.map(id => `${id}=${scores[id]}`).join(", ")}`);
       return { ...sig, matchedTaskIds: matchedIds, confidence: maxScore / 100, relevanceScores: scores };
     });
+
+    // Log summary
+    const matched = result.filter(s => s.matchedTaskIds.length > 0);
+    const dropped = cls.filter(x => x.matches?.some(m => m.relevanceScore > 0 && m.relevanceScore < 70));
+    console.log(`  [SUMMARY] ${signals.length} signals → ${matched.length} matched, ${dropped.length} dropped (score < 70)`);
+
+    return result;
   } catch (e) {
     console.error(`Classify error (${mode}):`, e);
     // Fallback: keyword matching with default relevance score
