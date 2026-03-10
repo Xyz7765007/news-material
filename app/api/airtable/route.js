@@ -62,7 +62,36 @@ async function listRecords(baseId, table, params = {}) {
   return allRecords;
 }
 
+// Cache to avoid re-checking fields on every write within the same request
+const _ensuredFieldsCache = new Map(); // key: baseId+table, value: Set of field names
+
+async function autoEnsureFields(baseId, table, records) {
+  // Extract all field names from the records being written
+  const fieldNames = new Set();
+  for (const r of records) {
+    const fields = r.fields || r;
+    for (const k of Object.keys(fields)) {
+      if (k !== "id") fieldNames.add(k);
+    }
+  }
+  if (!fieldNames.size) return;
+
+  const cacheKey = `${baseId}:${table}`;
+  const cached = _ensuredFieldsCache.get(cacheKey) || new Set();
+  const toEnsure = [...fieldNames].filter(f => !cached.has(f));
+  if (!toEnsure.length) return;
+
+  try {
+    await ensureCustomFields(baseId, table, toEnsure);
+    toEnsure.forEach(f => cached.add(f));
+    _ensuredFieldsCache.set(cacheKey, cached);
+  } catch (e) {
+    console.warn(`autoEnsureFields ${table}:`, e.message);
+  }
+}
+
 async function createRecords(baseId, table, records) {
+  await autoEnsureFields(baseId, table, records);
   const results = [];
   for (let i = 0; i < records.length; i += 10) {
     const batch = records.slice(i, i + 10).map(r => ({ fields: r }));
@@ -82,6 +111,7 @@ async function createRecords(baseId, table, records) {
 }
 
 async function updateRecords(baseId, table, records) {
+  await autoEnsureFields(baseId, table, records);
   const results = [];
   for (let i = 0; i < records.length; i += 10) {
     const batch = records.slice(i, i + 10).map(r => ({ id: r.id, fields: r.fields }));
@@ -424,49 +454,57 @@ async function runTopXScoring(baseId, rule) {
   const topN = rule.topN || 10;
   const scoringFields = rule.scoringFields || [];
   const scoringPrompt = (rule.scoringPrompt || "").trim();
-  if (!scoringFields.length) return { error: "No scoring fields defined", tasks: [] };
+  if (!scoringFields.length && !scoringPrompt) return { error: "No scoring fields or AI prompt defined", tasks: [] };
   const table = scanTarget === "accounts" ? "Accounts" : "Leads";
   const records = await listRecords(baseId, table);
   if (!records.length) return { error: `No ${table.toLowerCase()} found`, tasks: [] };
 
-  // ─── Step 1: Weighted numeric scoring (always runs) ──────
-  const totalWeight = scoringFields.reduce((sum, sf) => sum + (sf.weight || 0), 0);
-  const nf = scoringFields.map(sf => ({
-    field: sf.field,
-    weight: totalWeight > 0 ? (sf.weight || 0) / totalWeight : 1 / scoringFields.length,
-  }));
-  const fieldStats = {};
-  for (const sf of nf) {
-    const values = records.map(r => parseFloat(r.fields?.[sf.field]) || 0);
-    fieldStats[sf.field] = { min: Math.min(...values, 0), max: Math.max(...values, 1) };
-  }
+  // ─── Step 1: Weighted numeric scoring (skipped if no fields) ──
   const scored = records.map(r => {
     const fields = r.fields || {};
     let cs = 0;
-    for (const sf of nf) {
-      const raw = parseFloat(fields[sf.field]) || 0;
-      const st = fieldStats[sf.field];
-      const range = st.max - st.min;
-      cs += (range > 0 ? ((raw - st.min) / range) * 100 : 0) * sf.weight;
+    if (scoringFields.length > 0) {
+      const totalWeight = scoringFields.reduce((sum, sf) => sum + (sf.weight || 0), 0);
+      const nf = scoringFields.map(sf => ({
+        field: sf.field,
+        weight: totalWeight > 0 ? (sf.weight || 0) / totalWeight : 1 / scoringFields.length,
+      }));
+      // Compute field stats inline (we need them per-field across all records)
+      for (const sf of nf) {
+        if (!sf._stats) {
+          const values = records.map(rec => parseFloat(rec.fields?.[sf.field]) || 0);
+          sf._stats = { min: Math.min(...values, 0), max: Math.max(...values, 1) };
+        }
+        const raw = parseFloat(fields[sf.field]) || 0;
+        const range = sf._stats.max - sf._stats.min;
+        cs += (range > 0 ? ((raw - sf._stats.min) / range) * 100 : 0) * sf.weight;
+      }
     }
     return { record: r, numericScore: Math.round(cs), name: fields.Name || fields.Company || "Unknown" };
   });
 
   // ─── Step 2: AI scoring (only if prompt provided + OpenAI key) ──
+  // Pre-sort by numeric score, only AI-score top candidates (3x topN)
   let useAI = scoringPrompt && OPENAI_KEY;
   if (useAI) {
+    scored.sort((a, b) => b.numericScore - a.numericScore);
+    // When no numeric fields, AI-score all (up to 100). When blended, AI-score top 3x.
+    const candidateCount = scoringFields.length > 0
+      ? Math.min(scored.length, topN * 3)
+      : Math.min(scored.length, 100);
+    const candidates = scored.slice(0, candidateCount);
+    const rest = scored.slice(candidateCount);
+
     try {
       const openai = new OpenAI({ apiKey: OPENAI_KEY });
-      // Process in batches of 10 to stay within token limits
       const BATCH = 10;
-      for (let i = 0; i < scored.length; i += BATCH) {
-        const batch = scored.slice(i, i + BATCH);
+      for (let i = 0; i < candidates.length; i += BATCH) {
+        const batch = candidates.slice(i, i + BATCH);
         const recordSummaries = batch.map((item, idx) => {
           const f = item.record.fields || {};
-          // Include all fields, not just scoring ones
           const dataStr = Object.entries(f)
             .filter(([_, v]) => v !== null && v !== undefined && v !== "")
-            .map(([k, v]) => `${k}: ${v}`)
+            .map(([k, v]) => `${k}: ${String(v).slice(0, 200)}`)
             .join(" | ");
           return `[${idx}] ${item.name} — ${dataStr} — Numeric Score: ${item.numericScore}/100`;
         }).join("\n");
@@ -496,14 +534,22 @@ async function runTopXScoring(baseId, rule) {
         }
       }
 
-      // Final score: 40% numeric + 60% AI (AI is the primary when prompt is set)
-      for (const item of scored) {
+      // Final score: if numeric fields exist, blend 40% numeric + 60% AI. Otherwise pure AI.
+      const hasNumeric = scoringFields.length > 0;
+      for (const item of candidates) {
         if (item.aiScore !== undefined) {
-          item.compositeScore = Math.round(item.numericScore * 0.4 + item.aiScore * 0.6);
+          item.compositeScore = hasNumeric
+            ? Math.round(item.numericScore * 0.4 + item.aiScore * 0.6)
+            : item.aiScore;
         } else {
           item.compositeScore = item.numericScore;
         }
       }
+      // Non-candidates keep numeric score (won't make top N anyway)
+      rest.forEach(item => { item.compositeScore = item.numericScore; });
+      // Recombine and re-sort
+      scored.length = 0;
+      scored.push(...candidates, ...rest);
     } catch (e) {
       console.error("AI scoring failed, falling back to numeric:", e.message);
       useAI = false;

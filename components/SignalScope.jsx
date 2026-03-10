@@ -264,8 +264,6 @@ export default function SignalScope() {
     if (!csvModal) return;
     const { table, setter, headers, rows, mappings, mode, matchField } = csvModal;
     const active = Object.entries(mappings).filter(([_, v]) => v !== "__skip__");
-    const allMappedFields = active.map(([_, f]) => f);
-    if (allMappedFields.length > 0) { try { await at("ensure_fields", table, { fieldNames: allMappedFields }, bid); } catch (e) { console.error(e); } }
 
     const recs = rows.map(row => {
       const obj = {};
@@ -448,13 +446,8 @@ export default function SignalScope() {
   const saveRule = async (rule) => {
     let fields;
     if (rule.taskType === "top_x") {
-      // Top X rule
       fields = { Name: rule.name, Description: rule.description || "", "Task Type": "top_x", "Scan Target": rule.scanTarget || "leads", "Top N": rule.topN || 10, "Scoring Fields": JSON.stringify(rule.scoringFields || []), "Scoring Prompt": rule.scoringPrompt || "", Ease: rule.ease || "Medium", Strength: rule.strength || "Strong" };
-      try {
-        await at("ensure_fields", "Task Rules", { fieldNames: [{ name: "Top N", type: "number", options: { precision: 0 } }, { name: "Scoring Fields", type: "multilineText" }] }, bid);
-      } catch (e) { console.error("ensure_fields:", e); }
     } else {
-      // Signal rule (news / job_post / both)
       fields = { Name: rule.name, Description: rule.description || "", "Task Type": rule.taskType || "news", "Scan Target": rule.scanTarget || "accounts", Ease: rule.ease || "Medium", Strength: rule.strength || "Medium", Sources: (rule.sources || []).join(", "), Keywords: (rule.keywords || []).join(", "), "Job Title Keywords": (rule.jobTitleKeywords || []).join(", "), "Scoring Prompt": rule.scoringPrompt || "" };
     }
     try {
@@ -989,13 +982,13 @@ function RuleEditor({rule,onSave,onClose,availableFields}){
 
   // Top X helpers
   const tbl = f.scanTarget === "accounts" ? "Accounts" : "Leads";
-  const flds = (availableFields[tbl]||[]).filter(fd=>fd.type==="number"||fd.type==="percent"||fd.type==="currency"||fd.type==="rating"||fd.type==="singleLineText");
+  const allFlds = (availableFields[tbl]||[]);
   const addSF = (n) => { if (!f.scoringFields.some(s => s.field === n)) sF(p => ({...p, scoringFields: [...p.scoringFields, {field: n, weight: 20}]})); };
   const remSF = (n) => sF(p => ({...p, scoringFields: p.scoringFields.filter(s => s.field !== n)}));
   const updSF = (n, w) => sF(p => ({...p, scoringFields: p.scoringFields.map(s => s.field === n ? {...s, weight: Math.max(0, Math.min(100, w))} : s)}));
   const tw = f.scoringFields.reduce((s, x) => s + x.weight, 0);
 
-  const canSave = mode === "top_x" ? f.name.trim() && f.scoringFields.length > 0 : f.name.trim();
+  const canSave = mode === "top_x" ? f.name.trim() && (f.scoringFields.length > 0 || f.scoringPrompt.trim()) : f.name.trim();
 
   const handleSave = () => {
     if (mode === "top_x") {
@@ -1046,17 +1039,27 @@ function RuleEditor({rule,onSave,onClose,availableFields}){
     <div className="ig"><div className="il">Scan Target</div><div style={{display:"flex",gap:6}}>{[{v:"leads",l:"👤 Leads"},{v:"accounts",l:"🏢 Accounts"}].map(o=>(<button key={o.v} className={"btn btn-s"+(f.scanTarget===o.v?" btn-p":"")} onClick={()=>sF(p=>({...p,scanTarget:o.v,scoringFields:[]}))}>{o.l}</button>))}</div></div>
     <div className="ig"><div className="il">Top N</div><input type="number" className="inp" value={f.topN} onChange={e=>sF(p=>({...p,topN:parseInt(e.target.value)||10}))} min={1} max={500} style={{width:100}}/></div>
   </div>
-  <div className="ig"><div className="il">Scoring Fields & Weights</div>
-    {f.scoringFields.length>0&&<div style={{marginBottom:10}}>{f.scoringFields.map(sf=>(<div key={sf.field} className="wt-row"><span className="wt-name">{sf.field}</span><input type="range" className="sld" style={{width:120}} min="0" max="100" value={sf.weight} onChange={e=>updSF(sf.field,parseInt(e.target.value))}/><span className="wt-pct">{sf.weight}%</span><button style={{background:"none",border:"none",color:"var(--red)",cursor:"pointer",padding:"0 4px"}} onClick={()=>remSF(sf.field)}>×</button></div>))}<div style={{fontSize:10,color:tw===100?"var(--grn)":"var(--amb)"}}>Total: {tw}%{tw!==100?" (normalized)":""}</div></div>}
-    <select className="inp" onChange={e=>{if(e.target.value)addSF(e.target.value);e.target.value=""}} defaultValue=""><option value="" disabled>+ Add field…</option>{flds.filter(fd=>!f.scoringFields.some(s=>s.field===fd.name)).map(fd=>(<option key={fd.name} value={fd.name}>{fd.name} ({fd.type})</option>))}</select>
-    {flds.length===0&&<div style={{marginTop:8,padding:10,background:"var(--hover)",borderRadius:6,fontSize:10,color:"var(--amb)"}}>⚠️ No fields in {tbl}. Upload CSV with numeric data — fields auto-created.</div>}
-  </div>
-  {f.scoringFields.length>0&&<div style={{padding:12,border:"1px solid rgba(155,126,216,.3)",borderRadius:8,background:"rgba(155,126,216,.05)",fontSize:11}}><span style={{fontWeight:600,color:"var(--pur)"}}>🎯 Preview:</span> Read all {tbl.toLowerCase()}, score by {f.scoringFields.map(s=>s.field+" ("+s.weight+"%)").join(", ")}{f.scoringPrompt?", then AI re-scores using prompt":""}, return top {f.topN}.</div>}
 
-  {/* Optional AI Scoring Prompt */}
+  {/* Scoring Fields & Weights */}
+  <div className="ig">
+    <div className="il">Scoring Fields & Weights <span style={{fontSize:9,color:"var(--t3)",fontWeight:400}}>— optional if using AI prompt</span></div>
+    {f.scoringFields.length>0&&<div style={{marginBottom:10}}>{f.scoringFields.map(sf=>(<div key={sf.field} className="wt-row"><span className="wt-name">{sf.field}</span><input type="range" className="sld" style={{width:120}} min="0" max="100" value={sf.weight} onChange={e=>updSF(sf.field,parseInt(e.target.value))}/><span className="wt-pct">{sf.weight}%</span><button style={{background:"none",border:"none",color:"var(--red)",cursor:"pointer",padding:"0 4px"}} onClick={()=>remSF(sf.field)}>×</button></div>))}<div style={{fontSize:10,color:tw===100?"var(--grn)":"var(--amb)"}}>Total: {tw}%{tw!==100?" (normalized)":""}</div></div>}
+    <select className="inp" onChange={e=>{if(e.target.value)addSF(e.target.value);e.target.value=""}} defaultValue=""><option value="" disabled>+ Add field…</option>{allFlds.filter(fd=>!f.scoringFields.some(s=>s.field===fd.name)).map(fd=>(<option key={fd.name} value={fd.name}>{fd.name} ({fd.type})</option>))}</select>
+    {allFlds.length===0&&<div style={{marginTop:6,fontSize:10,color:"var(--amb)"}}>⚠️ No fields in {tbl}. Upload a CSV first.</div>}
+  </div>
+
+  {/* Preview */}
+  {(f.scoringFields.length>0||f.scoringPrompt.trim())&&<div style={{padding:12,border:"1px solid rgba(155,126,216,.3)",borderRadius:8,background:"rgba(155,126,216,.05)",fontSize:11}}>
+    <span style={{fontWeight:600,color:"var(--pur)"}}>🎯 Preview:</span> Read all {tbl.toLowerCase()}
+    {f.scoringFields.length>0&&<>, numeric score by {f.scoringFields.map(s=>s.field+" ("+s.weight+"%)").join(", ")}</>}
+    {f.scoringPrompt.trim()&&<>{f.scoringFields.length>0?" + ":" "}AI scores using all record data + your prompt</>}
+    , return top {f.topN}.
+  </div>}
+
+  {/* AI Scoring Prompt */}
   <div style={{padding:14,border:"1px solid rgba(191,163,90,.2)",borderRadius:8,background:"rgba(191,163,90,.03)"}}>
-    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}><span>🧠</span><span style={{fontSize:11,fontWeight:600,color:"var(--acc)"}}>AI SCORING PROMPT</span><span style={{fontSize:9,color:"var(--t3)",fontWeight:400}}>(optional)</span></div>
-    <div style={{fontSize:10,color:"var(--t3)",marginBottom:8,lineHeight:1.5}}>When set, AI reads each record's data and scores them holistically using your criteria. The AI considers the scoring fields above plus any other context from the record. Without a prompt, scoring is purely numeric weighted.</div>
+    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}><span>🧠</span><span style={{fontSize:11,fontWeight:600,color:"var(--acc)"}}>AI SCORING PROMPT</span><span style={{fontSize:9,color:"var(--t3)",fontWeight:400}}>{f.scoringFields.length>0?"(optional)":"(required without scoring fields)"}</span></div>
+    <div style={{fontSize:10,color:"var(--t3)",marginBottom:8,lineHeight:1.5}}>AI reads ALL fields on each record (not just scoring fields) and scores 0-100 based on your criteria. You can use this alone (pure AI scoring) or alongside weighted fields (blended 40% numeric + 60% AI).</div>
     <textarea className="inp ta" value={f.scoringPrompt} onChange={e=>sF(p=>({...p,scoringPrompt:e.target.value}))} placeholder="e.g. Score leads 0-100 based on how likely they are to need our marketing automation product. Prioritize companies with large marketing teams (50+), active hiring in marketing ops, and mid-market size (200-2000 employees). Penalize companies that are too small (<50) or enterprise (>10000)." style={{minHeight:80,fontSize:11,background:"var(--card)"}}/>
   </div>
   </>)}
