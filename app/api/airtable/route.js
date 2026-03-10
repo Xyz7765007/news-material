@@ -114,13 +114,23 @@ async function createRecords(baseId, table, records) {
   await autoEnsureFields(baseId, table, records);
   const results = [];
   for (let i = 0; i < records.length; i += 10) {
-    const batch = records.slice(i, i + 10).map(r => ({ fields: r }));
+    const batch = records.slice(i, i + 10).map(r => ({ fields: sanitizeFields(r) }));
     const res = await fetch(`${baseUrl(baseId)}/${encodeURIComponent(table)}`, {
       method: "POST", headers: hdrs,
       body: JSON.stringify({ records: batch }),
     });
     if (!res.ok) {
       const err = await res.text();
+      // On INVALID_VALUE_FOR_COLUMN, retry with all values as strings
+      if (err.includes("INVALID_VALUE_FOR_COLUMN")) {
+        console.warn(`CREATE ${table}: type mismatch, retrying with string coercion`);
+        const safeBatch = batch.map(r => ({ fields: stringifyFields(r.fields) }));
+        const retry = await fetch(`${baseUrl(baseId)}/${encodeURIComponent(table)}`, {
+          method: "POST", headers: hdrs,
+          body: JSON.stringify({ records: safeBatch }),
+        });
+        if (retry.ok) { const d = await retry.json(); results.push(...(d.records || [])); continue; }
+      }
       console.error(`CREATE ${table} error:`, err);
       throw new Error(`Airtable error: ${res.status}`);
     }
@@ -134,13 +144,22 @@ async function updateRecords(baseId, table, records) {
   await autoEnsureFields(baseId, table, records);
   const results = [];
   for (let i = 0; i < records.length; i += 10) {
-    const batch = records.slice(i, i + 10).map(r => ({ id: r.id, fields: r.fields }));
+    const batch = records.slice(i, i + 10).map(r => ({ id: r.id, fields: sanitizeFields(r.fields || r) }));
     const res = await fetch(`${baseUrl(baseId)}/${encodeURIComponent(table)}`, {
       method: "PATCH", headers: hdrs,
       body: JSON.stringify({ records: batch }),
     });
     if (!res.ok) {
       const err = await res.text();
+      if (err.includes("INVALID_VALUE_FOR_COLUMN")) {
+        console.warn(`UPDATE ${table}: type mismatch, retrying with string coercion`);
+        const safeBatch = batch.map(r => ({ id: r.id, fields: stringifyFields(r.fields) }));
+        const retry = await fetch(`${baseUrl(baseId)}/${encodeURIComponent(table)}`, {
+          method: "PATCH", headers: hdrs,
+          body: JSON.stringify({ records: safeBatch }),
+        });
+        if (retry.ok) { const d = await retry.json(); results.push(...(d.records || [])); continue; }
+      }
       console.error(`UPDATE ${table} error:`, err);
       throw new Error(`Airtable error: ${res.status}`);
     }
@@ -148,6 +167,32 @@ async function updateRecords(baseId, table, records) {
     results.push(...(data.records || []));
   }
   return results;
+}
+
+// Sanitize: ensure numbers are numbers, strings are strings, nulls removed
+function sanitizeFields(fields) {
+  const out = {};
+  for (const [k, v] of Object.entries(fields)) {
+    if (v === null || v === undefined) continue;
+    if (k === "id") continue;
+    // Known numeric fields
+    if (FIELD_TYPE_MAP[k]?.type === "number") {
+      out[k] = typeof v === "number" ? v : (parseInt(v) || 0);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+// Fallback: convert everything to strings (works for singleLineText fields)
+function stringifyFields(fields) {
+  const out = {};
+  for (const [k, v] of Object.entries(fields)) {
+    if (v === null || v === undefined) continue;
+    out[k] = String(v);
+  }
+  return out;
 }
 
 async function deleteRecords(baseId, table, recordIds) {
