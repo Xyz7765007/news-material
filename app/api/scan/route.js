@@ -298,138 +298,99 @@ async function scanJobsBatch(companies, taskDefs) {
   return results;
 }
 
-// ─── Shared: OpenAI Classification with Relevance Scoring ───────
+// ─── Shared: OpenAI Classification — ONE TASK AT A TIME ───────
 
 async function classify(signals, taskDefs, companyName, mode) {
   if (!signals.length || !taskDefs.length) return [];
 
-  const taskList = taskDefs
-    .map(t => {
-      let entry = `ID:"${t.id}" | "${t.name}" | Keywords:[${(t.keywords || []).join(", ")}]`;
-      if (t.jobTitleKeywords?.length) entry += ` | RequiredJobTitles:[${t.jobTitleKeywords.join(", ")}]`;
-      if (t.scoringPrompt) entry += `\n    ScoringCriteria: ${t.scoringPrompt.slice(0, 600)}`;
-      return entry;
-    }).join("\n\n");
-
   const signalList = signals
     .map((n, i) => {
       let e = `[${i}] "${n.headline}"`;
-      if (n.description) e += `\n    Summary: ${n.description.slice(0, 200)}`;
-      if (n.articleContent?.length > 50) e += `\n    Content: ${n.articleContent.slice(0, 400)}`;
+      if (n.description) e += ` — ${n.description.slice(0, 200)}`;
       return e;
-    }).join("\n\n");
+    }).join("\n");
 
-  const prompt = mode === "jobs"
-    ? `You evaluate job postings against signal task definitions. Be precise and accurate.
+  // Initialize results — each signal starts with no matches
+  const results = signals.map(sig => ({
+    ...sig, matchedTaskIds: [], confidence: 0, relevanceScores: {},
+  }));
 
-Your job is to find REAL matches. Most batches will have at least a few matches — if you're returning empty for everything, you're being too cautious.
+  // Run EACH task independently — its own call, its own prompt
+  for (const task of taskDefs) {
+    const taskDesc = mode === "jobs"
+      ? `Task: "${task.name}"\nJob Titles to match: [${(task.jobTitleKeywords || []).join(", ")}]\nKeywords: [${(task.keywords || []).join(", ")}]`
+      : `Task: "${task.name}"\nKeywords: [${(task.keywords || []).join(", ")}]`;
 
-MATCHING RULES:
-1. The JOB TITLE is the primary signal. It should align with the role type the task describes.
-   - Exact title match (e.g. "CMO" for "CMO opening") → score 90-100
-   - Strong adjacent match (e.g. "VP Marketing" for "CMO opening") → score 70-89
-   - Related but weaker (e.g. "Marketing Director" for "CMO opening") → score 50-69
-2. Seniority should roughly match. Don't stretch 2+ levels (Coordinator → CMO).
-3. Department must be relevant. HR/Compensation/Finance roles are NOT marketing roles.
-4. Use each task's ScoringCriteria when provided — it defines what scores high vs low.
+    const scoringCriteria = task.scoringPrompt
+      ? `\n\nScoring Criteria (use this as your primary guide):\n${task.scoringPrompt}`
+      : "";
 
-COMMON MISTAKES TO AVOID (score below 40 for these):
-- "Temporary Manager, Compensation" matching "Interim CMO" — wrong department entirely
-- "SEO Specialist" matching "Marketing Transformation / AI Marketing" — wrong specialization
-- Junior coordinator roles matching C-level signals
+    const sysPrompt = mode === "jobs"
+      ? `Score each job posting 0-100 for this ONE task. Use the scoring criteria if provided.
 
-Return ONLY JSON array: [{"newsIndex":0,"matches":[{"taskId":"j1","relevanceScore":85}]}]
-Include matches scoring 50+. Omit only truly unrelated signals. No markdown.`
-    : `You evaluate news articles against signal task definitions for company "${companyName}". Be precise and accurate.
+The job TITLE must align with the task's role type. HR/Finance/Ops roles don't match marketing tasks. Seniority must roughly match.
+${scoringCriteria}
 
-Your job is to find REAL matches. Real signals DO exist and should be surfaced. If an article genuinely describes the event a task is tracking, MATCH IT confidently.
+Return ONLY JSON: [{"idx":0,"score":85},{"idx":3,"score":72}]
+Only include postings scoring 50+. No markdown.`
+      : `Score each news article 0-100 for this ONE task about ${companyName}. Use the scoring criteria if provided.
 
-MATCHING RULES:
-1. The article should describe the SPECIFIC type of event the task tracks:
-   - "Reckitt earnings: emerging markets lead growth" matches "Emerging markets outperform core" → 90+
-   - "CMO steps down after 10 months" matches "Senior marketer exits within 12 months" → 90+
-   - "Company X launches agency review" matches "Agency review or consolidation" → 90+
-2. The subject/person/company must be in the right role relative to the signal:
-   - For "exits" — the person leaving must be the TYPE of executive the task describes (marketer, not engineer)
-   - For "new entrants" — the article is about a company entering ${companyName}'s market to compete, not about ${companyName} itself
-3. Score 70+ for strong matches, 50-69 for partial/indirect, below 50 for weak.
+The article must describe the specific event this task tracks. The subject must fit the task's intent.
+${scoringCriteria}
 
-COMMON MISTAKES TO AVOID (score below 40 for these):
-- A non-marketer (robotics leader, engineer) matched to "senior marketer exits"
-- The incumbent (${companyName}) doing something new matched to "new non-traditional entrants"
-- A partnership matched to "new entrant threatening" the incumbent
-- Generic company news that just shares a keyword
+Return ONLY JSON: [{"idx":0,"score":85},{"idx":3,"score":72}]
+Only include articles scoring 50+. No markdown.`;
 
-Return ONLY JSON array: [{"newsIndex":0,"matches":[{"taskId":"n1","relevanceScore":85}]}]
-Include matches scoring 50+. Omit only truly unrelated signals. No markdown.`;
+    try {
+      const c = await openai.chat.completions.create({
+        model: "gpt-4.1-mini", temperature: 0.15, max_tokens: 1000,
+        messages: [
+          { role: "system", content: sysPrompt },
+          { role: "user", content: `${taskDesc}\n\nSignals:\n${signalList}` },
+        ],
+      });
+      const text = c.choices[0]?.message?.content || "[]";
+      let scores;
+      try {
+        scores = JSON.parse(text.replace(/```json\n?|```/g, "").trim());
+      } catch {
+        const m = text.match(/\[[\s\S]*?\]/);
+        scores = m ? JSON.parse(m[0]) : [];
+      }
+      if (!Array.isArray(scores)) scores = [];
 
-  try {
-    const c = await openai.chat.completions.create({
-      model: "gpt-4.1-mini", temperature: 0.15, max_tokens: 3000,
-      messages: [
-        { role: "system", content: prompt },
-        { role: "user", content: `Company: ${companyName}\n\nSignals:\n${signalList}\n\nTasks:\n${taskList}` },
-      ],
-    });
-    const text = c.choices[0]?.message?.content || "[]";
-    console.log(`  [CLASSIFY-RAW] ${mode} for ${companyName}: ${text.slice(0, 500)}`);
-    let cls; try { cls = JSON.parse(text.replace(/```json\n?|```/g, "").trim()); } catch { const m = text.match(/\[[\s\S]*\]/); cls = m ? JSON.parse(m[0]) : []; }
-    if (!Array.isArray(cls)) return [];
-    const valid = new Set(taskDefs.map(t => t.id));
-
-    const result = signals.map((sig, i) => {
-      const entry = cls.find(x => x.newsIndex === i);
-      if (!entry) return { ...sig, matchedTaskIds: [], confidence: 0, relevanceScores: {} };
-      
-      const matchedIds = [];
-      const scores = {};
-      
-      // Handle new format: { matches: [{ taskId, relevanceScore }] }
-      if (entry.matches?.length) {
-        for (const m of entry.matches) {
-          if (valid.has(m.taskId) && m.relevanceScore >= 50) {
-            matchedIds.push(m.taskId);
-            scores[m.taskId] = Math.min(100, Math.max(0, m.relevanceScore));
-          }
+      let matchCount = 0;
+      for (const s of scores) {
+        const idx = s.idx ?? s.newsIndex;
+        const score = s.score ?? s.relevanceScore;
+        if (idx !== undefined && score >= 50 && results[idx]) {
+          results[idx].matchedTaskIds.push(task.id);
+          results[idx].relevanceScores[task.id] = Math.min(100, Math.max(0, Math.round(score)));
+          results[idx].confidence = Math.max(results[idx].confidence, score / 100);
+          matchCount++;
         }
       }
-      // Handle old format: { matchedTaskIds: [...], confidence: 0.85 }
-      else if (entry.matchedTaskIds?.length) {
-        const confScore = Math.round((entry.confidence || 0.7) * 100);
-        if (confScore >= 50) {
-          for (const id of entry.matchedTaskIds) {
-            if (valid.has(id)) {
-              matchedIds.push(id);
-              scores[id] = confScore;
-            }
-          }
+      console.log(`  [TASK] "${task.name}" → ${matchCount} matches from ${signals.length} signals`);
+    } catch (e) {
+      console.error(`  [TASK ERROR] "${task.name}":`, e.message);
+      // Fallback: keyword matching
+      signals.forEach((sig, i) => {
+        const t = (sig.headline + " " + (sig.description || "")).toLowerCase();
+        const kws = [...(task.keywords || []), ...(task.jobTitleKeywords || [])];
+        if (kws.some(kw => t.includes(kw.toLowerCase()))) {
+          results[i].matchedTaskIds.push(task.id);
+          results[i].relevanceScores[task.id] = 55;
+          results[i].confidence = Math.max(results[i].confidence, 0.55);
         }
-      }
-
-      if (matchedIds.length === 0) return { ...sig, matchedTaskIds: [], confidence: 0, relevanceScores: {} };
-      
-      const maxScore = Math.max(...Object.values(scores), 0);
-      console.log(`  [MATCH] Signal ${i}: "${(sig.headline||"").slice(0,60)}" → ${matchedIds.map(id => `${id}=${scores[id]}`).join(", ")}`);
-      return { ...sig, matchedTaskIds: matchedIds, confidence: maxScore / 100, relevanceScores: scores };
-    });
-
-    // Log summary
-    const matched = result.filter(s => s.matchedTaskIds.length > 0);
-    const dropped = cls.filter(x => x.matches?.some(m => m.relevanceScore > 0 && m.relevanceScore < 50));
-    console.log(`  [SUMMARY] ${signals.length} signals → ${matched.length} matched, ${dropped.length} dropped (score < 50)`);
-
-    return result;
-  } catch (e) {
-    console.error(`Classify error (${mode}):`, e);
-    // Fallback: keyword matching with default relevance score
-    return signals.map(sig => {
-      const t = (sig.headline + " " + (sig.description || "")).toLowerCase();
-      const matched = taskDefs.filter(td => (td.keywords || []).some(kw => t.includes(kw.toLowerCase())));
-      const scores = {};
-      matched.forEach(td => { scores[td.id] = 60; }); // default 60 for keyword matches
-      return { ...sig, matchedTaskIds: matched.map(td => td.id), confidence: matched.length > 0 ? 0.6 : 0, relevanceScores: scores };
-    });
+      });
+    }
   }
+
+  // Log summary
+  const matched = results.filter(s => s.matchedTaskIds.length > 0);
+  console.log(`  [SUMMARY] ${signals.length} signals × ${taskDefs.length} tasks → ${matched.length} signals matched`);
+
+  return results;
 }
 
 // ─── Route Handler ────────────────────────────────────────────────
