@@ -1,0 +1,867 @@
+import { NextResponse } from "next/server";
+import OpenAI from "openai";
+
+const API_KEY = process.env.AIRTABLE_API_KEY;
+const OPENAI_KEY = process.env.OPENAI_API_KEY;
+const MASTER_BASE_ID = process.env.AIRTABLE_BASE_ID; // master base — stores Campaigns registry
+const API = "https://api.airtable.com/v0";
+const META = "https://api.airtable.com/v0/meta/bases";
+
+const hdrs = {
+  Authorization: `Bearer ${API_KEY}`,
+  "Content-Type": "application/json",
+};
+const authHdr = { Authorization: `Bearer ${API_KEY}` };
+
+// ─── Helpers to build URLs per base ─────────────────────────────
+const baseUrl = (baseId) => `${API}/${baseId}`;
+const metaUrl = (baseId) => `${META}/${baseId}`;
+
+// ─── Extract base ID from Airtable URL ──────────────────────────
+function extractBaseId(input) {
+  if (!input) return null;
+  const s = input.trim();
+  // Direct base ID
+  if (/^app[a-zA-Z0-9]{10,17}$/.test(s)) return s;
+  // URL: https://airtable.com/appXXXXX/...
+  const m = s.match(/airtable\.com\/(app[a-zA-Z0-9]{10,17})/);
+  return m ? m[1] : null;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CORE CRUD — all take baseId as first param
+// ═══════════════════════════════════════════════════════════════
+
+async function listRecords(baseId, table, params = {}) {
+  const qs = new URLSearchParams();
+  if (params.view) qs.set("view", params.view);
+  if (params.maxRecords) qs.set("maxRecords", params.maxRecords);
+  if (params.filterByFormula) qs.set("filterByFormula", params.filterByFormula);
+  if (params.sort) {
+    params.sort.forEach((s, i) => {
+      qs.set(`sort[${i}][field]`, s.field);
+      if (s.direction) qs.set(`sort[${i}][direction]`, s.direction);
+    });
+  }
+  let allRecords = [];
+  let offset = null;
+  do {
+    const url = offset
+      ? `${baseUrl(baseId)}/${encodeURIComponent(table)}?${qs.toString()}&offset=${offset}`
+      : `${baseUrl(baseId)}/${encodeURIComponent(table)}?${qs.toString()}`;
+    const res = await fetch(url, { headers: authHdr });
+    if (!res.ok) {
+      const err = await res.text();
+      console.error(`LIST ${table} error:`, err);
+      throw new Error(`Airtable error: ${res.status}`);
+    }
+    const data = await res.json();
+    allRecords = allRecords.concat(data.records || []);
+    offset = data.offset;
+  } while (offset);
+  return allRecords;
+}
+
+// Cache to avoid re-checking fields on every write within the same request
+const _ensuredFieldsCache = new Map(); // key: baseId+table, value: Set of field names
+
+// Known field type overrides — autoEnsure uses these instead of defaulting to singleLineText
+const FIELD_TYPE_MAP = {
+  "Score": { type: "number", options: { precision: 0 } },
+  "Top N": { type: "number", options: { precision: 0 } },
+  "DM Step": { type: "number", options: { precision: 0 } },
+  "Description": { type: "multilineText" },
+  "Scoring Prompt": { type: "multilineText" },
+  "Scoring Fields": { type: "multilineText" },
+  "Outreach Config": { type: "multilineText" },
+  "Keywords": { type: "multilineText" },
+  "Job Title Keywords": { type: "multilineText" },
+  "Signal": { type: "multilineText" },
+  "Tables": { type: "multilineText" },
+  "Notes": { type: "multilineText" },
+};
+
+async function autoEnsureFields(baseId, table, records) {
+  const fieldNames = new Set();
+  for (const r of records) {
+    const fields = r.fields || r;
+    for (const k of Object.keys(fields)) {
+      if (k !== "id") fieldNames.add(k);
+    }
+  }
+  if (!fieldNames.size) return;
+
+  const cacheKey = `${baseId}:${table}`;
+  const cached = _ensuredFieldsCache.get(cacheKey) || new Set();
+  const toEnsure = [...fieldNames].filter(f => !cached.has(f));
+  if (!toEnsure.length) return;
+
+  // Build field defs with correct types
+  const fieldDefs = toEnsure.map(name => {
+    const override = FIELD_TYPE_MAP[name];
+    if (override) return { name, ...override };
+    return { name, type: "singleLineText" };
+  });
+
+  try {
+    await ensureCustomFields(baseId, table, fieldDefs);
+    toEnsure.forEach(f => cached.add(f));
+    _ensuredFieldsCache.set(cacheKey, cached);
+  } catch (e) {
+    console.warn(`autoEnsureFields ${table}:`, e.message);
+  }
+}
+
+async function createRecords(baseId, table, records) {
+  await autoEnsureFields(baseId, table, records);
+  const results = [];
+  for (let i = 0; i < records.length; i += 10) {
+    const batch = records.slice(i, i + 10).map(r => ({ fields: sanitizeFields(r) }));
+    // Filter out empty records
+    const validBatch = batch.filter(r => Object.keys(r.fields).length > 0);
+    if (!validBatch.length) continue;
+
+    const res = await fetch(`${baseUrl(baseId)}/${encodeURIComponent(table)}`, {
+      method: "POST", headers: hdrs,
+      body: JSON.stringify({ records: validBatch }),
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      // On any validation error, retry with stringified values
+      if (err.includes("INVALID_VALUE") || err.includes("INVALID_REQUEST") || err.includes("parameter validation")) {
+        console.warn(`CREATE ${table}: validation error, retrying with string coercion. Error: ${err.slice(0, 200)}`);
+        const safeBatch = validBatch.map(r => ({ fields: stringifyFields(r.fields) }));
+        const retry = await fetch(`${baseUrl(baseId)}/${encodeURIComponent(table)}`, {
+          method: "POST", headers: hdrs,
+          body: JSON.stringify({ records: safeBatch }),
+        });
+        if (retry.ok) { const d = await retry.json(); results.push(...(d.records || [])); continue; }
+        const retryErr = await retry.text();
+        console.error(`CREATE ${table} retry also failed:`, retryErr.slice(0, 300));
+      }
+      console.error(`CREATE ${table} error:`, err.slice(0, 300));
+      // Log first record for debugging
+      console.error(`CREATE ${table} sample record:`, JSON.stringify(validBatch[0]?.fields || {}).slice(0, 300));
+      throw new Error(`Airtable error: ${res.status}`);
+    }
+    const data = await res.json();
+    results.push(...(data.records || []));
+  }
+  return results;
+}
+
+async function updateRecords(baseId, table, records) {
+  await autoEnsureFields(baseId, table, records);
+  const results = [];
+  for (let i = 0; i < records.length; i += 10) {
+    const batch = records.slice(i, i + 10).map(r => ({ id: r.id, fields: sanitizeFields(r.fields || r) }));
+    const validBatch = batch.filter(r => r.id && Object.keys(r.fields).length > 0);
+    if (!validBatch.length) continue;
+
+    const res = await fetch(`${baseUrl(baseId)}/${encodeURIComponent(table)}`, {
+      method: "PATCH", headers: hdrs,
+      body: JSON.stringify({ records: validBatch }),
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      if (err.includes("INVALID_VALUE") || err.includes("INVALID_REQUEST") || err.includes("parameter validation")) {
+        console.warn(`UPDATE ${table}: validation error, retrying with string coercion`);
+        const safeBatch = validBatch.map(r => ({ id: r.id, fields: stringifyFields(r.fields) }));
+        const retry = await fetch(`${baseUrl(baseId)}/${encodeURIComponent(table)}`, {
+          method: "PATCH", headers: hdrs,
+          body: JSON.stringify({ records: safeBatch }),
+        });
+        if (retry.ok) { const d = await retry.json(); results.push(...(d.records || [])); continue; }
+      }
+      console.error(`UPDATE ${table} error:`, err.slice(0, 300));
+      throw new Error(`Airtable error: ${res.status}`);
+    }
+    const data = await res.json();
+    results.push(...(data.records || []));
+  }
+  return results;
+}
+
+// Sanitize: clean field values for Airtable compatibility
+function sanitizeFields(fields) {
+  const out = {};
+  for (const [k, v] of Object.entries(fields)) {
+    if (v === null || v === undefined || k === "id") continue;
+    // Skip empty strings — Airtable url fields reject ""
+    if (v === "") continue;
+    // Known numeric fields → ensure integer
+    if (FIELD_TYPE_MAP[k]?.type === "number") {
+      const num = parseFloat(v);
+      if (!isNaN(num)) out[k] = FIELD_TYPE_MAP[k]?.options?.precision === 0 ? Math.round(num) : num;
+      else out[k] = String(v); // fallback to string if not parseable
+      continue;
+    }
+    // Arrays/objects → stringify
+    if (typeof v === "object") { out[k] = JSON.stringify(v); continue; }
+    // Everything else → string (safest for Airtable)
+    out[k] = typeof v === "string" ? v : String(v);
+  }
+  return out;
+}
+
+// Fallback: convert everything to strings (works for singleLineText fields)
+function stringifyFields(fields) {
+  const out = {};
+  for (const [k, v] of Object.entries(fields)) {
+    if (v === null || v === undefined || v === "") continue;
+    out[k] = String(v);
+  }
+  return out;
+}
+
+async function deleteRecords(baseId, table, recordIds) {
+  const results = [];
+  for (let i = 0; i < recordIds.length; i += 10) {
+    const batch = recordIds.slice(i, i + 10);
+    const qs = batch.map(id => `records[]=${id}`).join("&");
+    const res = await fetch(`${baseUrl(baseId)}/${encodeURIComponent(table)}?${qs}`, {
+      method: "DELETE", headers: authHdr,
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      console.error(`DELETE ${table} error:`, err);
+      throw new Error(`Airtable error: ${res.status}`);
+    }
+    const data = await res.json();
+    results.push(...(data.records || []));
+  }
+  return results;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SCHEMA / FIELD MANAGEMENT
+// ═══════════════════════════════════════════════════════════════
+
+const SCHEMA = {
+  "Accounts": [
+    { name: "Name", type: "singleLineText" },
+    { name: "Domain", type: "singleLineText" },
+    { name: "Industry", type: "singleLineText" },
+    { name: "Size", type: "singleLineText" },
+    { name: "LinkedIn URL", type: "singleLineText" },
+    { name: "Country", type: "singleLineText" },
+  ],
+  "Leads": [
+    { name: "Name", type: "singleLineText" },
+    { name: "Email", type: "singleLineText" },
+    { name: "Title", type: "singleLineText" },
+    { name: "Company", type: "singleLineText" },
+    { name: "LinkedIn URL", type: "singleLineText" },
+    { name: "Phone", type: "singleLineText" },
+  ],
+  "Task Rules": [
+    { name: "Name", type: "singleLineText" },
+    { name: "Description", type: "multilineText" },
+    { name: "Task Type", type: "singleLineText" },
+    { name: "Scan Target", type: "singleLineText" },
+    { name: "Ease", type: "singleLineText" },
+    { name: "Strength", type: "singleLineText" },
+    { name: "Sources", type: "singleLineText" },
+    { name: "Keywords", type: "multilineText" },
+    { name: "Job Title Keywords", type: "multilineText" },
+    { name: "Scoring Prompt", type: "multilineText" },
+  ],
+  "Prompts": [
+    { name: "Name", type: "singleLineText" },
+    { name: "Task Rule", type: "singleLineText" },
+    { name: "Prompt", type: "multilineText" },
+  ],
+  "Tasks": [
+    { name: "Company", type: "singleLineText" },
+    { name: "Task Rule", type: "singleLineText" },
+    { name: "Score", type: "number", options: { precision: 0 } },
+    { name: "Scan Target", type: "singleLineText" },
+    { name: "Signal", type: "singleLineText" },
+    { name: "Source", type: "singleLineText" },
+    { name: "URL", type: "url" },
+    { name: "Task Type", type: "singleLineText" },
+    { name: "Date", type: "singleLineText" },
+    { name: "Created", type: "singleLineText" },
+  ],
+  "Campaigns": [
+    { name: "Name", type: "singleLineText" },
+    { name: "Base ID", type: "singleLineText" },
+    { name: "Features", type: "singleLineText" },
+    { name: "Description", type: "multilineText" },
+    { name: "Emoji", type: "singleLineText" },
+    { name: "Tables", type: "multilineText" },
+  ],
+};
+
+// ─── Fetch current tables from a base ───────────────────────
+async function fetchTables(baseId) {
+  const res = await fetch(`${metaUrl(baseId)}/tables`, { headers: authHdr });
+  if (res.status === 401 || res.status === 403) {
+    const err = await res.text();
+    throw new Error(`Auth failed (${res.status}). Token needs scopes: data.records:read/write, schema.bases:read/write. ${err.slice(0, 150)}`);
+  }
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Failed to fetch schema: ${res.status} — ${err.slice(0, 200)}`);
+  }
+  const { tables } = await res.json();
+  return tables || [];
+}
+
+// ─── Create a table with fields ─────────────────────────────
+async function createTable(baseId, tableName, fieldDefs) {
+  // Airtable requires at least one field to create a table.
+  // The first field becomes the primary field (must be singleLineText, email, or url).
+  const fields = fieldDefs.map(f => {
+    const fd = { name: f.name, type: f.type };
+    if (f.options) fd.options = f.options;
+    return fd;
+  });
+  const res = await fetch(`${metaUrl(baseId)}/tables`, {
+    method: "POST", headers: hdrs,
+    body: JSON.stringify({ name: tableName, fields }),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Failed to create table "${tableName}": ${res.status} — ${err.slice(0, 200)}`);
+  }
+  return await res.json();
+}
+
+// ─── Add a single field to an existing table ────────────────
+async function addField(baseId, tableId, fieldDef) {
+  const body = { name: fieldDef.name, type: fieldDef.type || "singleLineText" };
+  if (fieldDef.options) body.options = fieldDef.options;
+  const res = await fetch(`${metaUrl(baseId)}/tables/${tableId}/fields`, {
+    method: "POST", headers: hdrs, body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    if (err.includes("DUPLICATE_FIELD_NAME")) return { status: "skipped" };
+    throw new Error(`${fieldDef.name}: ${err.slice(0, 120)}`);
+  }
+  return { status: "created" };
+}
+
+// ─── Ensure a table + its fields exist ──────────────────────
+// Creates the table if missing, then adds any missing fields.
+async function ensureTable(baseId, tableName, requiredFields, existingTables) {
+  const results = { tables_created: [], fields_created: [], fields_skipped: [], errors: [] };
+  let table = existingTables.find(t => t.name === tableName);
+
+  if (!table) {
+    // Create the table with all fields at once
+    try {
+      const created = await createTable(baseId, tableName, requiredFields);
+      results.tables_created.push(tableName);
+      results.fields_created.push(...requiredFields.map(f => `${tableName}.${f.name}`));
+      return results; // all fields created with the table
+    } catch (e) {
+      results.errors.push(e.message);
+      return results;
+    }
+  }
+
+  // Table exists — add missing fields
+  const existingNames = new Set((table.fields || []).map(f => f.name));
+  for (const field of requiredFields) {
+    if (existingNames.has(field.name)) {
+      results.fields_skipped.push(`${tableName}.${field.name}`);
+      continue;
+    }
+    try {
+      const r = await addField(baseId, table.id, field);
+      if (r.status === "skipped") results.fields_skipped.push(`${tableName}.${field.name}`);
+      else results.fields_created.push(`${tableName}.${field.name}`);
+    } catch (e) {
+      results.errors.push(e.message);
+    }
+  }
+  return results;
+}
+
+// ─── Ensure custom fields exist (auto-creates table too) ────
+// fieldDefs: string[] | {name, type, options}[]
+async function ensureCustomFields(baseId, tableName, fieldDefs) {
+  const results = { created: [], skipped: [], errors: [] };
+  let tables;
+  try {
+    tables = await fetchTables(baseId);
+  } catch (e) {
+    results.errors.push(e.message);
+    return results;
+  }
+
+  // Normalize fieldDefs
+  const normalized = fieldDefs.map(fd => typeof fd === "string"
+    ? { name: fd, type: "singleLineText" }
+    : { name: fd.name, type: fd.type || "singleLineText", options: fd.options }
+  );
+
+  let table = tables.find(t => t.name === tableName);
+
+  // Create the table if it doesn't exist
+  if (!table) {
+    try {
+      await createTable(baseId, tableName, normalized);
+      results.created.push(...normalized.map(f => f.name));
+      return results;
+    } catch (e) {
+      results.errors.push(e.message);
+      return results;
+    }
+  }
+
+  // Table exists — add missing fields
+  const existingNames = new Set((table.fields || []).map(f => f.name));
+  for (const fd of normalized) {
+    if (existingNames.has(fd.name)) {
+      results.skipped.push(fd.name);
+      continue;
+    }
+    try {
+      const r = await addField(baseId, table.id, fd);
+      if (r.status === "skipped") results.skipped.push(fd.name);
+      else results.created.push(fd.name);
+    } catch (e) {
+      results.errors.push(e.message);
+    }
+  }
+  return results;
+}
+
+// ─── Setup: ensure ALL required tables + fields ─────────────
+async function setupSchema(baseId) {
+  let tables;
+  try {
+    tables = await fetchTables(baseId);
+  } catch (e) {
+    throw e;
+  }
+
+  const results = {
+    tables_created: [], fields_created: [], fields_skipped: [], errors: [],
+    tables_found: tables.map(t => t.name),
+  };
+
+  for (const [tableName, requiredFields] of Object.entries(SCHEMA)) {
+    const r = await ensureTable(baseId, tableName, requiredFields, tables);
+    results.tables_created.push(...r.tables_created);
+    results.fields_created.push(...r.fields_created);
+    results.fields_skipped.push(...r.fields_skipped);
+    results.errors.push(...r.errors);
+
+    // If we just created a table, refresh the tables list so subsequent
+    // ensureTable calls see it
+    if (r.tables_created.length > 0) {
+      try { tables = await fetchTables(baseId); } catch (_) {}
+    }
+  }
+
+  // Update tables_found to include any we just created
+  results.tables_found = [...new Set([...results.tables_found, ...results.tables_created])];
+
+  return results;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DISCOVER — probe an Airtable base, return tables & fields
+// ═══════════════════════════════════════════════════════════════
+
+async function discoverBase(baseId) {
+  const res = await fetch(`${metaUrl(baseId)}/tables`, { headers: authHdr });
+  if (res.status === 401 || res.status === 403) {
+    throw new Error("Access denied. Make sure your personal token has access to all bases (Settings → API → Personal Access Token → Scopes: schema.bases:read + data.records:read/write on 'All current and future bases').");
+  }
+  if (res.status === 404) {
+    throw new Error("Base not found. Check the URL — it should look like https://airtable.com/appXXXXXXXXXXX");
+  }
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Airtable error ${res.status}: ${err.slice(0, 200)}`);
+  }
+  const { tables } = await res.json();
+  const tableNames = (tables || []).map(t => t.name);
+  return {
+    baseId,
+    tables: (tables || []).map(t => ({
+      name: t.name,
+      fields: (t.fields || []).map(f => ({ name: f.name, type: f.type })),
+    })),
+    tableNames,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CAMPAIGN REGISTRY — stored in master base's Campaigns table
+// ═══════════════════════════════════════════════════════════════
+
+async function listCampaigns() {
+  try {
+    return await listRecords(MASTER_BASE_ID, "Campaigns");
+  } catch (e) {
+    console.error("listCampaigns error:", e);
+    return [];
+  }
+}
+
+// Auto-ensure Campaigns table + all fields exist before writing
+async function ensureCampaignFields() {
+  try {
+    const tables = await fetchTables(MASTER_BASE_ID);
+    await ensureTable(MASTER_BASE_ID, "Campaigns", SCHEMA["Campaigns"], tables);
+  } catch (e) {
+    console.error("ensureCampaignFields error:", e);
+  }
+}
+
+async function createCampaign(fields) {
+  await ensureCampaignFields();
+  return await createRecords(MASTER_BASE_ID, "Campaigns", [fields]);
+}
+
+async function deleteCampaign(recordId) {
+  return await deleteRecords(MASTER_BASE_ID, "Campaigns", [recordId]);
+}
+
+async function updateCampaign(records) {
+  await ensureCampaignFields();
+  return await updateRecords(MASTER_BASE_ID, "Campaigns", records);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// TOP X SCORING ENGINE
+// ═══════════════════════════════════════════════════════════════
+
+async function runTopXScoring(baseId, rule) {
+  const scanTarget = rule.scanTarget || "leads";
+  const topN = rule.topN || 10;
+  const scoringFields = rule.scoringFields || [];
+  const scoringPrompt = (rule.scoringPrompt || "").trim();
+  if (!scoringFields.length && !scoringPrompt) return { error: "No scoring fields or AI prompt defined", tasks: [] };
+  const table = scanTarget === "accounts" ? "Accounts" : "Leads";
+  const records = await listRecords(baseId, table);
+  if (!records.length) return { error: `No ${table.toLowerCase()} found`, tasks: [] };
+
+  // ─── Step 1: Weighted numeric scoring (skipped if no fields) ──
+  const scored = records.map(r => {
+    const fields = r.fields || {};
+    let cs = 0;
+    if (scoringFields.length > 0) {
+      const totalWeight = scoringFields.reduce((sum, sf) => sum + (sf.weight || 0), 0);
+      const nf = scoringFields.map(sf => ({
+        field: sf.field,
+        weight: totalWeight > 0 ? (sf.weight || 0) / totalWeight : 1 / scoringFields.length,
+      }));
+      // Compute field stats inline (we need them per-field across all records)
+      for (const sf of nf) {
+        if (!sf._stats) {
+          const values = records.map(rec => parseFloat(rec.fields?.[sf.field]) || 0);
+          sf._stats = { min: Math.min(...values, 0), max: Math.max(...values, 1) };
+        }
+        const raw = parseFloat(fields[sf.field]) || 0;
+        const range = sf._stats.max - sf._stats.min;
+        cs += (range > 0 ? ((raw - sf._stats.min) / range) * 100 : 0) * sf.weight;
+      }
+    }
+    return { record: r, numericScore: Math.round(cs), name: fields.Name || fields.Company || "Unknown" };
+  });
+
+  // ─── Step 2: AI scoring (only if prompt provided + OpenAI key) ──
+  const hasNumeric = scoringFields.length > 0;
+  let useAI = scoringPrompt && OPENAI_KEY;
+  if (useAI) {
+    scored.sort((a, b) => b.numericScore - a.numericScore);
+    // When no numeric fields, AI-score all (up to 100). When blended, AI-score top 3x.
+    const candidateCount = scoringFields.length > 0
+      ? Math.min(scored.length, topN * 3)
+      : Math.min(scored.length, 100);
+    const candidates = scored.slice(0, candidateCount);
+    const rest = scored.slice(candidateCount);
+
+    try {
+      const openai = new OpenAI({ apiKey: OPENAI_KEY });
+      const BATCH = 5; // smaller batches to avoid token truncation
+      for (let i = 0; i < candidates.length; i += BATCH) {
+        const batch = candidates.slice(i, i + BATCH);
+        const recordSummaries = batch.map((item, idx) => {
+          const f = item.record.fields || {};
+          const dataStr = Object.entries(f)
+            .filter(([_, v]) => v !== null && v !== undefined && v !== "")
+            .map(([k, v]) => `${k}: ${String(v).slice(0, 150)}`)
+            .join(" | ");
+          return `[${idx}] ${item.name} — ${dataStr}`;
+        }).join("\n");
+
+        const completion = await openai.chat.completions.create({
+          model: "gpt-4.1-mini",
+          temperature: 0.2,
+          max_tokens: 2048,
+          messages: [
+            { role: "system", content: `You are a B2B lead/account scoring engine. Score each record from 0-100 based on the user's criteria. Consider ALL data provided. Return ONLY a JSON array: [{"idx":0,"score":85,"reason":"max 15 words"},...]. Keep reasons under 15 words. One entry per record. No markdown.` },
+            { role: "user", content: `Scoring Criteria:\n${scoringPrompt}\n\n${scoringFields.length > 0 ? "Scoring Fields (weighted): " + scoringFields.map(sf => sf.field + " (" + sf.weight + "%)").join(", ") + "\n\n" : ""}Records:\n${recordSummaries}` }
+          ],
+        });
+
+        const text = completion.choices[0]?.message?.content || "[]";
+        const cleaned = text.replace(/```json\n?|```/g, "").trim();
+        try {
+          const aiScores = JSON.parse(cleaned);
+          for (const as of aiScores) {
+            if (as.idx !== undefined && as.score !== undefined && batch[as.idx]) {
+              batch[as.idx].aiScore = Math.max(0, Math.min(100, Math.round(as.score)));
+              batch[as.idx].aiReason = (as.reason || as.tier || "").slice(0, 100);
+            }
+          }
+        } catch (parseErr) {
+          // Attempt to recover truncated JSON — extract what we can
+          console.warn("AI scoring parse error, attempting recovery:", parseErr.message);
+          try {
+            // Find all complete objects in truncated JSON
+            const objMatches = cleaned.matchAll(/\{"idx"\s*:\s*(\d+)\s*,\s*"score"\s*:\s*(\d+)/g);
+            for (const m of objMatches) {
+              const idx = parseInt(m[1]);
+              const score = parseInt(m[2]);
+              if (batch[idx]) {
+                batch[idx].aiScore = Math.max(0, Math.min(100, score));
+                batch[idx].aiReason = "AI scored (partial recovery)";
+              }
+            }
+          } catch (recoveryErr) {
+            console.error("AI scoring recovery also failed:", recoveryErr.message);
+          }
+        }
+      }
+
+      // Retry any unscored candidates individually (handles batch parse failures)
+      const unscored = candidates.filter(item => item.aiScore === undefined);
+      if (unscored.length > 0 && unscored.length <= 20) {
+        console.log(`Retrying ${unscored.length} unscored records individually`);
+        for (const item of unscored) {
+          try {
+            const f = item.record.fields || {};
+            const dataStr = Object.entries(f)
+              .filter(([_, v]) => v !== null && v !== undefined && v !== "")
+              .map(([k, v]) => `${k}: ${String(v).slice(0, 200)}`)
+              .join(" | ");
+            const retry = await openai.chat.completions.create({
+              model: "gpt-4.1-mini", temperature: 0.2, max_tokens: 200,
+              messages: [
+                { role: "system", content: `Score this B2B lead/account from 0-100. Return ONLY: {"score":85,"reason":"max 15 words"}` },
+                { role: "user", content: `Criteria:\n${scoringPrompt}\n\nRecord: ${item.name} — ${dataStr}` }
+              ],
+            });
+            const rt = (retry.choices[0]?.message?.content || "").replace(/```json\n?|```/g, "").trim();
+            const rd = JSON.parse(rt);
+            if (rd.score !== undefined) {
+              item.aiScore = Math.max(0, Math.min(100, Math.round(rd.score)));
+              item.aiReason = (rd.reason || rd.tier || "").slice(0, 100);
+            }
+          } catch (e) { /* individual retry failed, keep unscored */ }
+        }
+      }
+
+      // Final score: if numeric fields exist, blend 40% numeric + 60% AI. Otherwise pure AI.
+      for (const item of candidates) {
+        if (item.aiScore !== undefined) {
+          item.compositeScore = hasNumeric
+            ? Math.round(item.numericScore * 0.4 + item.aiScore * 0.6)
+            : item.aiScore;
+        } else {
+          item.compositeScore = item.numericScore;
+        }
+      }
+      // Non-candidates keep numeric score (won't make top N anyway)
+      rest.forEach(item => { item.compositeScore = item.numericScore; });
+      // Recombine and re-sort
+      scored.length = 0;
+      scored.push(...candidates, ...rest);
+    } catch (e) {
+      console.error("AI scoring failed, falling back to numeric:", e.message);
+      useAI = false;
+      scored.forEach(item => { item.compositeScore = item.numericScore; });
+    }
+  } else {
+    scored.forEach(item => { item.compositeScore = item.numericScore; });
+  }
+
+  scored.sort((a, b) => b.compositeScore - a.compositeScore);
+  const fieldList = scoringFields.map(sf => sf.field).join(", ");
+  const tasks = scored.slice(0, topN).map(item => {
+    const score = parseInt(item.compositeScore) || 0;
+    const aiScore = parseInt(item.aiScore) || 0;
+    const numScore = parseInt(item.numericScore) || 0;
+    return {
+      Company: item.name,
+      "Task Rule": rule.name || "Top X",
+      Score: Math.max(0, Math.min(100, score)),
+      "Scan Target": scanTarget,
+      Signal: item.aiReason
+        ? `AI: ${item.aiReason} (${hasNumeric ? "numeric: " + numScore + ", " : ""}AI: ${aiScore})`
+        : hasNumeric
+          ? `Ranked by weighted score${fieldList ? " (" + fieldList + ")" : ""}: ${numScore}/100`
+          : `AI score pending — record included by position`,
+      Source: useAI ? "Top X + AI Scoring" : "Top X Scoring",
+      URL: "",
+      "Task Type": "top_x",
+      Date: new Date().toISOString().slice(0, 10),
+      Created: new Date().toISOString(),
+    };
+  });
+  return { tasks, totalRecords: records.length, topN, aiScored: !!useAI };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// GET TABLE FIELDS
+// ═══════════════════════════════════════════════════════════════
+
+async function getTableFields(baseId, tableName) {
+  try {
+    const res = await fetch(`${metaUrl(baseId)}/tables`, { headers: authHdr });
+    if (!res.ok) return [];
+    const { tables } = await res.json();
+    const table = tables.find(t => t.name === tableName);
+    if (!table) return [];
+    return (table.fields || []).map(f => ({ name: f.name, type: f.type }));
+  } catch (e) {
+    console.error("getTableFields error:", e);
+    return [];
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// TEST CONNECTION
+// ═══════════════════════════════════════════════════════════════
+
+async function testConnection(baseId) {
+  const result = { steps: [] };
+  try {
+    const res = await fetch(`${metaUrl(baseId)}/tables`, { headers: authHdr });
+    if (!res.ok) {
+      const err = await res.text();
+      result.steps.push({ step: "Read schema", ok: false, msg: `HTTP ${res.status}: ${err.slice(0, 150)}` });
+      return result;
+    }
+    const { tables } = await res.json();
+    result.steps.push({ step: "Read schema", ok: true, msg: `Found ${tables.length} tables: ${tables.map(t => t.name).join(", ")}` });
+    const testTable = tables[0];
+    if (!testTable) {
+      result.steps.push({ step: "Write test", ok: false, msg: "No tables found" });
+      return result;
+    }
+    const tfn = `_test_ss_${Date.now()}`;
+    const cr = await fetch(`${metaUrl(baseId)}/tables/${testTable.id}/fields`, {
+      method: "POST", headers: hdrs, body: JSON.stringify({ name: tfn, type: "singleLineText" }),
+    });
+    if (!cr.ok) {
+      const err = await cr.text();
+      result.steps.push({ step: "Write test", ok: false, msg: err.includes("NOT_AUTHORIZED") || cr.status === 403 ? 'Token needs "schema.bases:write" scope.' : `HTTP ${cr.status}: ${err.slice(0, 150)}` });
+      return result;
+    }
+    result.steps.push({ step: "Write test", ok: true, msg: `Created "${tfn}" in ${testTable.name}` });
+    result.steps.push({ step: "Cleanup", ok: true, msg: `Delete "${tfn}" from "${testTable.name}" manually` });
+    return result;
+  } catch (e) {
+    result.steps.push({ step: "Connection", ok: false, msg: e.message });
+    return result;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ROUTE HANDLER
+// ═══════════════════════════════════════════════════════════════
+
+export async function POST(request) {
+  try {
+    if (!API_KEY) {
+      return NextResponse.json({ error: "AIRTABLE_API_KEY not configured" }, { status: 500 });
+    }
+
+    const body = await request.json();
+    const { action, table, records, recordIds, params, fieldNames, rule } = body;
+    // baseId: use provided, else fall back to master
+    const baseId = body.baseId || MASTER_BASE_ID;
+
+    if (!baseId) {
+      return NextResponse.json({ error: "No baseId provided and no AIRTABLE_BASE_ID configured" }, { status: 500 });
+    }
+
+    switch (action) {
+      // ─── Campaign Registry (always uses master base) ────────
+      case "list_campaigns": {
+        if (!MASTER_BASE_ID) return NextResponse.json({ records: [] });
+        const data = await listCampaigns();
+        return NextResponse.json({ records: data });
+      }
+      case "create_campaign": {
+        if (!MASTER_BASE_ID) return NextResponse.json({ error: "No master base configured" }, { status: 500 });
+        const data = await createCampaign(body.fields);
+        return NextResponse.json({ records: data });
+      }
+      case "delete_campaign": {
+        if (!MASTER_BASE_ID) return NextResponse.json({ error: "No master base configured" }, { status: 500 });
+        const data = await deleteCampaign(body.campaignRecordId);
+        return NextResponse.json({ records: data });
+      }
+      case "update_campaign": {
+        if (!MASTER_BASE_ID) return NextResponse.json({ error: "No master base configured" }, { status: 500 });
+        const data = await updateCampaign(body.campaignRecords);
+        return NextResponse.json({ records: data });
+      }
+
+      // ─── Discover a new base ────────────────────────────────
+      case "discover": {
+        const bid = extractBaseId(body.baseUrl);
+        if (!bid) return NextResponse.json({ error: "Could not extract base ID from URL. Paste a URL like https://airtable.com/appXXXXXXXXXXX or just the base ID." }, { status: 400 });
+        const info = await discoverBase(bid);
+        return NextResponse.json(info);
+      }
+
+      // ─── Data operations (use campaign's baseId) ────────────
+      case "setup": {
+        const results = await setupSchema(baseId);
+        return NextResponse.json(results);
+      }
+      case "test": {
+        const results = await testConnection(baseId);
+        return NextResponse.json(results);
+      }
+      case "list": {
+        const data = await listRecords(baseId, table, params || {});
+        return NextResponse.json({ records: data });
+      }
+      case "create": {
+        const data = await createRecords(baseId, table, records);
+        return NextResponse.json({ records: data });
+      }
+      case "update": {
+        const data = await updateRecords(baseId, table, records);
+        return NextResponse.json({ records: data });
+      }
+      case "delete": {
+        const data = await deleteRecords(baseId, table, recordIds);
+        return NextResponse.json({ records: data });
+      }
+      case "ensure_fields": {
+        if (!table || !fieldNames?.length) return NextResponse.json({ error: "table and fieldNames required" }, { status: 400 });
+        const results = await ensureCustomFields(baseId, table, fieldNames);
+        return NextResponse.json(results);
+      }
+      case "get_fields": {
+        if (!table) return NextResponse.json({ error: "table required" }, { status: 400 });
+        const fields = await getTableFields(baseId, table);
+        return NextResponse.json({ fields });
+      }
+      case "run_topx": {
+        if (!rule) return NextResponse.json({ error: "rule required" }, { status: 400 });
+        const result = await runTopXScoring(baseId, rule);
+        return NextResponse.json(result);
+      }
+      default:
+        return NextResponse.json({ error: "Unknown action" }, { status: 400 });
+    }
+  } catch (error) {
+    console.error("Airtable API error:", error);
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+}

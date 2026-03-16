@@ -1,0 +1,16 @@
+{
+  "framework": "nextjs",
+  "buildCommand": "npm run build",
+  "installCommand": "npm install",
+  "functions": {
+    "app/api/**/*.js": {
+      "maxDuration": 600
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/cron/outreach",
+      "schedule": "0 */4 * * *"
+    }
+  ]
+}
