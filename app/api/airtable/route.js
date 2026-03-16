@@ -117,35 +117,38 @@ async function createRecords(baseId, table, records) {
   const results = [];
   for (let i = 0; i < records.length; i += 10) {
     const batch = records.slice(i, i + 10).map(r => ({ fields: sanitizeFields(r) }));
-    // Filter out empty records
     const validBatch = batch.filter(r => Object.keys(r.fields).length > 0);
     if (!validBatch.length) continue;
 
     const res = await fetch(`${baseUrl(baseId)}/${encodeURIComponent(table)}`, {
       method: "POST", headers: hdrs,
-      body: JSON.stringify({ records: validBatch }),
+      body: JSON.stringify({ records: validBatch, typecast: true }),
     });
-    if (!res.ok) {
-      const err = await res.text();
-      // On any validation error, retry with stringified values
-      if (err.includes("INVALID_VALUE") || err.includes("INVALID_REQUEST") || err.includes("parameter validation")) {
-        console.warn(`CREATE ${table}: validation error, retrying with string coercion. Error: ${err.slice(0, 200)}`);
-        const safeBatch = validBatch.map(r => ({ fields: stringifyFields(r.fields) }));
-        const retry = await fetch(`${baseUrl(baseId)}/${encodeURIComponent(table)}`, {
-          method: "POST", headers: hdrs,
-          body: JSON.stringify({ records: safeBatch }),
-        });
-        if (retry.ok) { const d = await retry.json(); results.push(...(d.records || [])); continue; }
-        const retryErr = await retry.text();
-        console.error(`CREATE ${table} retry also failed:`, retryErr.slice(0, 300));
-      }
-      console.error(`CREATE ${table} error:`, err.slice(0, 300));
-      // Log first record for debugging
-      console.error(`CREATE ${table} sample record:`, JSON.stringify(validBatch[0]?.fields || {}).slice(0, 300));
-      throw new Error(`Airtable error: ${res.status}`);
+    if (res.ok) {
+      const data = await res.json();
+      results.push(...(data.records || []));
+      continue;
     }
-    const data = await res.json();
-    results.push(...(data.records || []));
+
+    // Batch failed — fall back to one-at-a-time so we skip bad records instead of losing the whole batch
+    const err = await res.text();
+    console.warn(`CREATE ${table}: batch of ${validBatch.length} failed (${err.slice(0, 120)}), inserting one-by-one...`);
+
+    for (const rec of validBatch) {
+      try {
+        const r1 = await fetch(`${baseUrl(baseId)}/${encodeURIComponent(table)}`, {
+          method: "POST", headers: hdrs,
+          body: JSON.stringify({ records: [{ fields: stringifyFields(rec.fields) }], typecast: true }),
+        });
+        if (r1.ok) {
+          const d = await r1.json();
+          results.push(...(d.records || []));
+        } else {
+          const e1 = await r1.text();
+          console.error(`CREATE ${table} skip record:`, e1.slice(0, 100), "→", JSON.stringify(rec.fields).slice(0, 150));
+        }
+      } catch (e) { console.error(`CREATE ${table} single:`, e.message); }
+    }
   }
   return results;
 }
@@ -160,20 +163,17 @@ async function updateRecords(baseId, table, records) {
 
     const res = await fetch(`${baseUrl(baseId)}/${encodeURIComponent(table)}`, {
       method: "PATCH", headers: hdrs,
-      body: JSON.stringify({ records: validBatch }),
+      body: JSON.stringify({ records: validBatch, typecast: true }),
     });
     if (!res.ok) {
       const err = await res.text();
-      if (err.includes("INVALID_VALUE") || err.includes("INVALID_REQUEST") || err.includes("parameter validation")) {
-        console.warn(`UPDATE ${table}: validation error, retrying with string coercion`);
-        const safeBatch = validBatch.map(r => ({ id: r.id, fields: stringifyFields(r.fields) }));
-        const retry = await fetch(`${baseUrl(baseId)}/${encodeURIComponent(table)}`, {
-          method: "PATCH", headers: hdrs,
-          body: JSON.stringify({ records: safeBatch }),
-        });
-        if (retry.ok) { const d = await retry.json(); results.push(...(d.records || [])); continue; }
-      }
       console.error(`UPDATE ${table} error:`, err.slice(0, 300));
+      const safeBatch = validBatch.map(r => ({ id: r.id, fields: stringifyFields(r.fields) }));
+      const retry = await fetch(`${baseUrl(baseId)}/${encodeURIComponent(table)}`, {
+        method: "PATCH", headers: hdrs,
+        body: JSON.stringify({ records: safeBatch, typecast: true }),
+      });
+      if (retry.ok) { const d = await retry.json(); results.push(...(d.records || [])); continue; }
       throw new Error(`Airtable error: ${res.status}`);
     }
     const data = await res.json();
