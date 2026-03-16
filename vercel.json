@@ -6,11 +6,4 @@
     "app/api/**/*.js": {
       "maxDuration": 300
     }
-  },
-  "crons": [
-    {
-      "path": "/api/cron/outreach",
-      "schedule": "0 */4 * * *"
-    }
-  ]
-}
+  }
