@@ -1059,8 +1059,6 @@ export default function SignalScope() {
         </div>
       </div>
     ) : (<>
-      </div>
-    ) : (<>
 
     {/* Stats Cards */}
     {outreachStats && (<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(130px,1fr))",gap:12,marginBottom:20}}>
