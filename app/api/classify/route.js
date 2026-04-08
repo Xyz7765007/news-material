@@ -176,45 +176,47 @@ async function generateScoringPrompt(taskName, taskDescription, taskKeywords, ta
       messages: [
         {
           role: "system",
-          content: `You generate scoring criteria prompts for a B2B signal intelligence tool. Given a task definition, create a STRICT, precise scoring prompt that an AI will use to rate the relevance of ${sourceType} from 0-100.
+          content: `You generate scoring criteria prompts for a B2B signal intelligence tool used by a SALES TEAM. Every signal must be ACTIONABLE — meaning it should lead to a concrete outreach action (connect with someone, pitch a solution, time an approach). If a signal wouldn't lead to a clear next step, it should score low.
 
-Your prompt MUST include ALL of these sections in this order:
+Your prompt MUST include ALL sections:
 
 1. **Opening**: "Rate this signal on how directly it [describes what the signal must show]."
 
-2. **Subject requirement**: Who or what must the signal be about? Be explicit:
-   - For role-based signals: specify exact titles that qualify (and which DON'T)
-   - For market signals: specify the DIRECTION (who is the subject — new entrant vs incumbent, the company leaving vs joining)
-   - For event signals: specify what the event IS vs what it ISN'T
+2. **Actionability gate**: What sales action would this signal trigger? Define it. If a signal matches the topic but the sales team wouldn't do anything with it, it should score below 60.
 
-3. **Score 90-100**: Exact match. Include 1-2 concrete headline examples in quotes.
-
-4. **Score 70-89**: Strong but not exact. What's missing vs a 90+?
-
-5. **Score 50-69**: Tangential. Shares keywords but wrong context.
-
-6. **Score BELOW 50 (MOST IMPORTANT SECTION)**: Explicit rejection rules. List 3-5 specific patterns that look like matches but AREN'T. These are the tricky false positives.
+3. **Subject requirement**: Be HYPER-SPECIFIC about who/what qualifies:
+   - For role-based signals: list EXACT titles that qualify AND exact titles that DON'T
+   - "Interim CMO" means CMO specifically — interim CSCO, CFO, CTO = score below 30
+   - "Senior marketer exits" means the person must be a MARKETING executive — a brand president departing from a non-marketing role doesn't count
+   - "Regulatory change affecting data use" means consumer/marketing data — healthcare records, HIPAA, or non-marketing regulations = below 30
 ${isJobPost ? `
-   Common job post false positives to address:
-   - Adjacent department roles (HR/Compensation/Operations that share keywords with marketing)
-   - Junior roles matching senior signals (Coordinator ≠ Director ≠ VP ≠ C-level)
-   - The word "temporary" or "contract" in a non-marketing role does NOT make it an "interim CMO"
-   - SEO/Content/Social media specialists are NOT "Marketing Transformation" or "AI Marketing" roles unless the title explicitly says so
+4. **Seniority gate** (critical for job posts):
+   - Unless the task explicitly targets analyst/coordinator-level, only Director+ roles should score 70+
+   - "Marketing Analyst" at a hospital is NOT an actionable signal for a sales team — score below 40
+   - Manager-level: score 50-69 max. Director: 70-85. VP/C-level: 85-100.
+   - The role must be at a company where you could actually sell — context matters
 ` : ""}
 ${isNews ? `
-   Common news false positives to address:
-   - The target company doing something new ≠ "new entrant" (the signal is about someone ELSE entering THEIR market)
-   - A person from a different department leaving ≠ "senior marketer exits" (verify the person's actual role)
-   - A company partnership ≠ "new entrant threatening" (partnership means they're working together, not competing)
-   - Any executive making any statement ≠ "exec reframes success metrics" (must be specifically about changing KPIs)
-   - General company news that shares a keyword is NOT a match (keyword co-occurrence ≠ signal relevance)
+4. **Topic specificity** (critical for news):
+   - "Category growth stalls" = the actual product/service category declining. A company launching a new fund or product ≠ category stalling.
+   - "Earnings call focus on CAC" = the earnings call must SPECIFICALLY discuss CAC/acquisition costs. General earnings news ≠ CAC focus.
+   - "Executive speaking on effectiveness" at a conference = strong. Scheduled to speak = early signal, score 60-65 (not yet actionable).
+   - "Regulatory change affecting data use" = consumer data privacy, GDPR, CCPA. Healthcare records, internal data policies = not relevant.
 ` : ""}
 
-7. **Examples with scores**: 3 examples including at least 1 false positive that should score below 40.
+5. **Score 90-100**: Exact match + immediately actionable. Include examples.
+6. **Score 70-89**: Strong match, clearly actionable but missing something.
+7. **Score 50-69**: Related but either not actionable or missing key specificity.
+8. **Score BELOW 50**: List 3-5 false positives. Include at least:
+   - A keyword overlap that's the wrong context
+   - A role/person from the wrong department
+   - A topic that shares words but describes a different event
 
-The prompt should be 200-350 words. The #1 quality metric is PRECISION over RECALL — it's much better to miss a real signal than to surface a wrong one. When in doubt, the prompt should drive scores LOWER.
+9. **Examples**: 3 examples with at least 1 false positive scoring below 40.
 
-Return ONLY the scoring prompt text. No quotes, no explanation, no markdown.`,
+200-350 words. Precision over recall. If unsure, score lower.
+
+Return ONLY the scoring prompt text.`,
         },
         {
           role: "user",
@@ -232,7 +234,7 @@ Signal Sources: ${(taskSources || []).join(", ") || "N/A"}`,
     console.error("Scoring prompt generation error:", e);
     const kws = [...(taskKeywords || []), ...(taskJobTitleKeywords || [])].slice(0, 5).join(", ");
     return {
-      scoringPrompt: `Rate the relevance of this signal for detecting "${taskName}" at the target company. Score 90-100 ONLY if it directly and explicitly matches the core signal (${kws}). Score 70-89 for strong alignment with minor gaps. Score 50-69 for partial relevance. Score below 50 — and be aggressive here — if the signal is only tangentially related, uses similar keywords in a different context, or describes a different type of event/role than what this task tracks. When in doubt, score lower.`,
+      scoringPrompt: `Rate the relevance of this signal for detecting "${taskName}". Score 90-100 ONLY for exact matches that are immediately actionable (${kws}). Score 70-89 for strong, actionable signals. Score 50-69 for related but weak actionability. Score below 50 for wrong department, wrong seniority, wrong topic, or signals that wouldn't lead to a sales action.`,
     };
   }
 }

@@ -108,7 +108,7 @@ td{padding:10px 12px;border-bottom:1px solid var(--bdr);color:var(--t2)}tr:last-
 export default function SignalScope() {
   const [camp, setCamp] = useState(null); // active campaign object
   const [campaigns, setCampaigns] = useState(DEFAULT_CAMPAIGNS);
-  const [tab, setTab] = useState("accounts");
+  const [tab, setTab] = useState("dashboard");
   const [accounts, setAccounts] = useState([]);
   const [leads, setLeads] = useState([]);
   const [rules, setRules] = useState([]);
@@ -176,7 +176,10 @@ export default function SignalScope() {
             baseId: f["Base ID"] || null, tables: f.Tables || "",
           };
         });
-        setCampaigns([...DEFAULT_CAMPAIGNS, ...userCamps]);
+        // Deduplicate: if a default campaign exists in Airtable, skip the default
+        const userNames = new Set(userCamps.map(c => c.name.toLowerCase().trim()));
+        const dedupedDefaults = DEFAULT_CAMPAIGNS.filter(d => !userNames.has(d.name.toLowerCase().trim()));
+        setCampaigns([...dedupedDefaults, ...userCamps]);
       } catch (e) { console.log("Could not load campaigns:", e.message); }
     })();
   }, []);
@@ -190,7 +193,7 @@ export default function SignalScope() {
       setEditingBase(false); setBaseInput(""); setBaseError("");
       setSelectedTasks(new Set()); setShowExportModal(false);
       setLinkedinAccount(null); setOutreachStats(null); setOutreachItems([]);
-      setTab("accounts");
+      setTab("dashboard");
       loadAll();
       fetchAvailableFields();
       loadLinkedInAccounts();
@@ -304,12 +307,23 @@ export default function SignalScope() {
 
   const autoDetect = (headers, table) => {
     const aliases = FIELD_ALIASES[table] || {};
+    const existingFields = (availableFields[table] || []).map(f => f.name || f);
     const m = {};
     for (const h of headers) {
       const l = h.toLowerCase().trim();
       let hit = false;
+      // 1. Check hardcoded aliases
       for (const [f, alts] of Object.entries(aliases)) { if (alts.includes(l) || l === f.toLowerCase()) { m[h] = f; hit = true; break; } }
-      if (!hit) m[h] = h;
+      if (hit) continue;
+      // 2. Exact match against existing Airtable fields (case-insensitive)
+      const exact = existingFields.find(ef => ef.toLowerCase() === l);
+      if (exact) { m[h] = exact; continue; }
+      // 3. Fuzzy match (strip spaces/underscores/hyphens)
+      const hNorm = l.replace(/[\s_-]/g, "");
+      const fuzzy = existingFields.find(ef => ef.toLowerCase().replace(/[\s_-]/g, "") === hNorm);
+      if (fuzzy) { m[h] = fuzzy; continue; }
+      // 4. Default: use header as-is
+      m[h] = h;
     }
     return m;
   };
@@ -686,18 +700,26 @@ export default function SignalScope() {
   const topXRules = rules.filter(r => (r.fields||{})["Task Type"] === "top_x");
 
   const navs = [
+    {id:"dashboard",label:"📊 Dashboard",count:null},
+    null,
     {id:"accounts",label:"Accounts",count:accounts.length},
     {id:"leads",label:"Leads",count:leads.length},
+    null,
     {id:"rules",label:"Task Rules",count:rules.length},
     {id:"prompts",label:"Prompts",count:rules.length},
     {id:"threshold",label:"Scoring",count:null},
     {id:"tasks",label:"Tasks",count:tasks.length},
-    ...(hasOutreach ? [{id:"outreach",label:"💬 Outreach",count:outreachStats?.total||null}] : []),
+    null,
+    {id:"outreach",label:"💬 LinkedIn Automation",count:null},
+    {id:"coming_soon",label:"🚀 Coming Soon",count:null},
   ];
 
   return(<><style>{CSS}</style><div className="dash">
   <div className="side"><div className="side-hd"><div className="side-brand">SignalScope</div><div className="side-camp">{camp.name}</div><div className="side-back" onClick={()=>setCamp(null)}><I.Back/> All Campaigns</div></div>
-  <div className="side-nav">{navs.map(n=>(<div key={n.id} className={"nav-i"+(tab===n.id?" on":"")} onClick={()=>{setTab(n.id);if(n.id==="outreach")loadOutreachStats()}}><span>{n.label}</span>{n.count!==null&&<span className="cnt">{n.count}</span>}</div>))}</div>
+  <div className="side-nav">{navs.map((n,i)=> n===null
+    ? <div key={"sep"+i} style={{height:1,background:"var(--bdr)",margin:"6px 12px"}}/>
+    : <div key={n.id} className={"nav-i"+(tab===n.id?" on":"")} onClick={()=>{setTab(n.id);if(n.id==="outreach")loadOutreachStats()}}><span>{n.label}</span>{n.count!==null&&n.count>0&&<span className="cnt">{n.count}</span>}</div>
+  )}</div>
   <div style={{padding:"12px 16px",borderTop:"1px solid var(--bdr)"}}>
     {/* Airtable Base */}
     <div style={{marginBottom:10}}>
@@ -736,25 +758,124 @@ export default function SignalScope() {
       {setupStatus.errors?.length>0&&setupStatus.errors.map((e,i)=><div key={i} style={{color:"var(--red)"}}>❌ {e}</div>)}
       {!setupStatus.tables_created?.length&&!setupStatus.fields_created?.length&&!setupStatus.errors?.length&&!setupStatus.test&&<div style={{color:"var(--grn)"}}>✅ All good!</div>}
     </div>)}
-    {/* LinkedIn Account */}
-    {hasOutreach && (<div style={{marginTop:10,paddingTop:10,borderTop:"1px solid var(--bdr)"}}>
-      <div style={{fontSize:9,fontWeight:600,color:"var(--t3)",textTransform:"uppercase",letterSpacing:".05em",marginBottom:6}}>LinkedIn Account</div>
-      {linkedinAccount ? (
-        <div style={{display:"flex",alignItems:"center",gap:6}}>
-          <div style={{width:8,height:8,borderRadius:"50%",background:"var(--grn)"}}/>
-          <span style={{fontSize:11,color:"var(--t1)",flex:1}}>{linkedinAccount.name}</span>
-          <button className="btn btn-s" style={{padding:"2px 6px",fontSize:8}} onClick={connectLinkedIn}>Reconnect</button>
-        </div>
-      ) : (
-        <button className="btn btn-s btn-p" style={{width:"100%",justifyContent:"center",fontSize:10}} onClick={connectLinkedIn}>
-          <I.Link/> Connect LinkedIn
-        </button>
-      )}
-    </div>)}
+    {/* LinkedIn Status */}
+    <div style={{marginTop:10,paddingTop:10,borderTop:"1px solid var(--bdr)"}}>
+      <div style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer"}} onClick={()=>setTab("outreach")}>
+        <div style={{width:8,height:8,borderRadius:"50%",background:linkedinAccount?"var(--grn)":"var(--t3)"}}/>
+        <span style={{fontSize:10,color:"var(--t2)",flex:1}}>LinkedIn {linkedinAccount?"Connected":"Not connected"}</span>
+        <span style={{fontSize:9,color:"var(--t3)"}}>→</span>
+      </div>
+    </div>
   </div>
   </div>
 
   <div className="main">{loading&&<div style={{textAlign:"center",padding:40,color:"var(--t3)"}}>Loading…</div>}
+
+  {/* ════ DASHBOARD ════ */}
+  {tab==="dashboard"&&!loading&&(<div>
+    <div className="ph"><div><div className="pt">Dashboard</div><div className="pd">{camp.name} — Overview</div></div>
+      <div style={{display:"flex",gap:6}}>
+        {hasSignals&&<button className="btn btn-s btn-p" onClick={startScan} disabled={scanning||!accounts.length||!signalRules.length}>{scanning?"⏳ "+Math.round(scanProg)+"%":<>▶ Run Scan</>}</button>}
+      </div>
+    </div>
+
+    {/* Stats Grid */}
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(150px,1fr))",gap:12,marginBottom:24}}>
+      {[
+        {l:"Accounts",v:accounts.length,e:"🏢",c:"var(--acc)",t:"accounts"},
+        {l:"Leads",v:leads.length,e:"👤",c:"var(--blu)",t:"leads"},
+        {l:"Task Rules",v:rules.length,e:"⚙️",c:"var(--pur)",t:"rules"},
+        {l:"Tasks",v:tasks.length,e:"📋",c:"var(--grn)",t:"tasks"},
+        {l:"Signal Rules",v:signalRules.length,e:"📰",c:"var(--amb)"},
+        {l:"Top X Rules",v:topXRules.length,e:"🎯",c:"var(--pur)"},
+      ].map(s=>(
+        <div key={s.l} onClick={()=>s.t&&setTab(s.t)} style={{padding:"16px 18px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,cursor:s.t?"pointer":"default",transition:"border-color .2s"}} onMouseOver={e=>{if(s.t)e.currentTarget.style.borderColor="var(--acc)"}} onMouseOut={e=>e.currentTarget.style.borderColor="var(--bdr)"}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+            <span style={{fontSize:24}}>{s.e}</span>
+            <span style={{fontSize:26,fontWeight:700,fontFamily:"'JetBrains Mono',monospace",color:s.c}}>{s.v}</span>
+          </div>
+          <div style={{fontSize:10,color:"var(--t3)",marginTop:6}}>{s.l}</div>
+        </div>
+      ))}
+    </div>
+
+    {/* Active Features */}
+    <div style={{marginBottom:24}}>
+      <div style={{fontSize:12,fontWeight:600,marginBottom:10,color:"var(--t2)"}}>Active Features</div>
+      <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+        {activeFeatures.map(f=>{const ft=ALL_FEATURES.find(a=>a.id===f);return ft?<div key={f} style={{padding:"10px 14px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,display:"flex",alignItems:"center",gap:8}}>
+          <span style={{fontSize:18}}>{ft.emoji}</span><div><div style={{fontSize:11,fontWeight:600,color:"var(--t1)"}}>{ft.label}</div><div style={{fontSize:9,color:"var(--t3)"}}>{ft.desc}</div></div>
+        </div>:null})}
+        {activeFeatures.length===0&&<div style={{fontSize:11,color:"var(--t3)"}}>No features active — create a Task Rule to get started</div>}
+      </div>
+    </div>
+
+    {/* Integrations */}
+    <div style={{marginBottom:24}}>
+      <div style={{fontSize:12,fontWeight:600,marginBottom:10,color:"var(--t2)"}}>Integrations</div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))",gap:10}}>
+        {[
+          {n:"Airtable",ok:!!bid,sub:bid?"Connected":"Not connected"},
+          {n:"LinkedIn (Unipile)",ok:!!linkedinAccount,sub:linkedinAccount?linkedinAccount.name:"Not connected"},
+          {n:"HubSpot",ok:false,sub:"Coming Soon",dim:true},
+          {n:"Google Analytics",ok:false,sub:"Coming Soon",dim:true},
+          {n:"Smartlead",ok:false,sub:"Coming Soon",dim:true},
+        ].map(ig=>(
+          <div key={ig.n} style={{padding:"12px 14px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,display:"flex",alignItems:"center",gap:10,opacity:ig.dim?.5:1}}>
+            <div style={{width:8,height:8,borderRadius:"50%",background:ig.ok?"var(--grn)":"var(--t3)",flexShrink:0}}/>
+            <div><div style={{fontSize:11,fontWeight:600,color:"var(--t1)"}}>{ig.n}</div><div style={{fontSize:9,color:"var(--t3)"}}>{ig.sub}</div></div>
+          </div>
+        ))}
+      </div>
+    </div>
+
+    {/* Recent Tasks */}
+    {tasks.length>0&&(<div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+        <span style={{fontSize:12,fontWeight:600,color:"var(--t2)"}}>Recent Tasks</span>
+        <button className="btn btn-s" style={{fontSize:9}} onClick={()=>setTab("tasks")}>View All →</button>
+      </div>
+      <div className="tw"><table><thead><tr><th>Company</th><th>Rule</th><th>Score</th><th>Type</th><th>Date</th></tr></thead>
+      <tbody>{tasks.slice(0,6).map(t=>{const f=t.fields||{};return(<tr key={t.id} style={{cursor:"pointer"}} onClick={()=>setTab("tasks")}>
+        <td style={{color:"var(--t1)",fontWeight:500}}>{f.Company}</td>
+        <td style={{fontSize:10}}>{f["Task Rule"]}</td>
+        <td><div className="sb"><div className="st"><div className="sf" style={{width:Math.min(100,f.Score||0)+"%",background:f.Score>=80?"var(--grn)":f.Score>=60?"var(--acc)":"var(--red)"}}/></div><span className="sv">{f.Score}</span></div></td>
+        <td><span className={"chip "+(f["Task Type"]==="job_post"?"cb":f["Task Type"]==="top_x"?"cp":"cg")}>{(f["Task Type"]||"news").replace(/_/g," ")}</span></td>
+        <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10}}>{f.Date}</td>
+      </tr>)})}</tbody></table></div>
+    </div>)}
+
+    {tasks.length===0&&accounts.length===0&&(<div className="empty"><div className="em">📡</div><p>Upload accounts & leads, create task rules, and run your first scan</p>
+      <button className="btn btn-p" onClick={()=>setTab("accounts")}><I.Plus/> Start with Accounts</button>
+    </div>)}
+  </div>)}
+
+  {/* ════ COMING SOON ════ */}
+  {tab==="coming_soon"&&(<div>
+    <div className="ph"><div><div className="pt">🚀 Coming Soon</div><div className="pd">Features in development & planned</div></div></div>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(300px,1fr))",gap:14}}>
+      {[
+        {e:"🔗",n:"HubSpot Integration",s:"Planned",d:"Connect HubSpot CRM to auto-push tasks, sync contacts & deals. Connect via API key or send client a secure login link.",f:["Auto-push tasks to HubSpot as activities","Bi-directional contact sync","Deal stage change → trigger task creation","Custom field mapping between Airtable ↔ HubSpot"]},
+        {e:"📊",n:"Google Analytics Integration",s:"Planned",d:"Pull GA4 data into dashboards — traffic, conversions, channel performance. Correlate web analytics with signal data.",f:["GA4 property connection","Traffic & conversion dashboards","Channel attribution reports","Signal-to-web-visit correlation"]},
+        {e:"📧",n:"Smartlead Integration",s:"Planned",d:"Connect Smartlead for email campaign tracking — opens, replies, bounces alongside LinkedIn outreach data.",f:["Campaign sync & status tracking","Reply & bounce monitoring","Email + LinkedIn sequence coordination","Deliverability analytics"]},
+        {e:"🤖",n:"Post-Demo Automation",s:"Planned",d:"When a deal status changes (e.g. 'Demo Complete'), auto-create follow-up tasks for SDRs based on contact engagement history. AI determines what tasks are needed.",f:["Status-triggered task creation","AI-powered task recommendations based on engagement","Contact + company history analysis","Custom trigger workflow builder"]},
+        {e:"📰",n:"LinkedIn Post Monitoring",s:"In Testing",d:"Monitor leads' LinkedIn posts weekly. AI scores relevance, generates structured summaries and suggested comments for engagement.",f:["Auto-fetch posts via Apify (last 7 days)","AI relevance scoring with custom prompts","Structured sentence + suggested comment output","Engagement opportunity tasks"]},
+        {e:"💬",n:"LinkedIn Outreach Automation",s:"In Development",d:"Automated connection requests → DM sequences → follow-ups. AI personalizes each message. Full dashboard with acceptance rates.",f:["Multi-step DM sequences","AI message personalization with merge fields","Connection acceptance tracking","Rate-limited scheduling (safe for LinkedIn)"]},
+        {e:"🧠",n:"AI Task Recommendations",s:"Planned",d:"AI analyzes contact + company data to recommend priority tasks. Based on engagement signals, deal stage, and historical patterns.",f:["Next-best-action scoring","Engagement pattern analysis","SDR workload optimization","Priority queue with reasoning"]},
+        {e:"📋",n:"Automated HubSpot Task Push",s:"Planned",d:"Tasks created in SignalScope automatically pushed to HubSpot as activities/tasks, assigned to the right rep with full context.",f:["Real-time task sync to HubSpot","Rep assignment rules","Signal context in task description","Two-way status sync"]},
+      ].map(item=>(
+        <div key={item.n} style={{padding:18,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+            <span style={{fontSize:22}}>{item.e}</span>
+            <div style={{flex:1}}><div style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>{item.n}</div></div>
+            <span className={"chip "+(item.s==="In Testing"?"cg":item.s==="In Development"?"ca":"cp")}>{item.s}</span>
+          </div>
+          <div style={{fontSize:11,color:"var(--t3)",lineHeight:1.5,marginBottom:12}}>{item.d}</div>
+          {item.f.map(ft=><div key={ft} style={{fontSize:10,color:"var(--t2)",padding:"2px 0",display:"flex",alignItems:"center",gap:6}}><span style={{color:"var(--acc)",fontSize:8}}>●</span>{ft}</div>)}
+        </div>
+      ))}
+    </div>
+  </div>)}
 
   {/* ACCOUNTS */}
   {tab==="accounts"&&!loading&&(<div><div className="ph"><div><div className="pt">Accounts</div><div className="pd">{accounts.length} companies</div></div><label className="btn btn-s" style={{cursor:"pointer"}}><I.Upload/> Upload CSV<input type="file" accept=".csv" hidden onChange={e=>{if(e.target.files[0])handleCSVFile(e.target.files[0],"Accounts",setAccounts)}}/></label></div>
@@ -900,17 +1021,44 @@ export default function SignalScope() {
     </tr>)})}</tbody></table></div>}
   </div>)}
 
-  {/* ════ OUTREACH TAB ════ */}
+  {/* ════ LINKEDIN AUTOMATION ════ */}
   {tab==="outreach"&&!loading&&(<div>
-    <div className="ph"><div><div className="pt">💬 LinkedIn Outreach</div><div className="pd">Automated connection requests & DM sequences</div></div>
+    <div className="ph"><div><div className="pt">💬 LinkedIn Automation</div><div className="pd">Connection requests, DM sequences & outreach tracking</div></div>
       <div style={{display:"flex",gap:6}}>
         {linkedinAccount && <button className="btn btn-s" onClick={()=>loadOutreachStats()} disabled={outreachLoading}>↻ Refresh</button>}
       </div>
     </div>
 
+    {/* Connection Setup */}
     {!linkedinAccount ? (
-      <div className="empty"><div className="em">🔗</div><p>Connect your LinkedIn account to start outreach</p>
-        <button className="btn btn-p" onClick={connectLinkedIn}><I.Link/> Connect LinkedIn</button>
+      <div style={{marginBottom:24}}>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,maxWidth:600}}>
+          {/* Option A: Direct Login */}
+          <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10}}>
+            <div style={{fontSize:20,marginBottom:8}}>🔑</div>
+            <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:6}}>Login Directly</div>
+            <div style={{fontSize:10,color:"var(--t3)",lineHeight:1.5,marginBottom:14}}>Connect your own LinkedIn account via Unipile's secure auth.</div>
+            <button className="btn btn-p btn-s" style={{width:"100%",justifyContent:"center"}} onClick={connectLinkedIn}>Connect LinkedIn</button>
+          </div>
+          {/* Option B: Email to Client */}
+          <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10}}>
+            <div style={{fontSize:20,marginBottom:8}}>📧</div>
+            <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:6}}>Send to Client</div>
+            <div style={{fontSize:10,color:"var(--t3)",lineHeight:1.5,marginBottom:14}}>Generate a secure login link to email your client so they can connect their LinkedIn.</div>
+            <button className="btn btn-s" style={{width:"100%",justifyContent:"center"}} onClick={async()=>{
+              try{
+                const data = await outreachAPI("get_auth_link",{callbackUrl:window.location.href});
+                if(data.url){navigator.clipboard.writeText(data.url);alert("Auth link copied! Paste it in an email to your client.\n\nLink: "+data.url.slice(0,60)+"...")}
+                else alert("Could not generate link. Check Unipile credentials.");
+              }catch(e){alert("Error: "+e.message+"\n\nMake sure UNIPILE_DSN and UNIPILE_API_KEY are set.")}
+            }}>📋 Copy Auth Link</button>
+          </div>
+        </div>
+        <div style={{marginTop:12,fontSize:10,color:"var(--t3)",lineHeight:1.5}}>
+          ⚠️ Requires <strong>UNIPILE_DSN</strong> and <strong>UNIPILE_API_KEY</strong> environment variables. <a href="https://app.unipile.com" target="_blank" rel="noopener" style={{color:"var(--blu)"}}>Get them from Unipile →</a>
+        </div>
+      </div>
+    ) : (<>
       </div>
     ) : (<>
 

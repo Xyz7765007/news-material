@@ -328,14 +328,23 @@ async function classify(signals, taskDefs, companyName, mode) {
     const sysPrompt = mode === "jobs"
       ? `Score each job posting 0-100 for this ONE task. Use the scoring criteria if provided.
 
-The job TITLE must align with the task's role type. HR/Finance/Ops roles don't match marketing tasks. Seniority must roughly match.
+Rules:
+- The job TITLE must align with the task's role type AND seniority level
+- "Marketing Analyst" or "Analyst" is junior — only score 70+ for Director, VP, Head of, or C-level roles unless the task explicitly targets analyst-level
+- HR/Finance/Supply Chain/Operations roles NEVER match marketing tasks, even if keywords overlap
+- The signal must be ACTIONABLE — would this lead to a concrete outreach action? If not, score below 50.
 ${scoringCriteria}
 
 Return ONLY JSON: [{"idx":0,"score":85},{"idx":3,"score":72}]
 Only include postings scoring 50+. No markdown.`
       : `Score each news article 0-100 for this ONE task about ${companyName}. Use the scoring criteria if provided.
 
-The article must describe the specific event this task tracks. The subject must fit the task's intent.
+Rules:
+- The article must describe the SPECIFIC event this task tracks, not just share keywords
+- ROLE SPECIFICITY: If the task says "CMO" — only CMO qualifies, not CSCO/CFO/CTO. If it says "marketer" — the person must be in marketing, not engineering/supply chain/finance.
+- TOPIC SPECIFICITY: "Regulatory change affecting data use" means marketing/consumer data regulations, not healthcare records. "Category growth stalls" means the actual product category declining, not a company launching a fund.
+- ACTIONABILITY: Would this signal lead to a concrete next action for the sales team? If the answer is "we wouldn't do anything with this," score below 50.
+- "Executive scheduled to speak" is an early indicator signal — score 60-69 (useful but not yet actionable on its own)
 ${scoringCriteria}
 
 Return ONLY JSON: [{"idx":0,"score":85},{"idx":3,"score":72}]

@@ -86,7 +86,8 @@ async function autoEnsureFields(baseId, table, records) {
   for (const r of records) {
     const fields = r.fields || r;
     for (const k of Object.keys(fields)) {
-      if (k !== "id") fieldNames.add(k);
+      const clean = cleanFieldName(k);
+      if (clean && clean !== "id") fieldNames.add(clean);
     }
   }
   if (!fieldNames.size) return;
@@ -182,34 +183,42 @@ async function updateRecords(baseId, table, records) {
   return results;
 }
 
-// Sanitize: clean field values for Airtable compatibility
+// Clean field name: strip invisible chars, BOM, zero-width, trim
+function cleanFieldName(name) {
+  return name
+    .replace(/[\u200B-\u200D\uFEFF\u00A0]/g, "") // zero-width, BOM, non-breaking space
+    .replace(/[^\x20-\x7E\u00C0-\u024F\u0400-\u04FF\u4E00-\u9FFF\u3000-\u303F]/g, "") // keep printable + common intl
+    .trim();
+}
+
+// Sanitize: clean field names + values for Airtable compatibility
 function sanitizeFields(fields) {
   const out = {};
   for (const [k, v] of Object.entries(fields)) {
     if (v === null || v === undefined || k === "id") continue;
-    // Skip empty strings — Airtable url fields reject ""
     if (v === "") continue;
-    // Known numeric fields → ensure integer
-    if (FIELD_TYPE_MAP[k]?.type === "number") {
+    const cleanKey = cleanFieldName(k);
+    if (!cleanKey) continue;
+    if (FIELD_TYPE_MAP[cleanKey]?.type === "number") {
       const num = parseFloat(v);
-      if (!isNaN(num)) out[k] = FIELD_TYPE_MAP[k]?.options?.precision === 0 ? Math.round(num) : num;
-      else out[k] = String(v); // fallback to string if not parseable
+      if (!isNaN(num)) out[cleanKey] = FIELD_TYPE_MAP[cleanKey]?.options?.precision === 0 ? Math.round(num) : num;
+      else out[cleanKey] = String(v);
       continue;
     }
-    // Arrays/objects → stringify
-    if (typeof v === "object") { out[k] = JSON.stringify(v); continue; }
-    // Everything else → string (safest for Airtable)
-    out[k] = typeof v === "string" ? v : String(v);
+    if (typeof v === "object") { out[cleanKey] = JSON.stringify(v); continue; }
+    out[cleanKey] = typeof v === "string" ? v : String(v);
   }
   return out;
 }
 
-// Fallback: convert everything to strings (works for singleLineText fields)
+// Fallback: everything as strings + clean names
 function stringifyFields(fields) {
   const out = {};
   for (const [k, v] of Object.entries(fields)) {
     if (v === null || v === undefined || v === "") continue;
-    out[k] = String(v);
+    const cleanKey = cleanFieldName(k);
+    if (!cleanKey) continue;
+    out[cleanKey] = String(v);
   }
   return out;
 }
@@ -544,24 +553,23 @@ async function runTopXScoring(baseId, rule) {
   if (!records.length) return { error: `No ${table.toLowerCase()} found`, tasks: [] };
 
   // ─── Step 1: Weighted numeric scoring (skipped if no fields) ──
+  // Precompute field stats ONCE (not per-record — was O(n²) before)
+  const totalWeight = scoringFields.reduce((sum, sf) => sum + (sf.weight || 0), 0);
+  const fieldStats = {};
+  for (const sf of scoringFields) {
+    const values = records.map(r => parseFloat(r.fields?.[sf.field]) || 0);
+    fieldStats[sf.field] = { min: Math.min(...values, 0), max: Math.max(...values, 1) };
+  }
   const scored = records.map(r => {
     const fields = r.fields || {};
     let cs = 0;
     if (scoringFields.length > 0) {
-      const totalWeight = scoringFields.reduce((sum, sf) => sum + (sf.weight || 0), 0);
-      const nf = scoringFields.map(sf => ({
-        field: sf.field,
-        weight: totalWeight > 0 ? (sf.weight || 0) / totalWeight : 1 / scoringFields.length,
-      }));
-      // Compute field stats inline (we need them per-field across all records)
-      for (const sf of nf) {
-        if (!sf._stats) {
-          const values = records.map(rec => parseFloat(rec.fields?.[sf.field]) || 0);
-          sf._stats = { min: Math.min(...values, 0), max: Math.max(...values, 1) };
-        }
+      for (const sf of scoringFields) {
+        const w = totalWeight > 0 ? (sf.weight || 0) / totalWeight : 1 / scoringFields.length;
         const raw = parseFloat(fields[sf.field]) || 0;
-        const range = sf._stats.max - sf._stats.min;
-        cs += (range > 0 ? ((raw - sf._stats.min) / range) * 100 : 0) * sf.weight;
+        const st = fieldStats[sf.field];
+        const range = st.max - st.min;
+        cs += (range > 0 ? ((raw - st.min) / range) * 100 : 0) * w;
       }
     }
     return { record: r, numericScore: Math.round(cs), name: fields.Name || fields.Company || "Unknown" };
@@ -572,10 +580,10 @@ async function runTopXScoring(baseId, rule) {
   let useAI = scoringPrompt && OPENAI_KEY;
   if (useAI) {
     scored.sort((a, b) => b.numericScore - a.numericScore);
-    // When no numeric fields, AI-score all (up to 100). When blended, AI-score top 3x.
+    // When no numeric fields, AI-score up to 200. When blended, AI-score top 3x.
     const candidateCount = scoringFields.length > 0
       ? Math.min(scored.length, topN * 3)
-      : Math.min(scored.length, 100);
+      : Math.min(scored.length, Math.max(200, topN * 5));
     const candidates = scored.slice(0, candidateCount);
     const rest = scored.slice(candidateCount);
 
