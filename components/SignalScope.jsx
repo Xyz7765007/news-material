@@ -149,6 +149,13 @@ export default function SignalScope() {
   const [enrichLoading, setEnrichLoading] = useState(false);
   const [enrichResults, setEnrichResults] = useState([]);
   const [campTagFilter, setCampTagFilter] = useState("all");
+  // Post-Demo
+  const [pdRule, setPdRule] = useState({ name: "Post-Demo Follow-up", triggerField: "", triggerValue: "", triggerOperator: "equals", aiPrompt: "" });
+  const [pdLeadFields, setPdLeadFields] = useState([]);
+  const [pdFieldValues, setPdFieldValues] = useState(null); // { field, values: [{value, count}], empty, total }
+  const [pdPreview, setPdPreview] = useState(null);
+  const [pdResults, setPdResults] = useState(null);
+  const [pdLoading, setPdLoading] = useState(false);
 
   const bid = camp?.baseId || undefined; // current campaign's base
 
@@ -816,6 +823,7 @@ export default function SignalScope() {
     null,
     {id:"outreach",label:"💬 LinkedIn Automation",count:null},
     {id:"hubspot",label:"🔗 HubSpot",count:null},
+    {id:"post_demo",label:"🤖 Post-Demo Auto",count:null},
     {id:"coming_soon",label:"🚀 Coming Soon",count:null},
   ];
 
@@ -1009,6 +1017,151 @@ export default function SignalScope() {
     </>)}
   </div>)}
 
+  {/* ════ POST-DEMO AUTOMATION ════ */}
+  {tab==="post_demo"&&!loading&&(<div>
+    <div className="ph"><div><div className="pt">🤖 Post-Demo Automation</div><div className="pd">Auto-create follow-up tasks when lead status changes</div></div></div>
+
+    {/* Step 1: Rule Name */}
+    <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginBottom:16}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}><span style={{width:22,height:22,borderRadius:"50%",background:"var(--acc)",color:"#0a0a0c",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700}}>1</span><span style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>Define the Rule</span></div>
+      <div className="ig"><div className="il">Rule Name</div>
+        <input className="inp" value={pdRule.name} onChange={e=>setPdRule(p=>({...p,name:e.target.value}))} placeholder="e.g. Post-Demo Follow-up, Meeting Booked Tasks"/>
+      </div>
+    </div>
+
+    {/* Step 2: Pick Trigger Field */}
+    <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginBottom:16}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}><span style={{width:22,height:22,borderRadius:"50%",background:"var(--acc)",color:"#0a0a0c",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700}}>2</span><span style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>Select Trigger Field</span></div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:12}}>Which field in your leads data indicates a status change? (e.g. Status, Stage, Result, Demo Status)</div>
+      <select className="inp" value={pdRule.triggerField} onChange={async(e)=>{
+        const field = e.target.value;
+        setPdRule(p=>({...p,triggerField:field,triggerValue:""}));
+        setPdFieldValues(null);setPdPreview(null);setPdResults(null);
+        if(field&&bid){
+          try{const res=await fetch("/api/post-demo",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"get_field_values",baseId:bid,field})});setPdFieldValues(await res.json())}catch{}
+        }
+      }} onFocus={async()=>{if(!pdLeadFields.length&&bid){try{const res=await fetch("/api/post-demo",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"get_lead_fields",baseId:bid})});const d=await res.json();setPdLeadFields(d.fields||[])}catch{}}}}>
+        <option value="">Select a field...</option>
+        {pdLeadFields.map(f => <option key={f} value={f}>{f}</option>)}
+        {pdLeadFields.length===0 && <option disabled>Click to load fields...</option>}
+      </select>
+    </div>
+
+    {/* Step 3: Show all stages/values for that field */}
+    {pdFieldValues&&(<div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginBottom:16}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}><span style={{width:22,height:22,borderRadius:"50%",background:"var(--acc)",color:"#0a0a0c",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700}}>3</span><span style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>Choose the Trigger Value</span></div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:12}}>These are all the current values for <strong style={{color:"var(--t1)"}}>{pdFieldValues.field}</strong> across {pdFieldValues.total} leads. Click the one that should trigger follow-up task creation.</div>
+
+      {pdFieldValues.values.length === 0 ? (
+        <div style={{fontSize:11,color:"var(--red)"}}>No values found for this field. All {pdFieldValues.empty} leads have this field empty.</div>
+      ) : (<>
+        <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:12}}>
+          {pdFieldValues.values.map(v => (
+            <button key={v.value} onClick={()=>{setPdRule(p=>({...p,triggerValue:v.value,triggerOperator:"equals"}));setPdPreview(null);setPdResults(null)}}
+              style={{padding:"8px 14px",borderRadius:8,border:"1px solid "+(pdRule.triggerValue===v.value?"var(--acc)":"var(--bdr)"),background:pdRule.triggerValue===v.value?"var(--acc-d)":"var(--hover)",cursor:"pointer",display:"flex",alignItems:"center",gap:8,transition:"all .15s"}}>
+              <span style={{fontSize:12,color:pdRule.triggerValue===v.value?"var(--acc)":"var(--t1)",fontWeight:pdRule.triggerValue===v.value?600:400}}>{v.value}</span>
+              <span style={{fontSize:10,color:"var(--t3)",fontFamily:"'JetBrains Mono',monospace",background:"var(--card)",padding:"1px 6px",borderRadius:4}}>{v.count}</span>
+            </button>
+          ))}
+        </div>
+        {pdFieldValues.empty > 0 && <div style={{fontSize:10,color:"var(--t3)"}}>+ {pdFieldValues.empty} leads have this field empty</div>}
+
+        {/* Custom value option */}
+        <div style={{marginTop:12,paddingTop:12,borderTop:"1px solid var(--bdr)"}}>
+          <div style={{fontSize:10,color:"var(--t3)",marginBottom:6}}>Or use a custom condition:</div>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <select className="inp" style={{width:140}} value={pdRule.triggerOperator} onChange={e=>setPdRule(p=>({...p,triggerOperator:e.target.value}))}>
+              <option value="equals">Equals</option>
+              <option value="contains">Contains</option>
+              <option value="not_empty">Not Empty</option>
+              <option value="greater_than">Greater Than</option>
+              <option value="less_than">Less Than</option>
+            </select>
+            <input className="inp" style={{flex:1}} value={pdRule.triggerValue} onChange={e=>setPdRule(p=>({...p,triggerValue:e.target.value}))} placeholder={pdRule.triggerOperator==="not_empty"?"(any non-empty value)":"Type value..."} disabled={pdRule.triggerOperator==="not_empty"}/>
+          </div>
+        </div>
+      </>)}
+    </div>)}
+
+    {/* Step 4: AI Prompt + Actions */}
+    {pdRule.triggerField && (pdRule.triggerValue || pdRule.triggerOperator === "not_empty") && (<div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginBottom:16}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}><span style={{width:22,height:22,borderRadius:"50%",background:"var(--acc)",color:"#0a0a0c",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700}}>4</span><span style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>Configure AI Task Generation</span></div>
+
+      <div style={{padding:10,background:"var(--hover)",borderRadius:8,marginBottom:14,fontSize:11,color:"var(--t2)"}}>
+        🎯 Trigger: When <strong style={{color:"var(--acc)"}}>{pdRule.triggerField}</strong> {pdRule.triggerOperator === "not_empty" ? "is not empty" : `${pdRule.triggerOperator.replace(/_/g," ")} "${pdRule.triggerValue}"`}
+        {pdFieldValues && pdRule.triggerValue && (() => { const match = pdFieldValues.values.find(v => v.value === pdRule.triggerValue); return match ? <span style={{marginLeft:8,color:"var(--t3)"}}>({match.count} leads match)</span> : null; })()}
+      </div>
+
+      <div className="ig">
+        <div className="il">AI Instructions <span style={{fontWeight:400,textTransform:"none",color:"var(--t3)"}}>— tell AI how to create follow-up tasks</span></div>
+        <textarea className="inp" value={pdRule.aiPrompt} onChange={e=>setPdRule(p=>({...p,aiPrompt:e.target.value}))} style={{minHeight:90}} placeholder={"Based on this contact's status and engagement history, create follow-up tasks for the SDR.\n\nPrioritize:\n- If they have a phone → schedule a call within 24h\n- If VP+ title → high priority executive outreach\n- If they engaged with our signals → reference specific engagement\n- Always include a personalized LinkedIn message\n- Keep tasks specific and actionable"}/>
+      </div>
+
+      <div style={{display:"flex",gap:8}}>
+        <button className="btn btn-s" disabled={pdLoading} onClick={async()=>{
+          setPdLoading(true);setPdPreview(null);
+          try{const res=await fetch("/api/post-demo",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"preview",baseId:bid,rule:pdRule})});setPdPreview(await res.json())}catch(e){setPdPreview({error:e.message})}
+          setPdLoading(false);
+        }}>{pdLoading?"⏳":"👁 Preview"}</button>
+        <button className="btn btn-p btn-s" disabled={pdLoading||!bid} onClick={async()=>{
+          setPdLoading(true);setPdResults(null);
+          try{const res=await fetch("/api/post-demo",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"run",baseId:bid,rule:pdRule})});const d=await res.json();setPdResults(d);if(d.tasksCreated>0){const all=await fetch("/api/airtable",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"list",table:"Tasks",baseId:bid})});if(all.ok){const ad=await all.json();setTasks((ad.records||[]).sort((a,b)=>((b.fields?.Created||"")>(a.fields?.Created||"")?1:-1)))}}}catch(e){setPdResults({error:e.message})}
+          setPdLoading(false);
+        }}>{pdLoading?"⏳ Generating...":"▶ Run Automation"}</button>
+      </div>
+    </div>)}
+
+    {/* Preview */}
+    {pdPreview&&(<div style={{padding:16,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginBottom:16}}>
+      <div style={{fontSize:12,fontWeight:600,color:"var(--t2)",marginBottom:8}}>Preview: {pdPreview.matched||0} leads match</div>
+      {pdPreview.error && <div style={{color:"var(--red)",fontSize:11}}>❌ {pdPreview.error}</div>}
+      {pdPreview.sample?.length > 0 && (<div className="tw"><table><thead><tr><th>Name</th><th>Company</th><th>{pdRule.triggerField}</th></tr></thead>
+        <tbody>{pdPreview.sample.map((s,i) => <tr key={i}><td style={{color:"var(--t1)",fontWeight:500}}>{s.name}</td><td>{s.company}</td><td style={{color:"var(--acc)",fontSize:10}}>{s.value}</td></tr>)}</tbody></table></div>)}
+      {pdPreview.matched===0 && !pdPreview.error && <div style={{fontSize:11,color:"var(--t3)"}}>No leads match. Check your trigger condition.</div>}
+    </div>)}
+
+    {/* Results */}
+    {pdResults&&(<div style={{padding:16,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10}}>
+      <div style={{display:"flex",gap:12,marginBottom:16}}>
+        {[{l:"Matched",v:pdResults.triggered||0,c:"var(--t1)"},{l:"New",v:pdResults.newTriggers||0,c:"var(--blu)"},{l:"Tasks Created",v:pdResults.tasksCreated||0,c:"var(--grn)"}].map(s=>(
+          <div key={s.l} style={{padding:"10px 16px",background:"var(--hover)",borderRadius:8}}><div style={{fontSize:20,fontWeight:700,fontFamily:"'JetBrains Mono',monospace",color:s.c}}>{s.v}</div><div style={{fontSize:9,color:"var(--t3)"}}>{s.l}</div></div>
+        ))}
+      </div>
+      {pdResults.error && <div style={{color:"var(--red)",fontSize:11,marginBottom:12}}>❌ {pdResults.error}</div>}
+      {pdResults.results?.length > 0 && (<div style={{maxHeight:400,overflowY:"auto"}}>
+        {pdResults.results.map((r,i) => (
+          <div key={i} style={{padding:14,border:"1px solid var(--bdr)",borderRadius:8,marginBottom:8,background:"var(--hover)"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+              <div><span style={{fontWeight:600,color:"var(--t1)"}}>{r.lead}</span> <span style={{fontSize:10,color:"var(--t3)"}}>— {r.title} at {r.company}</span></div>
+              <span style={{fontSize:9,color:"var(--t3)"}}>{r.engagementCount} prior signals</span>
+            </div>
+            <div style={{fontSize:10,color:"var(--acc)",marginBottom:6}}>Trigger: {r.trigger}</div>
+            {r.tasks.map((t,j) => (
+              <div key={j} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 10px",background:"var(--card)",borderRadius:6,marginBottom:4}}>
+                <span className={"chip "+(t.priority==="HIGH"?"cr":t.priority==="MEDIUM"?"ca":"cg")}>{t.priority}</span>
+                <span style={{fontSize:10,color:"var(--t2)",flex:1}}><strong style={{color:"var(--t1)"}}>{t.subject}</strong> — {t.action}</span>
+                <span style={{fontSize:9,color:"var(--pur)",padding:"2px 6px",background:"rgba(155,126,216,.1)",borderRadius:4}}>{t.channel}</span>
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>)}
+      {pdResults.tasksCreated > 0 && <div style={{marginTop:12,fontSize:11,color:"var(--grn)"}}>✅ {pdResults.tasksCreated} tasks saved. View on Tasks tab (type: post_demo).</div>}
+    </div>)}
+
+    {/* Empty state */}
+    {!pdFieldValues && !pdPreview && !pdResults && !pdRule.triggerField && (<div style={{padding:20,background:"var(--hover)",borderRadius:10}}>
+      <div style={{fontSize:12,fontWeight:600,color:"var(--t2)",marginBottom:10}}>How it works</div>
+      <div style={{fontSize:11,color:"var(--t3)",lineHeight:1.7}}>
+        <strong style={{color:"var(--t2)"}}>Step 1:</strong> Name your rule<br/>
+        <strong style={{color:"var(--t2)"}}>Step 2:</strong> Pick a trigger field from your leads (e.g. "Status", "Stage", "Result")<br/>
+        <strong style={{color:"var(--t2)"}}>Step 3:</strong> See all current values for that field — click the one that triggers automation (e.g. "Demo Complete")<br/>
+        <strong style={{color:"var(--t2)"}}>Step 4:</strong> Write AI instructions — what kind of follow-up tasks should be generated<br/>
+        <strong style={{color:"var(--t2)"}}>Run:</strong> AI analyzes each matched lead's profile + engagement history and creates 1-3 personalized tasks per lead
+      </div>
+    </div>)}
+  </div>)}
+
   {/* ════ COMING SOON ════ */}
   {tab==="coming_soon"&&(<div>
     <div className="ph"><div><div className="pt">🚀 Coming Soon</div><div className="pd">Features in development & planned</div></div></div>
@@ -1017,7 +1170,7 @@ export default function SignalScope() {
         {e:"🔗",n:"HubSpot Integration",s:"Live",d:"Connect HubSpot CRM, push tasks, assign to reps. API key stored per campaign.",f:["Push tasks to HubSpot","Assignee selection from HubSpot owners","Phone enrichment via Apollo","Enriched task push"]},
         {e:"📊",n:"Google Analytics Integration",s:"Planned",d:"Pull GA4 data into dashboards — traffic, conversions, channel performance. Correlate web analytics with signal data.",f:["GA4 property connection","Traffic & conversion dashboards","Channel attribution reports","Signal-to-web-visit correlation"]},
         {e:"📧",n:"Smartlead Integration",s:"Planned",d:"Connect Smartlead for email campaign tracking — opens, replies, bounces alongside LinkedIn outreach data.",f:["Campaign sync & status tracking","Reply & bounce monitoring","Email + LinkedIn sequence coordination","Deliverability analytics"]},
-        {e:"🤖",n:"Post-Demo Automation",s:"Planned",d:"When a deal status changes (e.g. 'Demo Complete'), auto-create follow-up tasks for SDRs based on contact engagement history. AI determines what tasks are needed.",f:["Status-triggered task creation","AI-powered task recommendations based on engagement","Contact + company history analysis","Custom trigger workflow builder"]},
+        {e:"🤖",n:"Post-Demo Automation",s:"Live",d:"When a lead's status changes, AI analyzes their profile + engagement history and creates personalized SDR follow-up tasks.",f:["Trigger on any field value change","AI generates 1-3 tasks per lead","References engagement history","Dedup — won't re-process leads"]},
         {e:"📰",n:"LinkedIn Post Monitoring",s:"In Testing",d:"Monitor leads' LinkedIn posts weekly. AI scores relevance, generates structured summaries and suggested comments for engagement.",f:["Auto-fetch posts via Apify (last 7 days)","AI relevance scoring with custom prompts","Structured sentence + suggested comment output","Engagement opportunity tasks"]},
         {e:"💬",n:"LinkedIn Outreach Automation",s:"In Development",d:"Automated connection requests → DM sequences → follow-ups. AI personalizes each message. Full dashboard with acceptance rates.",f:["Multi-step DM sequences","AI message personalization with merge fields","Connection acceptance tracking","Rate-limited scheduling (safe for LinkedIn)"]},
         {e:"🧠",n:"AI Task Recommendations",s:"Planned",d:"AI analyzes contact + company data to recommend priority tasks. Based on engagement signals, deal stage, and historical patterns.",f:["Next-best-action scoring","Engagement pattern analysis","SDR workload optimization","Priority queue with reasoning"]},
