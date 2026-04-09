@@ -155,7 +155,7 @@ async function aiSelectLeads(leads, prompt, count) {
 
   try {
     const c = await openai.chat.completions.create({
-      model: "gpt-4.1-mini", temperature: 0.2, max_tokens: 500,
+      model: "gpt-5.4-mini", temperature: 0.2, max_tokens: 500,
       messages: [
         { role: "system", content: `Select the top ${count} leads that best match the criteria. Return ONLY a JSON array of indices: [0, 3, 7, ...]. No markdown.` },
         { role: "user", content: `Criteria:\n${prompt}\n\nLeads:\n${leadList}` },
@@ -177,7 +177,7 @@ async function aiPersonalizeMessage(template, lead, signal, companyName) {
   const openai = new OpenAI({ apiKey: OPENAI_KEY });
   try {
     const c = await openai.chat.completions.create({
-      model: "gpt-4.1-mini", temperature: 0.5, max_tokens: 300,
+      model: "gpt-5.4-mini", temperature: 0.5, max_tokens: 300,
       messages: [
         { role: "system", content: `Personalize this LinkedIn message template for the specific lead. Keep the same structure and intent. Make it natural and conversational. Replace merge fields and add personal touches based on the lead's data. Return ONLY the message text, nothing else.` },
         { role: "user", content: `Template:\n${template}\n\nLead: ${f.Name || "there"}\nTitle: ${f.Title || ""}\nCompany: ${f.Company || companyName || ""}\nLinkedIn: ${f["LinkedIn URL"] || ""}\nSignal: ${signal || ""}` },

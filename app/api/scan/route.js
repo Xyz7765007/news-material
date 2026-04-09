@@ -182,7 +182,7 @@ async function scanNews(company, taskDefs) {
     return [];
   }
 
-  const enriched = await Promise.all(recent.slice(0, 10).map(async n => ({ ...n, taskType: "news", articleContent: await fetchArticle(n.url) })));
+  const enriched = await Promise.all(recent.slice(0, 50).map(async n => ({ ...n, taskType: "news", articleContent: await fetchArticle(n.url) })));
   return classify(enriched, taskDefs, company.name, "news");
 }
 
@@ -352,7 +352,7 @@ Only include articles scoring 50+. No markdown.`;
 
     try {
       const c = await openai.chat.completions.create({
-        model: "gpt-4.1-mini", temperature: 0.15, max_tokens: 1000,
+        model: "gpt-5.4-mini", temperature: 0.15, max_tokens: 1000,
         messages: [
           { role: "system", content: sysPrompt },
           { role: "user", content: `${taskDesc}\n\nSignals:\n${signalList}` },

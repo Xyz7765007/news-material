@@ -14,7 +14,7 @@ async function classifyNews(newsItem, taskDefs, companyName) {
 
   try {
     const completion = await openai.chat.completions.create({
-      model: "gpt-4.1",
+      model: "gpt-5.4",
       temperature: 0.1,
       max_tokens: 600,
       messages: [
@@ -54,7 +54,7 @@ If no tasks match (WHICH IS OFTEN THE CORRECT ANSWER), return: {"matchedTaskIds"
 async function refineTask(userInput) {
   try {
     const completion = await openai.chat.completions.create({
-      model: "gpt-4.1",
+      model: "gpt-5.4",
       temperature: 0.5,
       max_tokens: 1000,
       messages: [
@@ -94,7 +94,7 @@ IMPORTANT: If the signal is about hiring, job openings, or specific roles being 
 async function generateInsights(task, companyName) {
   try {
     const completion = await openai.chat.completions.create({
-      model: "gpt-4.1",
+      model: "gpt-5.4",
       temperature: 0.6,
       max_tokens: 600,
       messages: [
@@ -128,7 +128,7 @@ async function generateInsights(task, companyName) {
 async function generateJobKeywords(taskName, taskDescription) {
   try {
     const completion = await openai.chat.completions.create({
-      model: "gpt-4.1",
+      model: "gpt-5.4",
       temperature: 0.3,
       max_tokens: 400,
       messages: [
@@ -170,7 +170,7 @@ async function generateScoringPrompt(taskName, taskDescription, taskKeywords, ta
 
   try {
     const completion = await openai.chat.completions.create({
-      model: "gpt-4.1",
+      model: "gpt-5.4",
       temperature: 0.25,
       max_tokens: 1500,
       messages: [
@@ -256,7 +256,7 @@ async function dedupTasks(taskGroups) {
       ).join("\n");
 
       const completion = await openai.chat.completions.create({
-        model: "gpt-4.1-mini",
+        model: "gpt-5.4-mini",
         temperature: 0,
         max_tokens: 600,
         messages: [

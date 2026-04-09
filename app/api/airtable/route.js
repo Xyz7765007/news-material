@@ -580,33 +580,53 @@ async function runTopXScoring(baseId, rule) {
   let useAI = scoringPrompt && OPENAI_KEY;
   if (useAI) {
     scored.sort((a, b) => b.numericScore - a.numericScore);
-    // When no numeric fields, AI-score up to 200. When blended, AI-score top 3x.
-    const candidateCount = scoringFields.length > 0
+
+    // Score ALL records — use larger batches (15) for pure AI to keep cost reasonable
+    // 1000 leads / 15 per batch = ~67 API calls × ~$0.001 = ~$0.07
+    // When blended (has numeric fields), only AI-score the top 3x since numeric pre-filters
+    const candidateCount = hasNumeric
       ? Math.min(scored.length, topN * 3)
-      : Math.min(scored.length, Math.max(200, topN * 5));
+      : scored.length; // ← pure AI: score EVERYTHING
     const candidates = scored.slice(0, candidateCount);
     const rest = scored.slice(candidateCount);
 
+    const BATCH = hasNumeric ? 5 : 15; // larger batches for pure AI (cheaper, faster)
+
     try {
       const openai = new OpenAI({ apiKey: OPENAI_KEY });
-      const BATCH = 5; // smaller batches to avoid token truncation
+      console.log(`[TOP-X] AI scoring ${candidates.length} records in batches of ${BATCH}`);
       for (let i = 0; i < candidates.length; i += BATCH) {
         const batch = candidates.slice(i, i + BATCH);
+        if (i % (BATCH * 10) === 0 || i === 0) console.log(`[TOP-X] Progress: ${i}/${candidates.length} scored...`);
         const recordSummaries = batch.map((item, idx) => {
           const f = item.record.fields || {};
+          // Show ALL fields including zeros — AI needs to see "Engagement: 0" not just omit it
+          const maxFieldLen = BATCH > 10 ? 80 : 150;
           const dataStr = Object.entries(f)
-            .filter(([_, v]) => v !== null && v !== undefined && v !== "")
-            .map(([k, v]) => `${k}: ${String(v).slice(0, 150)}`)
+            .filter(([_, v]) => v !== null && v !== undefined)
+            .map(([k, v]) => {
+              const val = v === "" ? "(empty)" : String(v).slice(0, maxFieldLen);
+              return `${k}: ${val}`;
+            })
             .join(" | ");
           return `[${idx}] ${item.name} — ${dataStr}`;
         }).join("\n");
 
         const completion = await openai.chat.completions.create({
-          model: "gpt-4.1-mini",
+          model: "gpt-5.4-mini",
           temperature: 0.2,
-          max_tokens: 2048,
+          max_tokens: BATCH > 10 ? 4000 : 2048,
           messages: [
-            { role: "system", content: `You are a B2B lead/account scoring engine. Score each record from 0-100 based on the user's criteria. Consider ALL data provided. Return ONLY a JSON array: [{"idx":0,"score":85,"reason":"max 15 words"},...]. Keep reasons under 15 words. One entry per record. No markdown.` },
+            { role: "system", content: `You are a data-driven B2B lead scoring engine. Score each record 0-100 based STRICTLY on the user's criteria and the ACTUAL DATA VALUES in each record.
+
+CRITICAL RULES:
+- Score based on the FIELD VALUES provided, NOT on how impressive a person's name/title/company sounds
+- If the scoring criteria reference specific fields (e.g. website visits, engagement score, revenue) and those fields are ZERO, EMPTY, or MISSING in the record → score MUST be below 30
+- A "Co-Founder" at a great company with zero engagement data scores LOW, not high
+- Only score high (70+) when the actual data values demonstrate what the criteria asks for
+- "No data" or "0" in key metric fields = low score, period
+
+Return ONLY JSON: [{"idx":0,"score":85,"reason":"max 15 words explaining which data values drove this score"},...]. One entry per record. No markdown.` },
             { role: "user", content: `Scoring Criteria:\n${scoringPrompt}\n\n${scoringFields.length > 0 ? "Scoring Fields (weighted): " + scoringFields.map(sf => sf.field + " (" + sf.weight + "%)").join(", ") + "\n\n" : ""}Records:\n${recordSummaries}` }
           ],
         });
@@ -641,21 +661,21 @@ async function runTopXScoring(baseId, rule) {
         }
       }
 
-      // Retry any unscored candidates individually (handles batch parse failures)
+      // Retry unscored individually (cap at 50 to avoid runaway costs)
       const unscored = candidates.filter(item => item.aiScore === undefined);
-      if (unscored.length > 0 && unscored.length <= 20) {
-        console.log(`Retrying ${unscored.length} unscored records individually`);
+      if (unscored.length > 0 && unscored.length <= 50) {
+        console.log(`[TOP-X] Retrying ${unscored.length} unscored records individually`);
         for (const item of unscored) {
           try {
             const f = item.record.fields || {};
             const dataStr = Object.entries(f)
-              .filter(([_, v]) => v !== null && v !== undefined && v !== "")
-              .map(([k, v]) => `${k}: ${String(v).slice(0, 200)}`)
+              .filter(([_, v]) => v !== null && v !== undefined)
+              .map(([k, v]) => `${k}: ${v === "" ? "(empty)" : String(v).slice(0, 200)}`)
               .join(" | ");
             const retry = await openai.chat.completions.create({
-              model: "gpt-4.1-mini", temperature: 0.2, max_tokens: 200,
+              model: "gpt-5.4-mini", temperature: 0.2, max_tokens: 200,
               messages: [
-                { role: "system", content: `Score this B2B lead/account from 0-100. Return ONLY: {"score":85,"reason":"max 15 words"}` },
+                { role: "system", content: `Score this record 0-100 based STRICTLY on its data values. If key metric fields are zero/empty, score below 30. Return ONLY: {"score":85,"reason":"max 15 words citing actual data values"}` },
                 { role: "user", content: `Criteria:\n${scoringPrompt}\n\nRecord: ${item.name} — ${dataStr}` }
               ],
             });
@@ -670,6 +690,8 @@ async function runTopXScoring(baseId, rule) {
       }
 
       // Final score: if numeric fields exist, blend 40% numeric + 60% AI. Otherwise pure AI.
+      const aiScoredCount = candidates.filter(item => item.aiScore !== undefined).length;
+      console.log(`[TOP-X] AI scored ${aiScoredCount}/${candidates.length} records successfully`);
       for (const item of candidates) {
         if (item.aiScore !== undefined) {
           item.compositeScore = hasNumeric
