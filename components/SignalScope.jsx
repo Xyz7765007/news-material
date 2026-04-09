@@ -402,15 +402,42 @@ export default function SignalScope() {
   };
 
   const handleCSVFile = (file, table, setter) => {
-    // Refresh available fields before mapping
     fetchAvailableFields();
     const reader = new FileReader();
     reader.onload = (e) => {
-      const lines = e.target.result.split("\n").filter(l => l.trim());
-      if (lines.length < 2) return;
-      const headers = parseCSVLine(lines[0]);
-      const rows = lines.slice(1).map(l => parseCSVLine(l)).filter(r => r.some(c => c));
-      setCsvModal({ table, setter, headers, rows, mappings: autoDetect(headers, table), mode: "create", matchField: "Name", campaignTag: camp?.name || "", newCampaignTag: "" });
+      const text = e.target.result;
+      // Proper CSV parse — handles multi-line quoted fields, escaped quotes
+      const parseFullCSV = (csv) => {
+        const rows = []; let row = []; let cell = ""; let inQ = false;
+        for (let i = 0; i < csv.length; i++) {
+          const c = csv[i];
+          if (inQ) {
+            if (c === '"') {
+              if (csv[i + 1] === '"') { cell += '"'; i++; } // escaped quote
+              else inQ = false; // end quote
+            } else { cell += c; }
+          } else {
+            if (c === '"') { inQ = true; }
+            else if (c === ',') { row.push(cell.trim()); cell = ""; }
+            else if (c === '\n' || c === '\r') {
+              if (c === '\r' && csv[i + 1] === '\n') i++; // skip \r\n
+              row.push(cell.trim()); cell = "";
+              if (row.some(c => c)) rows.push(row);
+              row = [];
+            } else { cell += c; }
+          }
+        }
+        // Last cell/row
+        row.push(cell.trim());
+        if (row.some(c => c)) rows.push(row);
+        return rows;
+      };
+
+      const allRows = parseFullCSV(text);
+      if (allRows.length < 2) return;
+      const headers = allRows[0];
+      const dataRows = allRows.slice(1).filter(r => r.length >= 2 && r.some(c => c)); // need at least 2 non-empty cells
+      setCsvModal({ table, setter, headers, rows: dataRows, mappings: autoDetect(headers, table), mode: "create", matchField: "Name", campaignTag: camp?.name || "", newCampaignTag: "" });
     };
     reader.readAsText(file);
   };
