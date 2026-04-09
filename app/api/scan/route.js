@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+let _openai;
+function getOpenAI() { if (!_openai) _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY }); return _openai; }
 
 // ─── Apify Token Fallback ─────────────────────────────────────────
 // Supports 3 Apify accounts. If one is exhausted, falls back to the next.
@@ -351,7 +352,7 @@ Return ONLY JSON: [{"idx":0,"score":85},{"idx":3,"score":72}]
 Only include articles scoring 50+. No markdown.`;
 
     try {
-      const c = await openai.chat.completions.create({
+      const c = await getOpenAI().chat.completions.create({
         model: "gpt-5.4-mini", temperature: 0.15, max_tokens: 1000,
         messages: [
           { role: "system", content: sysPrompt },

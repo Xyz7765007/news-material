@@ -132,10 +132,21 @@ export default function SignalScope() {
   const [baseError, setBaseError] = useState("");
   const [selectedTasks, setSelectedTasks] = useState(new Set());
   const [showExportModal, setShowExportModal] = useState(false);
-  const [linkedinAccount, setLinkedinAccount] = useState(null); // { id, name, type }
+  const [linkedinAccount, setLinkedinAccount] = useState(null);
   const [outreachStats, setOutreachStats] = useState(null);
   const [outreachItems, setOutreachItems] = useState([]);
   const [outreachLoading, setOutreachLoading] = useState(false);
+  // HubSpot
+  const [hsConnected, setHsConnected] = useState(false);
+  const [hsKey, setHsKey] = useState("");
+  const [hsMasked, setHsMasked] = useState("");
+  const [hsOwners, setHsOwners] = useState([]);
+  const [hsLoading, setHsLoading] = useState(false);
+  const [hsMsg, setHsMsg] = useState("");
+  // Enrichment
+  const [enrichModal, setEnrichModal] = useState(null); // { mode: "enrich" | "push", tasks: [] }
+  const [enrichLoading, setEnrichLoading] = useState(false);
+  const [enrichResults, setEnrichResults] = useState([]);
 
   const bid = camp?.baseId || undefined; // current campaign's base
 
@@ -197,6 +208,7 @@ export default function SignalScope() {
       loadAll();
       fetchAvailableFields();
       loadLinkedInAccounts();
+      loadHubSpot();
     }
   }, [camp]);
 
@@ -286,6 +298,43 @@ export default function SignalScope() {
       return data;
     } catch (e) { console.error(e); }
     finally { setOutreachLoading(false); }
+  };
+
+  // ─── HubSpot helpers ───────────────────────────────────────
+  const hsAPI = async (action, data = {}) => {
+    const res = await fetch("/api/hubspot", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, campaignId: camp?.airtableId, ...data }) });
+    return res.json();
+  };
+  const loadHubSpot = async () => { try { const d = await hsAPI("get_stored_key"); if (d.hasKey) { setHsConnected(true); setHsMasked(d.maskedKey || ""); loadHsOwners(); } } catch {} };
+  const connectHubSpot = async (key) => {
+    setHsLoading(true); setHsMsg("");
+    try { const d = await hsAPI("save_key", { apiKey: key }); if (d.ok) { setHsConnected(true); setHsMasked("****" + key.slice(-4)); setHsKey(""); setHsMsg("✅ Connected"); loadHsOwners(); } else setHsMsg("❌ " + (d.error || "Failed")); }
+    catch (e) { setHsMsg("❌ " + e.message); } setHsLoading(false);
+  };
+  const loadHsOwners = async () => { try { const d = await hsAPI("fetch_owners"); setHsOwners(d.owners || []); } catch {} };
+  const pushToHubSpot = async (tasksToPush, config) => {
+    setHsLoading(true); setHsMsg("");
+    try {
+      const mapped = tasksToPush.map(t => { const f = t.fields || t; return { Company: f.Company, "Task Rule": f["Task Rule"], Score: f.Score, Signal: f.Signal, URL: f.URL, Date: f.Date, "Lead Name": f["Lead Name"], Phone: f.Phone || "" }; });
+      const d = await hsAPI("push_tasks", { tasks: mapped, config });
+      setHsMsg(d.created > 0 ? `✅ ${d.created} tasks pushed` : "❌ " + (d.errors?.[0] || "Failed"));
+    } catch (e) { setHsMsg("❌ " + e.message); } setHsLoading(false);
+  };
+  // ─── Enrichment helpers ────────────────────────────────────
+  const enrichTasks = async (tasksToEnrich) => {
+    setEnrichLoading(true);
+    const records = tasksToEnrich.map(t => { const f = t.fields || t; return { id: t.id, name: f["Lead Name"] || f.Company || "", email: f.Email || "", company: f.Company || "", linkedinUrl: f["LinkedIn URL"] || "", domain: f.Domain || "" }; });
+    try {
+      const res = await fetch("/api/enrich", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "enrich", records }) });
+      const data = await res.json();
+      if (data.results) {
+        setEnrichResults(data.results);
+        const updates = data.results.filter(r => r.found && (r.phone || r.mobile)).map(r => ({ id: r.id, fields: { Phone: r.phone || r.mobile || "" } }));
+        if (updates.length > 0) { try { await at("update", "Tasks", { records: updates }, bid); } catch {} setTasks(prev => prev.map(t => { const u = updates.find(x => x.id === t.id); return u ? { ...t, fields: { ...t.fields, ...u.fields } } : t; })); }
+        setEnrichLoading(false); return data;
+      }
+    } catch (e) { console.error(e); }
+    setEnrichLoading(false); return null;
   };
 
   // ─── CSV ───────────────────────────────────────────────────
@@ -711,6 +760,7 @@ export default function SignalScope() {
     {id:"tasks",label:"Tasks",count:tasks.length},
     null,
     {id:"outreach",label:"💬 LinkedIn Automation",count:null},
+    {id:"hubspot",label:"🔗 HubSpot",count:null},
     {id:"coming_soon",label:"🚀 Coming Soon",count:null},
   ];
 
@@ -817,11 +867,11 @@ export default function SignalScope() {
         {[
           {n:"Airtable",ok:!!bid,sub:bid?"Connected":"Not connected"},
           {n:"LinkedIn (Unipile)",ok:!!linkedinAccount,sub:linkedinAccount?linkedinAccount.name:"Not connected"},
-          {n:"HubSpot",ok:false,sub:"Coming Soon",dim:true},
+          {n:"HubSpot",ok:hsConnected,sub:hsConnected?"Connected":"Not connected",onClick:()=>setTab("hubspot")},
           {n:"Google Analytics",ok:false,sub:"Coming Soon",dim:true},
           {n:"Smartlead",ok:false,sub:"Coming Soon",dim:true},
         ].map(ig=>(
-          <div key={ig.n} style={{padding:"12px 14px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,display:"flex",alignItems:"center",gap:10,opacity:ig.dim?.5:1}}>
+          <div key={ig.n} onClick={ig.onClick} style={{padding:"12px 14px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,display:"flex",alignItems:"center",gap:10,opacity:ig.dim?.5:1,cursor:ig.onClick?"pointer":"default"}}>
             <div style={{width:8,height:8,borderRadius:"50%",background:ig.ok?"var(--grn)":"var(--t3)",flexShrink:0}}/>
             <div><div style={{fontSize:11,fontWeight:600,color:"var(--t1)"}}>{ig.n}</div><div style={{fontSize:9,color:"var(--t3)"}}>{ig.sub}</div></div>
           </div>
@@ -850,12 +900,57 @@ export default function SignalScope() {
     </div>)}
   </div>)}
 
+  {/* ════ HUBSPOT ════ */}
+  {tab==="hubspot"&&!loading&&(<div>
+    <div className="ph"><div><div className="pt">🔗 HubSpot Integration</div><div className="pd">Connect HubSpot, push tasks, manage enrichment</div></div></div>
+
+    {/* Connection */}
+    <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginBottom:16}}>
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
+        <div style={{width:10,height:10,borderRadius:"50%",background:hsConnected?"var(--grn)":"var(--red)"}}/>
+        <span style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>{hsConnected?"HubSpot Connected":"Connect HubSpot"}</span>
+        {hsConnected && <span style={{fontSize:10,color:"var(--t3)",marginLeft:"auto"}}>API Key: {hsMasked}</span>}
+      </div>
+      {!hsConnected ? (<div>
+        <div style={{fontSize:11,color:"var(--t3)",marginBottom:12,lineHeight:1.5}}>Enter your HubSpot Private App access token. Create one in HubSpot → Settings → Integrations → Private Apps. Needs scopes: <code style={{background:"var(--hover)",padding:"1px 4px",borderRadius:3,fontSize:10}}>crm.objects.contacts.read</code>, <code style={{background:"var(--hover)",padding:"1px 4px",borderRadius:3,fontSize:10}}>crm.objects.owners.read</code>, <code style={{background:"var(--hover)",padding:"1px 4px",borderRadius:3,fontSize:10}}>tickets</code>.</div>
+        <div style={{display:"flex",gap:8}}>
+          <input className="inp" type="password" placeholder="pat-na1-xxxxxxxx..." value={hsKey} onChange={e=>setHsKey(e.target.value)} style={{flex:1}}/>
+          <button className="btn btn-p btn-s" disabled={!hsKey.trim()||hsLoading} onClick={()=>connectHubSpot(hsKey)}>{hsLoading?"⏳":"Connect"}</button>
+        </div>
+      </div>) : (<div>
+        <div style={{display:"flex",gap:8}}>
+          <button className="btn btn-s" onClick={async()=>{const d=await hsAPI("test");setHsMsg(d.ok?"✅ Connection healthy":"❌ "+d.error)}} disabled={hsLoading}>🧪 Test Connection</button>
+          <button className="btn btn-s" onClick={()=>{setHsConnected(false);setHsMasked("")}}>Disconnect</button>
+        </div>
+      </div>)}
+      {hsMsg && <div style={{marginTop:8,fontSize:11,color:hsMsg.startsWith("✅")?"var(--grn)":"var(--red)"}}>{hsMsg}</div>}
+    </div>
+
+    {hsConnected && (<>
+    {/* Push Tasks */}
+    <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginBottom:16}}>
+      <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:12}}>📋 Push Tasks to HubSpot</div>
+      {tasks.length === 0 ? <div style={{fontSize:11,color:"var(--t3)"}}>No tasks to push. Run a scan first.</div> : (<div>
+        <div style={{fontSize:11,color:"var(--t3)",marginBottom:12}}>{tasks.length} tasks available. Select tasks on the Tasks tab, or push all.</div>
+        <PushToHubSpotForm tasks={tasks} owners={hsOwners} onPush={pushToHubSpot} loading={hsLoading} rules={rules}/>
+      </div>)}
+    </div>
+
+    {/* Enrich + Push */}
+    <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10}}>
+      <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:8}}>📞 Enrich & Push</div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:12,lineHeight:1.5}}>Enrich tasks with phone numbers via Apollo, then push enriched tasks to HubSpot. Requires <code style={{background:"var(--hover)",padding:"1px 4px",borderRadius:3,fontSize:10}}>APOLLO_API_KEY</code> env var.</div>
+      <button className="btn btn-s" style={{color:"var(--pur)",borderColor:"rgba(155,126,216,.3)"}} disabled={!tasks.length} onClick={()=>setEnrichModal({mode:"select"})}><I.Sparkle/> Enrich Phone Numbers</button>
+    </div>
+    </>)}
+  </div>)}
+
   {/* ════ COMING SOON ════ */}
   {tab==="coming_soon"&&(<div>
     <div className="ph"><div><div className="pt">🚀 Coming Soon</div><div className="pd">Features in development & planned</div></div></div>
     <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(300px,1fr))",gap:14}}>
       {[
-        {e:"🔗",n:"HubSpot Integration",s:"Planned",d:"Connect HubSpot CRM to auto-push tasks, sync contacts & deals. Connect via API key or send client a secure login link.",f:["Auto-push tasks to HubSpot as activities","Bi-directional contact sync","Deal stage change → trigger task creation","Custom field mapping between Airtable ↔ HubSpot"]},
+        {e:"🔗",n:"HubSpot Integration",s:"Live",d:"Connect HubSpot CRM, push tasks, assign to reps. API key stored per campaign.",f:["Push tasks to HubSpot","Assignee selection from HubSpot owners","Phone enrichment via Apollo","Enriched task push"]},
         {e:"📊",n:"Google Analytics Integration",s:"Planned",d:"Pull GA4 data into dashboards — traffic, conversions, channel performance. Correlate web analytics with signal data.",f:["GA4 property connection","Traffic & conversion dashboards","Channel attribution reports","Signal-to-web-visit correlation"]},
         {e:"📧",n:"Smartlead Integration",s:"Planned",d:"Connect Smartlead for email campaign tracking — opens, replies, bounces alongside LinkedIn outreach data.",f:["Campaign sync & status tracking","Reply & bounce monitoring","Email + LinkedIn sequence coordination","Deliverability analytics"]},
         {e:"🤖",n:"Post-Demo Automation",s:"Planned",d:"When a deal status changes (e.g. 'Demo Complete'), auto-create follow-up tasks for SDRs based on contact engagement history. AI determines what tasks are needed.",f:["Status-triggered task creation","AI-powered task recommendations based on engagement","Contact + company history analysis","Custom trigger workflow builder"]},
@@ -975,8 +1070,10 @@ export default function SignalScope() {
   {/* TASKS */}
   {tab==="tasks"&&!loading&&(<div>
     <div className="ph"><div><div className="pt">Tasks</div><div className="pd">{fTasks.length} tasks{selCount>0&&<span style={{color:"var(--acc)",marginLeft:6}}>· {selCount} selected</span>}</div></div>
-    <div style={{display:"flex",gap:8}}>
+    <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
       <button className="btn btn-s" onClick={()=>setShowExportModal(true)} disabled={!tasks.length}><I.Download/> Export{selCount>0?` (${selCount})`:""}</button>
+      <button className="btn btn-s" style={{color:"var(--pur)",borderColor:"rgba(155,126,216,.3)"}} disabled={!tasks.length} onClick={()=>setEnrichModal({mode:"select"})}><I.Sparkle/> Enrich Phones</button>
+      {hsConnected && <button className="btn btn-s" style={{color:"var(--grn)",borderColor:"rgba(93,168,122,.3)"}} disabled={!tasks.length} onClick={()=>setEnrichModal({mode:"push"})}><I.Upload/> Push to HubSpot{selCount>0?` (${selCount})`:""}</button>}
       {hasSignals&&<button className="btn btn-p btn-s" onClick={startScan} disabled={scanning||!accounts.length||!signalRules.length}>{scanning?"Scanning "+Math.round(scanProg)+"%":<><I.Play/> Run Scan</>}</button>}
     </div></div>
     {scanning&&<div className="scan-s"><div className="scan-d"/><span style={{fontSize:12,flex:1}}>{scanText}</span><span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:11,color:"var(--acc)"}}>{Math.round(scanProg)}%</span>{hasSignals&&<button className="btn btn-d btn-s" onClick={()=>{scanRef.current=false;setScanning(false)}}>Stop</button>}</div>}
@@ -1140,6 +1237,7 @@ export default function SignalScope() {
 
   {editRule!==null&&<RuleEditor rule={editRule} onSave={saveRule} onClose={()=>setEditRule(null)} availableFields={availableFields}/>}
   {showExportModal&&<ExportModal tasks={selCount>0?fTasks.filter(t=>selectedTasks.has(t.id)):fTasks} accounts={accounts} leads={leads} onClose={()=>setShowExportModal(false)}/>}
+  {enrichModal&&<EnrichModal mode={enrichModal.mode} tasks={tasks} rules={rules} fTasks={fTasks} selectedTasks={selectedTasks} onEnrich={enrichTasks} onPush={pushToHubSpot} enrichResults={enrichResults} enrichLoading={enrichLoading} hsConnected={hsConnected} hsOwners={hsOwners} hsLoading={hsLoading} onClose={()=>{setEnrichModal(null);setEnrichResults([])}}/>}
 
   {/* CSV MODAL */}
   {csvModal&&(<div className="modal-o" onClick={e=>e.target===e.currentTarget&&setCsvModal(null)}><div className="modal" style={{maxWidth:700}}>
@@ -1208,6 +1306,237 @@ export default function SignalScope() {
   </button></div>
   </div></div>)}
   </>);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PUSH TO HUBSPOT FORM
+// ═══════════════════════════════════════════════════════════════
+function PushToHubSpotForm({ tasks, owners, onPush, loading, rules }) {
+  const [ownerId, setOwnerId] = useState("");
+  const [priority, setPriority] = useState("MEDIUM");
+  const [status, setStatus] = useState("NOT_STARTED");
+  const [ruleFilter, setRuleFilter] = useState("all");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+
+  const ruleNames = [...new Set(tasks.map(t => (t.fields || {})["Task Rule"]).filter(Boolean))];
+  const filtered = tasks.filter(t => {
+    const f = t.fields || {};
+    if (ruleFilter !== "all" && f["Task Rule"] !== ruleFilter) return false;
+    if (dateFrom && (f.Date || "") < dateFrom) return false;
+    if (dateTo && (f.Date || "") > dateTo) return false;
+    return true;
+  });
+
+  return (<div>
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
+      <div className="ig" style={{marginBottom:0}}>
+        <div className="il">Filter by Task Rule</div>
+        <select className="inp" value={ruleFilter} onChange={e=>setRuleFilter(e.target.value)}>
+          <option value="all">All Rules ({tasks.length})</option>
+          {ruleNames.map(r => <option key={r} value={r}>{r} ({tasks.filter(t=>(t.fields||{})["Task Rule"]===r).length})</option>)}
+        </select>
+      </div>
+      <div className="ig" style={{marginBottom:0}}>
+        <div className="il">Assign To</div>
+        <select className="inp" value={ownerId} onChange={e=>setOwnerId(e.target.value)}>
+          <option value="">Unassigned</option>
+          {owners.map(o => <option key={o.id} value={o.id}>{o.label} ({o.email})</option>)}
+        </select>
+      </div>
+    </div>
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:12,marginBottom:14}}>
+      <div className="ig" style={{marginBottom:0}}>
+        <div className="il">Priority</div>
+        <select className="inp" value={priority} onChange={e=>setPriority(e.target.value)}>
+          <option value="HIGH">High</option><option value="MEDIUM">Medium</option><option value="LOW">Low</option>
+        </select>
+      </div>
+      <div className="ig" style={{marginBottom:0}}>
+        <div className="il">Status</div>
+        <select className="inp" value={status} onChange={e=>setStatus(e.target.value)}>
+          <option value="NOT_STARTED">Not Started</option><option value="IN_PROGRESS">In Progress</option><option value="WAITING">Waiting</option>
+        </select>
+      </div>
+      <div className="ig" style={{marginBottom:0}}>
+        <div className="il">Date From</div>
+        <input type="date" className="inp" value={dateFrom} onChange={e=>setDateFrom(e.target.value)}/>
+      </div>
+      <div className="ig" style={{marginBottom:0}}>
+        <div className="il">Date To</div>
+        <input type="date" className="inp" value={dateTo} onChange={e=>setDateTo(e.target.value)}/>
+      </div>
+    </div>
+    <div style={{display:"flex",alignItems:"center",gap:12}}>
+      <button className="btn btn-p btn-s" disabled={loading || !filtered.length} onClick={() => onPush(filtered, { ownerId, priority, status })}>
+        {loading ? "⏳ Pushing..." : `Push ${filtered.length} Task${filtered.length !== 1 ? "s" : ""} to HubSpot`}
+      </button>
+      <span style={{fontSize:10,color:"var(--t3)"}}>{filtered.length} of {tasks.length} tasks match filters</span>
+    </div>
+  </div>);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ENRICH MODAL — select tasks, enrich phones, push to HubSpot
+// ═══════════════════════════════════════════════════════════════
+function EnrichModal({ mode, tasks, rules, fTasks, selectedTasks, onEnrich, onPush, enrichResults, enrichLoading, hsConnected, hsOwners, hsLoading, onClose }) {
+  const [step, setStep] = useState(mode === "push" ? "push" : "select"); // select → enriching → results → push
+  const [ruleFilter, setRuleFilter] = useState("all");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [scoreMin, setScoreMin] = useState(0);
+  const [ownerId, setOwnerId] = useState("");
+  const [priority, setPriority] = useState("MEDIUM");
+
+  const ruleNames = [...new Set(tasks.map(t => (t.fields || {})["Task Rule"]).filter(Boolean))];
+
+  const getFilteredTasks = () => {
+    // If tasks are selected on the main page, use those
+    if (selectedTasks.size > 0) return tasks.filter(t => selectedTasks.has(t.id));
+    return tasks.filter(t => {
+      const f = t.fields || {};
+      if (ruleFilter !== "all" && f["Task Rule"] !== ruleFilter) return false;
+      if (dateFrom && (f.Date || "") < dateFrom) return false;
+      if (dateTo && (f.Date || "") > dateTo) return false;
+      if (scoreMin > 0 && (f.Score || 0) < scoreMin) return false;
+      return true;
+    });
+  };
+
+  const filtered = getFilteredTasks();
+  const enrichedWithPhone = enrichResults.filter(r => r.phone || r.mobile);
+
+  return (<div className="modal-o" onClick={e=>e.target===e.currentTarget&&onClose()}><div className="modal" style={{maxWidth:720}}>
+    <div className="modal-h">
+      <span style={{fontWeight:600}}>{step==="select"?"📞 Enrich Phone Numbers":step==="enriching"?"⏳ Enriching...":step==="results"?"📞 Enrichment Results":"📤 Push to HubSpot"}</span>
+      <button className="btn btn-s" onClick={onClose}>✕</button>
+    </div>
+    <div className="modal-b">
+
+    {/* ─── SELECT ─── */}
+    {step==="select"&&(<div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:14,lineHeight:1.5}}>
+        Select which tasks to enrich with phone numbers via Apollo.
+        {selectedTasks.size > 0 && <span style={{color:"var(--acc)"}}> Using {selectedTasks.size} selected tasks from the Tasks tab.</span>}
+      </div>
+
+      {selectedTasks.size === 0 && (<>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
+        <div className="ig" style={{marginBottom:0}}>
+          <div className="il">Task Rule</div>
+          <select className="inp" value={ruleFilter} onChange={e=>setRuleFilter(e.target.value)}>
+            <option value="all">All Rules</option>
+            {ruleNames.map(r => <option key={r} value={r}>{r}</option>)}
+          </select>
+        </div>
+        <div className="ig" style={{marginBottom:0}}>
+          <div className="il">Min Score</div>
+          <input type="number" className="inp" value={scoreMin} onChange={e=>setScoreMin(+e.target.value)} min={0} max={100} placeholder="0"/>
+        </div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
+        <div className="ig" style={{marginBottom:0}}>
+          <div className="il">Date From</div>
+          <input type="date" className="inp" value={dateFrom} onChange={e=>setDateFrom(e.target.value)}/>
+        </div>
+        <div className="ig" style={{marginBottom:0}}>
+          <div className="il">Date To</div>
+          <input type="date" className="inp" value={dateTo} onChange={e=>setDateTo(e.target.value)}/>
+        </div>
+      </div>
+      </>)}
+
+      <div style={{padding:12,background:"var(--hover)",borderRadius:8,marginBottom:14,fontSize:11,color:"var(--t2)"}}>
+        📋 {filtered.length} tasks will be enriched. Each task costs ~1 Apollo credit.
+      </div>
+    </div>)}
+
+    {/* ─── ENRICHING ─── */}
+    {step==="enriching"&&(<div style={{textAlign:"center",padding:30}}>
+      <div style={{fontSize:32,marginBottom:12}}>⏳</div>
+      <div style={{fontSize:13,color:"var(--t1)",marginBottom:6}}>Enriching {filtered.length} tasks...</div>
+      <div style={{fontSize:11,color:"var(--t3)"}}>Looking up phone numbers via Apollo. This may take a minute.</div>
+    </div>)}
+
+    {/* ─── RESULTS ─── */}
+    {step==="results"&&(<div>
+      <div style={{display:"flex",gap:10,marginBottom:16}}>
+        <div style={{padding:"10px 14px",background:"var(--hover)",borderRadius:8,flex:1}}>
+          <div style={{fontSize:18,fontWeight:700,fontFamily:"'JetBrains Mono',monospace",color:"var(--t1)"}}>{enrichResults.length}</div>
+          <div style={{fontSize:9,color:"var(--t3)"}}>Processed</div>
+        </div>
+        <div style={{padding:"10px 14px",background:"var(--hover)",borderRadius:8,flex:1}}>
+          <div style={{fontSize:18,fontWeight:700,fontFamily:"'JetBrains Mono',monospace",color:"var(--grn)"}}>{enrichedWithPhone.length}</div>
+          <div style={{fontSize:9,color:"var(--t3)"}}>Phone Found</div>
+        </div>
+        <div style={{padding:"10px 14px",background:"var(--hover)",borderRadius:8,flex:1}}>
+          <div style={{fontSize:18,fontWeight:700,fontFamily:"'JetBrains Mono',monospace",color:"var(--red)"}}>{enrichResults.length - enrichResults.filter(r=>r.found).length}</div>
+          <div style={{fontSize:9,color:"var(--t3)"}}>Not Found</div>
+        </div>
+      </div>
+
+      {enrichedWithPhone.length > 0 && (<div style={{maxHeight:300,overflowY:"auto",marginBottom:14}}>
+        <table><thead><tr><th>Name</th><th>Company</th><th>Phone</th><th>Status</th></tr></thead>
+        <tbody>{enrichResults.map((r, i) => (
+          <tr key={i}><td style={{color:"var(--t1)",fontWeight:500}}>{r.name}</td><td>{r.company}</td>
+          <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10,color:r.phone?"var(--grn)":"var(--t3)"}}>{r.phone || r.mobile || "—"}</td>
+          <td><span className={"chip "+(r.found?"cg":"cr")}>{r.found?(r.phone?"Phone found":"Found, no phone"):"Not found"}</span></td></tr>
+        ))}</tbody></table>
+      </div>)}
+
+      <div style={{fontSize:10,color:"var(--grn)",marginBottom:8}}>✅ Phone numbers saved to Airtable tasks</div>
+    </div>)}
+
+    {/* ─── PUSH TO HUBSPOT ─── */}
+    {step==="push"&&(<div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:14,lineHeight:1.5}}>
+        Push {selectedTasks.size > 0 ? selectedTasks.size + " selected" : "filtered"} tasks to HubSpot as activities.
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
+        <div className="ig" style={{marginBottom:0}}>
+          <div className="il">Task Rule</div>
+          <select className="inp" value={ruleFilter} onChange={e=>setRuleFilter(e.target.value)}>
+            <option value="all">All Rules</option>
+            {ruleNames.map(r => <option key={r} value={r}>{r}</option>)}
+          </select>
+        </div>
+        <div className="ig" style={{marginBottom:0}}>
+          <div className="il">Assign To</div>
+          <select className="inp" value={ownerId} onChange={e=>setOwnerId(e.target.value)}>
+            <option value="">Unassigned</option>
+            {hsOwners.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
+          </select>
+        </div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:12,marginBottom:14}}>
+        <div className="ig" style={{marginBottom:0}}><div className="il">Priority</div>
+          <select className="inp" value={priority} onChange={e=>setPriority(e.target.value)}>
+            <option value="HIGH">High</option><option value="MEDIUM">Medium</option><option value="LOW">Low</option>
+          </select>
+        </div>
+        <div className="ig" style={{marginBottom:0}}><div className="il">Min Score</div>
+          <input type="number" className="inp" value={scoreMin} onChange={e=>setScoreMin(+e.target.value)} min={0} max={100}/>
+        </div>
+        <div className="ig" style={{marginBottom:0}}><div className="il">From</div>
+          <input type="date" className="inp" value={dateFrom} onChange={e=>setDateFrom(e.target.value)}/>
+        </div>
+        <div className="ig" style={{marginBottom:0}}><div className="il">To</div>
+          <input type="date" className="inp" value={dateTo} onChange={e=>setDateTo(e.target.value)}/>
+        </div>
+      </div>
+      <div style={{padding:10,background:"var(--hover)",borderRadius:8,marginBottom:14,fontSize:11,color:"var(--t2)"}}>
+        📋 {filtered.length} tasks will be pushed to HubSpot
+      </div>
+    </div>)}
+
+    </div>
+    <div className="modal-f">
+      {step==="select"&&<><button className="btn" onClick={onClose}>Cancel</button><button className="btn btn-p" disabled={enrichLoading||!filtered.length} onClick={async()=>{setStep("enriching");const r=await onEnrich(filtered);if(r)setStep("results");else setStep("select")}}><I.Sparkle/> Enrich {filtered.length} Tasks</button></>}
+      {step==="results"&&<><button className="btn" onClick={onClose}>Done</button>{hsConnected&&enrichedWithPhone.length>0&&<button className="btn btn-p" onClick={()=>setStep("push")}>Push to HubSpot →</button>}</>}
+      {step==="push"&&<><button className="btn" onClick={onClose}>Cancel</button><button className="btn btn-p" disabled={hsLoading||!filtered.length} onClick={async()=>{await onPush(filtered,{ownerId,priority,status:"NOT_STARTED"});onClose()}}>{hsLoading?"⏳":"📤 Push "+filtered.length+" Tasks"}</button></>}
+      {step==="enriching"&&<button className="btn" disabled>⏳ Processing...</button>}
+    </div>
+  </div></div>);
 }
 
 // ═══════════════════════════════════════════════════════════════

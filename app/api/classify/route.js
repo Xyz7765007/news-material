@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+let _openai;
+function getOpenAI() { if (!_openai) _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY }); return _openai; }
 
 // Classify a news item against task definitions
 async function classifyNews(newsItem, taskDefs, companyName) {
@@ -13,7 +14,7 @@ async function classifyNews(newsItem, taskDefs, companyName) {
     .join("\n\n");
 
   try {
-    const completion = await openai.chat.completions.create({
+    const completion = await getOpenAI().chat.completions.create({
       model: "gpt-5.4",
       temperature: 0.1,
       max_tokens: 600,
@@ -53,7 +54,7 @@ If no tasks match (WHICH IS OFTEN THE CORRECT ANSWER), return: {"matchedTaskIds"
 // Refine a vague task description into a structured task definition
 async function refineTask(userInput) {
   try {
-    const completion = await openai.chat.completions.create({
+    const completion = await getOpenAI().chat.completions.create({
       model: "gpt-5.4",
       temperature: 0.5,
       max_tokens: 1000,
@@ -93,7 +94,7 @@ IMPORTANT: If the signal is about hiring, job openings, or specific roles being 
 // Generate AI insights for a specific task
 async function generateInsights(task, companyName) {
   try {
-    const completion = await openai.chat.completions.create({
+    const completion = await getOpenAI().chat.completions.create({
       model: "gpt-5.4",
       temperature: 0.6,
       max_tokens: 600,
@@ -127,7 +128,7 @@ async function generateInsights(task, companyName) {
 // Generate optimal LinkedIn search keywords for a job task
 async function generateJobKeywords(taskName, taskDescription) {
   try {
-    const completion = await openai.chat.completions.create({
+    const completion = await getOpenAI().chat.completions.create({
       model: "gpt-5.4",
       temperature: 0.3,
       max_tokens: 400,
@@ -169,7 +170,7 @@ async function generateScoringPrompt(taskName, taskDescription, taskKeywords, ta
   const sourceType = isJobPost && isNews ? "news articles AND job postings" : isJobPost ? "job postings" : "news articles";
 
   try {
-    const completion = await openai.chat.completions.create({
+    const completion = await getOpenAI().chat.completions.create({
       model: "gpt-5.4",
       temperature: 0.25,
       max_tokens: 1500,
@@ -255,7 +256,7 @@ async function dedupTasks(taskGroups) {
         `[${i}] Rule:"${t.taskRule}" | Signal:"${t.signal}" | URL:${t.url || "none"} | Score:${t.score}`
       ).join("\n");
 
-      const completion = await openai.chat.completions.create({
+      const completion = await getOpenAI().chat.completions.create({
         model: "gpt-5.4-mini",
         temperature: 0,
         max_tokens: 600,

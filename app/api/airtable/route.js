@@ -291,6 +291,7 @@ const SCHEMA = {
     { name: "Task Type", type: "singleLineText" },
     { name: "Date", type: "singleLineText" },
     { name: "Created", type: "singleLineText" },
+    { name: "Phone", type: "singleLineText" },
   ],
   "Campaigns": [
     { name: "Name", type: "singleLineText" },
@@ -299,6 +300,7 @@ const SCHEMA = {
     { name: "Description", type: "multilineText" },
     { name: "Emoji", type: "singleLineText" },
     { name: "Tables", type: "multilineText" },
+    { name: "HubSpot API Key", type: "singleLineText" },
   ],
 };
 
