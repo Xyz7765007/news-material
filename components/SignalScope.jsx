@@ -323,6 +323,18 @@ export default function SignalScope() {
       setHsMsg(d.created > 0 ? `✅ ${d.created} tasks pushed` : "❌ " + (d.errors?.[0] || "Failed"));
     } catch (e) { setHsMsg("❌ " + e.message); } setHsLoading(false);
   };
+  const pushLeadsToHS = async (leadsToPush, config) => {
+    setHsLoading(true); setHsMsg("");
+    try {
+      const mapped = leadsToPush.map(l => { const f = l.fields || l; return { name: f.Name || "", email: f.Email || "", phone: f.Phone || "", company: f.Company || "", title: f.Title || "", linkedinUrl: f["LinkedIn URL"] || "", website: f.Domain || f.Website || "", city: f.City || "", state: f.State || "", country: f.Country || "" }; });
+      const d = await hsAPI("push_leads", { leads: mapped, config });
+      const parts = [];
+      if (d.created) parts.push(`${d.created} created`);
+      if (d.updated) parts.push(`${d.updated} updated`);
+      if (d.skipped) parts.push(`${d.skipped} skipped`);
+      setHsMsg(parts.length ? "✅ " + parts.join(", ") : "❌ " + (d.errors?.[0] || "No leads pushed"));
+    } catch (e) { setHsMsg("❌ " + e.message); } setHsLoading(false);
+  };
   // ─── Enrichment helpers ────────────────────────────────────
   const enrichTasks = async (tasksToEnrich) => {
     setEnrichLoading(true);
@@ -940,10 +952,19 @@ export default function SignalScope() {
     </div>
 
     {/* Enrich + Push */}
-    <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10}}>
+    <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginBottom:16}}>
       <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:8}}>📞 Enrich & Push</div>
       <div style={{fontSize:11,color:"var(--t3)",marginBottom:12,lineHeight:1.5}}>Enrich tasks with phone numbers via Apollo, then push enriched tasks to HubSpot. Requires <code style={{background:"var(--hover)",padding:"1px 4px",borderRadius:3,fontSize:10}}>APOLLO_API_KEY</code> env var.</div>
       <button className="btn btn-s" style={{color:"var(--pur)",borderColor:"rgba(155,126,216,.3)"}} disabled={!tasks.length} onClick={()=>setEnrichModal({mode:"select"})}><I.Sparkle/> Enrich Phone Numbers</button>
+    </div>
+
+    {/* Upload Leads to HubSpot */}
+    <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10}}>
+      <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:8}}>👤 Upload Leads to HubSpot</div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:12,lineHeight:1.5}}>Push your SignalScope leads directly to HubSpot as contacts. Existing contacts (matched by email) will be updated, new ones created.</div>
+      {leads.length === 0 ? <div style={{fontSize:11,color:"var(--t3)"}}>No leads loaded. Upload leads on the Leads tab first.</div> : (
+        <LeadsToHubSpotForm leads={leads} owners={hsOwners} onPush={pushLeadsToHS} loading={hsLoading}/>
+      )}
     </div>
     </>)}
   </div>)}
@@ -1375,6 +1396,76 @@ function PushToHubSpotForm({ tasks, owners, onPush, loading, rules }) {
         {loading ? "⏳ Pushing..." : `Push ${filtered.length} Task${filtered.length !== 1 ? "s" : ""} to HubSpot`}
       </button>
       <span style={{fontSize:10,color:"var(--t3)"}}>{filtered.length} of {tasks.length} tasks match filters</span>
+    </div>
+  </div>);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// LEADS TO HUBSPOT FORM
+// ═══════════════════════════════════════════════════════════════
+function LeadsToHubSpotForm({ leads, owners, onPush, loading }) {
+  const [ownerId, setOwnerId] = useState("");
+  const [lifecycle, setLifecycle] = useState("lead");
+  const [leadStatus, setLeadStatus] = useState("NEW");
+  const [filterCompany, setFilterCompany] = useState("");
+  const [onlyWithEmail, setOnlyWithEmail] = useState(true);
+
+  const filtered = leads.filter(l => {
+    const f = l.fields || {};
+    if (onlyWithEmail && !f.Email) return false;
+    if (filterCompany && !(f.Company || "").toLowerCase().includes(filterCompany.toLowerCase())) return false;
+    return true;
+  });
+
+  return (<div>
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
+      <div className="ig" style={{marginBottom:0}}>
+        <div className="il">Assign To</div>
+        <select className="inp" value={ownerId} onChange={e=>setOwnerId(e.target.value)}>
+          <option value="">Unassigned</option>
+          {owners.map(o => <option key={o.id} value={o.id}>{o.label} ({o.email})</option>)}
+        </select>
+      </div>
+      <div className="ig" style={{marginBottom:0}}>
+        <div className="il">Filter by Company</div>
+        <input className="inp" placeholder="Type to filter..." value={filterCompany} onChange={e=>setFilterCompany(e.target.value)}/>
+      </div>
+    </div>
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12,marginBottom:14}}>
+      <div className="ig" style={{marginBottom:0}}>
+        <div className="il">Lifecycle Stage</div>
+        <select className="inp" value={lifecycle} onChange={e=>setLifecycle(e.target.value)}>
+          <option value="subscriber">Subscriber</option>
+          <option value="lead">Lead</option>
+          <option value="marketingqualifiedlead">Marketing Qualified</option>
+          <option value="salesqualifiedlead">Sales Qualified</option>
+          <option value="opportunity">Opportunity</option>
+          <option value="customer">Customer</option>
+        </select>
+      </div>
+      <div className="ig" style={{marginBottom:0}}>
+        <div className="il">Lead Status</div>
+        <select className="inp" value={leadStatus} onChange={e=>setLeadStatus(e.target.value)}>
+          <option value="NEW">New</option>
+          <option value="OPEN">Open</option>
+          <option value="IN_PROGRESS">In Progress</option>
+          <option value="ATTEMPTED_TO_CONTACT">Attempted</option>
+          <option value="CONNECTED">Connected</option>
+        </select>
+      </div>
+      <div className="ig" style={{marginBottom:0}}>
+        <div className="il">Email Filter</div>
+        <label style={{display:"flex",alignItems:"center",gap:6,fontSize:11,color:"var(--t2)",cursor:"pointer",paddingTop:6}}>
+          <input type="checkbox" checked={onlyWithEmail} onChange={e=>setOnlyWithEmail(e.target.checked)} style={{accentColor:"var(--acc)"}}/>
+          Only leads with email
+        </label>
+      </div>
+    </div>
+    <div style={{display:"flex",alignItems:"center",gap:12}}>
+      <button className="btn btn-p btn-s" disabled={loading || !filtered.length} onClick={() => onPush(filtered, { ownerId, lifecycleStage: lifecycle, leadStatus })}>
+        {loading ? "⏳ Pushing..." : `Upload ${filtered.length} Lead${filtered.length !== 1 ? "s" : ""} to HubSpot`}
+      </button>
+      <span style={{fontSize:10,color:"var(--t3)"}}>{filtered.length} of {leads.length} leads{onlyWithEmail ? " (with email)" : ""}</span>
     </div>
   </div>);
 }

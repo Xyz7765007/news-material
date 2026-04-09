@@ -156,6 +156,85 @@ async function searchContacts(apiKey, query) {
   return data.results || [];
 }
 
+// ─── HubSpot: Create/update contacts (leads upload) ─────────
+async function pushLeads(apiKey, leads, config) {
+  const { ownerId, lifecycleStage, leadStatus } = config;
+  const results = { created: 0, updated: 0, skipped: 0, errors: [] };
+
+  for (let i = 0; i < leads.length; i += 100) {
+    const batch = leads.slice(i, i + 100);
+    const inputs = batch.map(l => {
+      const props = {};
+      if (l.email) props.email = l.email;
+      if (l.firstName || l.name) {
+        const parts = (l.name || "").split(" ");
+        props.firstname = l.firstName || parts[0] || "";
+        props.lastname = l.lastName || parts.slice(1).join(" ") || "";
+      }
+      if (l.phone) props.phone = l.phone;
+      if (l.company) props.company = l.company;
+      if (l.title) props.jobtitle = l.title;
+      if (l.website || l.domain) props.website = l.website || l.domain;
+      if (l.linkedinUrl) props.hs_linkedinid = l.linkedinUrl;
+      if (l.city) props.city = l.city;
+      if (l.state) props.state = l.state;
+      if (l.country) props.country = l.country;
+      if (ownerId) props.hubspot_owner_id = ownerId;
+      if (lifecycleStage) props.lifecyclestage = lifecycleStage;
+      if (leadStatus) props.hs_lead_status = leadStatus;
+      return { properties: props };
+    }).filter(x => x.properties.email || x.properties.firstname); // need at least email or name
+
+    if (!inputs.length) { results.skipped += batch.length; continue; }
+
+    // Try batch create first
+    const res = await fetch(`${HS_API}/crm/v3/objects/contacts/batch/create`, {
+      method: "POST", headers: hsHdr(apiKey),
+      body: JSON.stringify({ inputs }),
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      results.created += (data.results || []).length;
+    } else {
+      const errText = await res.text();
+      // If conflict (contact exists), try upsert one by one
+      if (errText.includes("CONFLICT") || errText.includes("already exists")) {
+        for (const input of inputs) {
+          try {
+            // Try create
+            const single = await fetch(`${HS_API}/crm/v3/objects/contacts`, {
+              method: "POST", headers: hsHdr(apiKey),
+              body: JSON.stringify(input),
+            });
+            if (single.ok) { results.created++; }
+            else {
+              const sErr = await single.text();
+              if (sErr.includes("CONFLICT") || sErr.includes("already exists")) {
+                // Update existing by email
+                if (input.properties.email) {
+                  const upd = await fetch(`${HS_API}/crm/v3/objects/contacts/${encodeURIComponent(input.properties.email)}?idProperty=email`, {
+                    method: "PATCH", headers: hsHdr(apiKey),
+                    body: JSON.stringify(input),
+                  });
+                  if (upd.ok) results.updated++;
+                  else results.skipped++;
+                } else results.skipped++;
+              } else {
+                results.errors.push(sErr.slice(0, 100));
+              }
+            }
+          } catch (e) { results.errors.push(e.message); }
+        }
+      } else {
+        console.error("[HUBSPOT] Leads batch error:", errText.slice(0, 300));
+        results.errors.push(errText.slice(0, 150));
+      }
+    }
+  }
+  return results;
+}
+
 // ═══════════════════════════════════════════════════════════════
 // ROUTE HANDLER
 // ═══════════════════════════════════════════════════════════════
@@ -216,6 +295,15 @@ export async function POST(request) {
         if (!apiKey) return NextResponse.json({ error: "No API key" }, { status: 400 });
         const contacts = await searchContacts(apiKey, body.query);
         return NextResponse.json({ contacts });
+      }
+
+      case "push_leads": {
+        const apiKey = body.apiKey || await getStoredKey(campaignId);
+        if (!apiKey) return NextResponse.json({ error: "No API key" }, { status: 400 });
+        const { leads, config } = body;
+        if (!leads?.length) return NextResponse.json({ error: "No leads to push" }, { status: 400 });
+        const result = await pushLeads(apiKey, leads, config || {});
+        return NextResponse.json(result);
       }
 
       default:
