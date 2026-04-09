@@ -156,13 +156,55 @@ async function searchContacts(apiKey, query) {
   return data.results || [];
 }
 
-// ─── HubSpot: Create/update contacts (leads upload) ─────────
+// ─── HubSpot: Create contacts — skip existing (no duplicates) ─
 async function pushLeads(apiKey, leads, config) {
   const { ownerId, lifecycleStage, leadStatus } = config;
-  const results = { created: 0, updated: 0, skipped: 0, errors: [] };
+  const results = { created: 0, skipped: 0, alreadyExist: 0, errors: [] };
 
-  for (let i = 0; i < leads.length; i += 100) {
-    const batch = leads.slice(i, i + 100);
+  // Step 1: Collect all emails and check which already exist in HubSpot
+  const emails = leads.map(l => (l.email || "").toLowerCase().trim()).filter(Boolean);
+  const existingEmails = new Set();
+
+  // Batch read by email — 100 at a time
+  for (let i = 0; i < emails.length; i += 100) {
+    const batch = emails.slice(i, i + 100);
+    try {
+      const res = await fetch(`${HS_API}/crm/v3/objects/contacts/batch/read`, {
+        method: "POST", headers: hsHdr(apiKey),
+        body: JSON.stringify({
+          properties: ["email"],
+          idProperty: "email",
+          inputs: batch.map(email => ({ id: email })),
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        for (const r of (data.results || [])) {
+          const em = (r.properties?.email || "").toLowerCase().trim();
+          if (em) existingEmails.add(em);
+        }
+      }
+    } catch (e) {
+      console.error("[HUBSPOT] Batch read error:", e.message);
+    }
+  }
+
+  console.log(`[HUBSPOT] ${existingEmails.size} contacts already exist in HubSpot out of ${emails.length} emails`);
+
+  // Step 2: Filter out existing contacts
+  const newLeads = leads.filter(l => {
+    const em = (l.email || "").toLowerCase().trim();
+    if (em && existingEmails.has(em)) { results.alreadyExist++; return false; }
+    return true;
+  });
+
+  if (!newLeads.length) {
+    return results;
+  }
+
+  // Step 3: Create only new contacts
+  for (let i = 0; i < newLeads.length; i += 100) {
+    const batch = newLeads.slice(i, i + 100);
     const inputs = batch.map(l => {
       const props = {};
       if (l.email) props.email = l.email;
@@ -183,11 +225,10 @@ async function pushLeads(apiKey, leads, config) {
       if (lifecycleStage) props.lifecyclestage = lifecycleStage;
       if (leadStatus) props.hs_lead_status = leadStatus;
       return { properties: props };
-    }).filter(x => x.properties.email || x.properties.firstname); // need at least email or name
+    }).filter(x => x.properties.email || x.properties.firstname);
 
     if (!inputs.length) { results.skipped += batch.length; continue; }
 
-    // Try batch create first
     const res = await fetch(`${HS_API}/crm/v3/objects/contacts/batch/create`, {
       method: "POST", headers: hsHdr(apiKey),
       body: JSON.stringify({ inputs }),
@@ -198,36 +239,23 @@ async function pushLeads(apiKey, leads, config) {
       results.created += (data.results || []).length;
     } else {
       const errText = await res.text();
-      // If conflict (contact exists), try upsert one by one
+      // If some in batch conflict, fall back to one-by-one — only create, never update
       if (errText.includes("CONFLICT") || errText.includes("already exists")) {
         for (const input of inputs) {
           try {
-            // Try create
             const single = await fetch(`${HS_API}/crm/v3/objects/contacts`, {
-              method: "POST", headers: hsHdr(apiKey),
-              body: JSON.stringify(input),
+              method: "POST", headers: hsHdr(apiKey), body: JSON.stringify(input),
             });
-            if (single.ok) { results.created++; }
+            if (single.ok) results.created++;
             else {
               const sErr = await single.text();
-              if (sErr.includes("CONFLICT") || sErr.includes("already exists")) {
-                // Update existing by email
-                if (input.properties.email) {
-                  const upd = await fetch(`${HS_API}/crm/v3/objects/contacts/${encodeURIComponent(input.properties.email)}?idProperty=email`, {
-                    method: "PATCH", headers: hsHdr(apiKey),
-                    body: JSON.stringify(input),
-                  });
-                  if (upd.ok) results.updated++;
-                  else results.skipped++;
-                } else results.skipped++;
-              } else {
-                results.errors.push(sErr.slice(0, 100));
-              }
+              if (sErr.includes("CONFLICT") || sErr.includes("already exists")) results.alreadyExist++;
+              else results.errors.push(sErr.slice(0, 100));
             }
           } catch (e) { results.errors.push(e.message); }
         }
       } else {
-        console.error("[HUBSPOT] Leads batch error:", errText.slice(0, 300));
+        console.error("[HUBSPOT] Batch create error:", errText.slice(0, 300));
         results.errors.push(errText.slice(0, 150));
       }
     }

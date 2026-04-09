@@ -148,6 +148,7 @@ export default function SignalScope() {
   const [enrichModal, setEnrichModal] = useState(null); // { mode: "enrich" | "push", tasks: [] }
   const [enrichLoading, setEnrichLoading] = useState(false);
   const [enrichResults, setEnrichResults] = useState([]);
+  const [campTagFilter, setCampTagFilter] = useState("all");
 
   const bid = camp?.baseId || undefined; // current campaign's base
 
@@ -330,9 +331,10 @@ export default function SignalScope() {
       const d = await hsAPI("push_leads", { leads: mapped, config });
       const parts = [];
       if (d.created) parts.push(`${d.created} created`);
-      if (d.updated) parts.push(`${d.updated} updated`);
-      if (d.skipped) parts.push(`${d.skipped} skipped`);
-      setHsMsg(parts.length ? "✅ " + parts.join(", ") : "❌ " + (d.errors?.[0] || "No leads pushed"));
+      if (d.alreadyExist) parts.push(`${d.alreadyExist} already existed (skipped)`);
+      if (d.skipped) parts.push(`${d.skipped} skipped (no email/name)`);
+      if (d.errors?.length) parts.push(`${d.errors.length} errors`);
+      setHsMsg(parts.length ? (d.created > 0 ? "✅ " : "ℹ️ ") + parts.join(", ") : "❌ No leads pushed");
     } catch (e) { setHsMsg("❌ " + e.message); } setHsLoading(false);
   };
   // ─── Enrichment helpers ────────────────────────────────────
@@ -365,13 +367,20 @@ export default function SignalScope() {
   };
 
   const FIELD_ALIASES = {
-    Accounts: { Name:["name","company","company name","account","account name","organization","org name","business name"],Domain:["domain","website","company website","url","company url","company domain"],Industry:["industry","vertical","sector","category"],Size:["size","employees","employee count","company size","headcount","num employees","number of employees"],"LinkedIn URL":["linkedin","linkedin url","linkedin company","company linkedin","linkedin link"],Country:["country","location","hq","headquarters","region","geography","city","state"] },
-    Leads: { Name:["name","full name","contact name","contact","person","lead name"],Email:["email","email address","work email","business email","e-mail","mail"],Title:["title","job title","position","role","designation","current title"],Company:["company","organization","employer","company name","org","account name"],"LinkedIn URL":["linkedin","linkedin url","linkedin profile","profile url","li url"],Phone:["phone","phone number","direct phone","mobile","cell","telephone","work phone"] },
+    Accounts: { Name:["name","company","company name","account","account name","organization","org name","business name","company_name"],Domain:["domain","website","company website","url","company url","company domain","company_website","site"],Industry:["industry","vertical","sector","category"],Size:["size","employees","employee count","company size","headcount","num employees","number of employees","# employees","employee_count","total employees"],"LinkedIn URL":["linkedin","linkedin url","linkedin company","company linkedin","linkedin link","linkedin_url","company linkedin url","company_linkedin_url","linkedinurl"],Country:["country","location","hq","headquarters","region","geography","company country","company_country"] },
+    Leads: { Name:["name","full name","contact name","contact","person","lead name","full_name","contact_name","lead_name"],Email:["email","email address","work email","business email","e-mail","mail","email_address","work_email"],Title:["title","job title","position","role","designation","current title","job_title","jobtitle"],"First Name":["first name","first_name","firstname","given name","fname"],"Last Name":["last name","last_name","lastname","surname","family name","lname"],Company:["company","organization","employer","company name","org","account name","company_name","account_name"],"LinkedIn URL":["linkedin","linkedin url","linkedin profile","profile url","li url","linkedin_url","linkedinurl","linkedin profile url"],"Company LinkedIn URL":["company linkedin url","company_linkedin_url","company linkedin"],Phone:["phone","phone number","direct phone","mobile","cell","telephone","work phone","phone_number","direct_phone","mobile phone"],Website:["website","domain","company website","company_website","company domain","site","web"],City:["city","lead city","company city"],State:["state","lead state","company state","province","region"],Country:["country","lead country","company country"],"Annual Revenue":["annual revenue","annual_revenue","revenue"],"Total Funding":["total funding","total_funding","funding"],"# Employees":["# employees","employees","employee count","headcount","company size","number of employees"] },
   };
 
   const autoDetect = (headers, table) => {
     const aliases = FIELD_ALIASES[table] || {};
-    const existingFields = (availableFields[table] || []).map(f => f.name || f);
+    // Get fields from Airtable metadata
+    const metaFields = (availableFields[table] || []).map(f => f.name || f);
+    // Also get fields from loaded records as fallback (always up-to-date)
+    const recordSource = table === "Accounts" ? accounts : table === "Leads" ? leads : [];
+    const recordFields = [...new Set(recordSource.flatMap(r => Object.keys(r.fields || {})))];
+    // Combine both — metadata + record fields
+    const existingFields = [...new Set([...metaFields, ...recordFields])];
+
     const m = {};
     for (const h of headers) {
       const l = h.toLowerCase().trim();
@@ -393,27 +402,31 @@ export default function SignalScope() {
   };
 
   const handleCSVFile = (file, table, setter) => {
+    // Refresh available fields before mapping
+    fetchAvailableFields();
     const reader = new FileReader();
     reader.onload = (e) => {
       const lines = e.target.result.split("\n").filter(l => l.trim());
       if (lines.length < 2) return;
       const headers = parseCSVLine(lines[0]);
       const rows = lines.slice(1).map(l => parseCSVLine(l)).filter(r => r.some(c => c));
-      setCsvModal({ table, setter, headers, rows, mappings: autoDetect(headers, table), mode: "create", matchField: "Name" });
+      setCsvModal({ table, setter, headers, rows, mappings: autoDetect(headers, table), mode: "create", matchField: "Name", campaignTag: camp?.name || "", newCampaignTag: "" });
     };
     reader.readAsText(file);
   };
 
   const uploadMappedCSV = async () => {
     if (!csvModal) return;
-    const { table, setter, headers, rows, mappings, mode, matchField } = csvModal;
+    const { table, setter, headers, rows, mappings, mode, matchField, campaignTag, newCampaignTag } = csvModal;
     const active = Object.entries(mappings).filter(([_, v]) => v !== "__skip__");
+    const tag = (newCampaignTag || "").trim() || (campaignTag || "").trim();
 
     const recs = rows.map(row => {
       const obj = {};
       active.forEach(([csv, field]) => { const idx = headers.indexOf(csv); if (idx >= 0 && row[idx]) obj[field] = row[idx]; });
+      if (tag) obj["Campaign Tag"] = tag;
       return obj;
-    }).filter(r => Object.keys(r).length > 0);
+    }).filter(r => Object.keys(r).length > (tag ? 1 : 0)); // don't count only-tag records
     if (!recs.length) { setCsvModal(null); return; }
 
     try {
@@ -997,14 +1010,46 @@ export default function SignalScope() {
   </div>)}
 
   {/* ACCOUNTS */}
-  {tab==="accounts"&&!loading&&(<div><div className="ph"><div><div className="pt">Accounts</div><div className="pd">{accounts.length} companies</div></div><label className="btn btn-s" style={{cursor:"pointer"}}><I.Upload/> Upload CSV<input type="file" accept=".csv" hidden onChange={e=>{if(e.target.files[0])handleCSVFile(e.target.files[0],"Accounts",setAccounts)}}/></label></div>
-  {accounts.length===0?<div className="empty"><div className="em">🏢</div><p>Upload a CSV to get started.</p></div>:
-  <div className="tw"><table><thead><tr>{Object.keys(accounts[0]?.fields||{}).slice(0,6).map(k=><th key={k}>{k}</th>)}<th></th></tr></thead><tbody>{accounts.map(a=>(<tr key={a.id}>{Object.values(a.fields||{}).slice(0,6).map((v,i)=><td key={i}>{String(v).slice(0,50)}</td>)}<td><button className="btn btn-d btn-s" onClick={()=>del("Accounts",[a.id],setAccounts)}><I.Trash/></button></td></tr>))}</tbody></table></div>}</div>)}
+  {tab==="accounts"&&!loading&&(()=>{
+    const prefCols = ["Name","Domain","Industry","Size","LinkedIn URL","Country","Campaign Tag"];
+    const allCols = accounts.length ? [...new Set(accounts.flatMap(a => Object.keys(a.fields || {})))] : [];
+    const cols = [...prefCols.filter(c => allCols.includes(c)), ...allCols.filter(c => !prefCols.includes(c) && c !== "Campaign Tag")].slice(0, 8);
+    if (allCols.includes("Campaign Tag") && !cols.includes("Campaign Tag")) cols.push("Campaign Tag");
+    const fmt = v => { if (v === null || v === undefined) return ""; if (typeof v === "object") return JSON.stringify(v).slice(0, 50); return String(v).slice(0, 60); };
+    const acctTags = [...new Set(accounts.map(a => (a.fields || {})["Campaign Tag"]).filter(Boolean))].sort();
+    const filteredAccts = campTagFilter === "all" ? accounts : accounts.filter(a => (a.fields || {})["Campaign Tag"] === campTagFilter);
+    return (<div><div className="ph"><div><div className="pt">Accounts</div><div className="pd">{filteredAccts.length}{campTagFilter!=="all"?` of ${accounts.length}`:""} companies</div></div>
+      <div style={{display:"flex",gap:8}}>
+        {acctTags.length > 0 && <select className="inp" style={{width:160,fontSize:10,padding:"5px 8px"}} value={campTagFilter} onChange={e=>setCampTagFilter(e.target.value)}>
+          <option value="all">All Campaigns ({accounts.length})</option>
+          {acctTags.map(t => <option key={t} value={t}>{t} ({accounts.filter(a=>(a.fields||{})["Campaign Tag"]===t).length})</option>)}
+        </select>}
+        <label className="btn btn-s" style={{cursor:"pointer"}}><I.Upload/> Upload CSV<input type="file" accept=".csv" hidden onChange={e=>{if(e.target.files[0])handleCSVFile(e.target.files[0],"Accounts",setAccounts)}}/></label>
+      </div></div>
+    {filteredAccts.length===0?<div className="empty"><div className="em">🏢</div><p>{accounts.length>0?"No accounts match this campaign filter.":"Upload a CSV to get started."}</p></div>:
+    <div className="tw"><table><thead><tr>{cols.map(k=><th key={k}>{k}</th>)}<th></th></tr></thead><tbody>{filteredAccts.map(a=>{const f=a.fields||{};return(<tr key={a.id}>{cols.map(k=><td key={k} style={k==="Name"?{color:"var(--t1)",fontWeight:500}:k==="Campaign Tag"?{fontSize:10,color:"var(--acc)"}:{}}>{fmt(f[k])}</td>)}<td><button className="btn btn-d btn-s" onClick={()=>del("Accounts",[a.id],setAccounts)}><I.Trash/></button></td></tr>)})}</tbody></table></div>}</div>);
+  })()}
 
   {/* LEADS */}
-  {tab==="leads"&&!loading&&(<div><div className="ph"><div><div className="pt">Leads</div><div className="pd">{leads.length} contacts</div></div><label className="btn btn-s" style={{cursor:"pointer"}}><I.Upload/> Upload CSV<input type="file" accept=".csv" hidden onChange={e=>{if(e.target.files[0])handleCSVFile(e.target.files[0],"Leads",setLeads)}}/></label></div>
-  {leads.length===0?<div className="empty"><div className="em">👤</div><p>Upload a CSV.</p></div>:
-  <div className="tw"><table><thead><tr>{Object.keys(leads[0]?.fields||{}).slice(0,6).map(k=><th key={k}>{k}</th>)}<th></th></tr></thead><tbody>{leads.map(l=>(<tr key={l.id}>{Object.values(l.fields||{}).slice(0,6).map((v,i)=><td key={i}>{String(v).slice(0,50)}</td>)}<td><button className="btn btn-d btn-s" onClick={()=>del("Leads",[l.id],setLeads)}><I.Trash/></button></td></tr>))}</tbody></table></div>}</div>)}
+  {tab==="leads"&&!loading&&(()=>{
+    const prefCols = ["Name","Email","Title","Company","LinkedIn URL","Phone","Campaign Tag"];
+    const allCols = leads.length ? [...new Set(leads.flatMap(l => Object.keys(l.fields || {})))] : [];
+    const cols = [...prefCols.filter(c => allCols.includes(c)), ...allCols.filter(c => !prefCols.includes(c) && c !== "Campaign Tag")].slice(0, 8);
+    if (allCols.includes("Campaign Tag") && !cols.includes("Campaign Tag")) cols.push("Campaign Tag");
+    const fmt = v => { if (v === null || v === undefined) return ""; if (typeof v === "object") return JSON.stringify(v).slice(0, 50); return String(v).slice(0, 60); };
+    const leadTags = [...new Set(leads.map(l => (l.fields || {})["Campaign Tag"]).filter(Boolean))].sort();
+    const filteredLeads = campTagFilter === "all" ? leads : leads.filter(l => (l.fields || {})["Campaign Tag"] === campTagFilter);
+    return (<div><div className="ph"><div><div className="pt">Leads</div><div className="pd">{filteredLeads.length}{campTagFilter!=="all"?` of ${leads.length}`:""} contacts</div></div>
+      <div style={{display:"flex",gap:8}}>
+        {leadTags.length > 0 && <select className="inp" style={{width:160,fontSize:10,padding:"5px 8px"}} value={campTagFilter} onChange={e=>setCampTagFilter(e.target.value)}>
+          <option value="all">All Campaigns ({leads.length})</option>
+          {leadTags.map(t => <option key={t} value={t}>{t} ({leads.filter(l=>(l.fields||{})["Campaign Tag"]===t).length})</option>)}
+        </select>}
+        <label className="btn btn-s" style={{cursor:"pointer"}}><I.Upload/> Upload CSV<input type="file" accept=".csv" hidden onChange={e=>{if(e.target.files[0])handleCSVFile(e.target.files[0],"Leads",setLeads)}}/></label>
+      </div></div>
+    {filteredLeads.length===0?<div className="empty"><div className="em">👤</div><p>{leads.length>0?"No leads match this campaign filter.":"Upload a CSV."}</p></div>:
+    <div className="tw"><table><thead><tr>{cols.map(k=><th key={k}>{k}</th>)}<th></th></tr></thead><tbody>{filteredLeads.map(l=>{const f=l.fields||{};return(<tr key={l.id}>{cols.map(k=><td key={k} style={k==="Name"?{color:"var(--t1)",fontWeight:500}:k==="Email"?{fontSize:10}:k==="Campaign Tag"?{fontSize:10,color:"var(--acc)"}:{}}>{fmt(f[k])}</td>)}<td><button className="btn btn-d btn-s" onClick={()=>del("Leads",[l.id],setLeads)}><I.Trash/></button></td></tr>)})}</tbody></table></div>}</div>);
+  })()}
 
   {/* TASK RULES (unified — signal + top_x) */}
   {tab==="rules"&&!loading&&(<div><div className="ph"><div><div className="pt">Task Rules</div><div className="pd">{rules.length} rules</div></div><button className="btn btn-s btn-p" onClick={()=>setEditRule({})}><I.Plus/> Add Rule</button></div>
@@ -1303,6 +1348,27 @@ export default function SignalScope() {
       )}
     </div>
   </div>)}
+
+  {/* Campaign Tag */}
+  <div className="ig">
+    <div className="il">Campaign Tag <span style={{fontWeight:400,color:"var(--t3)",textTransform:"none"}}>— tag all imported rows</span></div>
+    {(()=>{
+      const allRecords = [...accounts, ...leads];
+      const existingTags = [...new Set(allRecords.map(r => (r.fields || {})["Campaign Tag"]).filter(Boolean))].sort();
+      return (<div style={{display:"flex",gap:8}}>
+        <select className="inp" style={{flex:1}} value={csvModal.campaignTag} onChange={e=>setCsvModal(p=>({...p,campaignTag:e.target.value,newCampaignTag:""}))}>
+          <option value="">— No tag —</option>
+          {camp?.name && <option value={camp.name}>{camp.name} (current campaign)</option>}
+          {existingTags.filter(t => t !== camp?.name).map(t => <option key={t} value={t}>{t}</option>)}
+          <option value="__new__">+ Create new tag…</option>
+        </select>
+        {csvModal.campaignTag === "__new__" && (
+          <input className="inp" style={{flex:1}} placeholder="Enter new tag name…" value={csvModal.newCampaignTag} onChange={e=>setCsvModal(p=>({...p,newCampaignTag:e.target.value}))} autoFocus/>
+        )}
+      </div>);
+    })()}
+    <div style={{fontSize:10,color:"var(--t3)",marginTop:4}}>All rows will get a "Campaign Tag" field so you can filter leads by campaign later.</div>
+  </div>
 
   <div style={{fontSize:11,color:"var(--t3)",marginBottom:12}}>{csvModal.rows.length} rows · Custom columns auto-created on Airtable</div>
   <div style={{display:"flex",flexDirection:"column",gap:8}}>
