@@ -138,7 +138,8 @@ export default function SignalScope() {
   const [outreachLoading, setOutreachLoading] = useState(false);
   // HubSpot
   const [hsConnected, setHsConnected] = useState(false);
-  const [hsKey, setHsKey] = useState("");
+  const [hsKey, setHsKey] = useState(""); // input field
+  const hsApiKeyRef = useRef(""); // actual stored key
   const [hsMasked, setHsMasked] = useState("");
   const [hsOwners, setHsOwners] = useState([]);
   const [hsLoading, setHsLoading] = useState(false);
@@ -302,13 +303,15 @@ export default function SignalScope() {
 
   // ─── HubSpot helpers ───────────────────────────────────────
   const hsAPI = async (action, data = {}) => {
-    const res = await fetch("/api/hubspot", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, campaignId: camp?.airtableId, ...data }) });
+    const payload = { action, campaignId: camp?.airtableId, ...data };
+    if (hsApiKeyRef.current && !payload.apiKey) payload.apiKey = hsApiKeyRef.current;
+    const res = await fetch("/api/hubspot", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     return res.json();
   };
-  const loadHubSpot = async () => { try { const d = await hsAPI("get_stored_key"); if (d.hasKey) { setHsConnected(true); setHsMasked(d.maskedKey || ""); loadHsOwners(); } } catch {} };
+  const loadHubSpot = async () => { try { const d = await hsAPI("get_stored_key"); if (d.hasKey) { setHsConnected(true); setHsMasked(d.maskedKey || ""); if (d.rawKey) hsApiKeyRef.current = d.rawKey; loadHsOwners(); } } catch {} };
   const connectHubSpot = async (key) => {
     setHsLoading(true); setHsMsg("");
-    try { const d = await hsAPI("save_key", { apiKey: key }); if (d.ok) { setHsConnected(true); setHsMasked("****" + key.slice(-4)); setHsKey(""); setHsMsg("✅ Connected"); loadHsOwners(); } else setHsMsg("❌ " + (d.error || "Failed")); }
+    try { const d = await hsAPI("save_key", { apiKey: key }); if (d.ok) { hsApiKeyRef.current = key; setHsConnected(true); setHsMasked("****" + key.slice(-4)); setHsKey(""); setHsMsg("✅ Connected"); loadHsOwners(); } else setHsMsg("❌ " + (d.error || "Failed")); }
     catch (e) { setHsMsg("❌ " + e.message); } setHsLoading(false);
   };
   const loadHsOwners = async () => { try { const d = await hsAPI("fetch_owners"); setHsOwners(d.owners || []); } catch {} };

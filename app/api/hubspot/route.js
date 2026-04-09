@@ -20,6 +20,18 @@ async function getStoredKey(campaignId) {
 async function storeKey(campaignId, apiKey) {
   if (!campaignId || !MASTER_BASE) return false;
   try {
+    // Ensure field exists
+    const tables = await fetch(`https://api.airtable.com/v0/meta/bases/${MASTER_BASE}/tables`, { headers: atHdr });
+    if (tables.ok) {
+      const { tables: tbls } = await tables.json();
+      const campTable = tbls?.find(t => t.name === "Campaigns");
+      if (campTable && !campTable.fields?.some(f => f.name === "HubSpot API Key")) {
+        await fetch(`https://api.airtable.com/v0/meta/bases/${MASTER_BASE}/tables/${campTable.id}/fields`, {
+          method: "POST", headers: atHdr,
+          body: JSON.stringify({ name: "HubSpot API Key", type: "singleLineText" }),
+        });
+      }
+    }
     const res = await fetch(`${AT_API}/${MASTER_BASE}/Campaigns/${campaignId}`, {
       method: "PATCH", headers: atHdr,
       body: JSON.stringify({ fields: { "HubSpot API Key": apiKey } }),
@@ -155,7 +167,7 @@ export async function POST(request) {
     switch (action) {
       case "get_stored_key": {
         const key = await getStoredKey(campaignId);
-        return NextResponse.json({ hasKey: !!key, maskedKey: key ? "****" + key.slice(-4) : null });
+        return NextResponse.json({ hasKey: !!key, maskedKey: key ? "****" + key.slice(-4) : null, rawKey: key || null });
       }
 
       case "save_key": {
