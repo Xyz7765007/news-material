@@ -1019,7 +1019,13 @@ export default function SignalScope() {
 
   {/* ════ POST-DEMO AUTOMATION ════ */}
   {tab==="post_demo"&&!loading&&(<div>
-    <div className="ph"><div><div className="pt">🤖 Post-Demo Automation</div><div className="pd">Auto-create follow-up tasks when lead status changes</div></div></div>
+    <div className="ph"><div><div className="pt">🤖 Post-Demo Automation</div><div className="pd">Auto-create follow-up tasks from HubSpot contact data</div></div></div>
+
+    {!hsConnected ? (
+      <div className="empty"><div className="em">🔗</div><p>Connect HubSpot first to use Post-Demo Automation</p>
+        <button className="btn btn-p" onClick={()=>setTab("hubspot")}>Go to HubSpot →</button>
+      </div>
+    ) : (<>
 
     {/* Step 1: Rule Name */}
     <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginBottom:16}}>
@@ -1029,95 +1035,104 @@ export default function SignalScope() {
       </div>
     </div>
 
-    {/* Step 2: Pick Trigger Field */}
+    {/* Step 2: Pick Trigger Field from HubSpot */}
     <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginBottom:16}}>
-      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}><span style={{width:22,height:22,borderRadius:"50%",background:"var(--acc)",color:"#0a0a0c",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700}}>2</span><span style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>Select Trigger Field</span></div>
-      <div style={{fontSize:11,color:"var(--t3)",marginBottom:12}}>Which field in your leads data indicates a status change? (e.g. Status, Stage, Result, Demo Status)</div>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}><span style={{width:22,height:22,borderRadius:"50%",background:"var(--acc)",color:"#0a0a0c",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700}}>2</span><span style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>Select Trigger Field</span><span style={{fontSize:9,padding:"2px 8px",background:"rgba(91,143,212,.12)",color:"var(--blu)",borderRadius:4}}>from HubSpot</span></div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:12}}>Which HubSpot contact property indicates a status change? (e.g. lifecyclestage, hs_lead_status, deal stage)</div>
       <select className="inp" value={pdRule.triggerField} onChange={async(e)=>{
         const field = e.target.value;
         setPdRule(p=>({...p,triggerField:field,triggerValue:""}));
         setPdFieldValues(null);setPdPreview(null);setPdResults(null);
-        if(field&&bid){
-          try{const res=await fetch("/api/post-demo",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"get_field_values",baseId:bid,field})});setPdFieldValues(await res.json())}catch{}
-        }
-      }} onFocus={async()=>{if(!pdLeadFields.length&&bid){try{const res=await fetch("/api/post-demo",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"get_lead_fields",baseId:bid})});const d=await res.json();setPdLeadFields(d.fields||[])}catch{}}}}>
-        <option value="">Select a field...</option>
-        {pdLeadFields.map(f => <option key={f} value={f}>{f}</option>)}
-        {pdLeadFields.length===0 && <option disabled>Click to load fields...</option>}
+        if(field){
+          try{const res=await fetch("/api/post-demo",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"get_field_values",campaignId:camp?.airtableId,apiKey:hsApiKeyRef.current,field})});setPdFieldValues(await res.json())}catch{}}
+      }} onFocus={async()=>{if(!pdLeadFields.length){
+        try{const res=await fetch("/api/post-demo",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"get_properties",campaignId:camp?.airtableId,apiKey:hsApiKeyRef.current})});const d=await res.json();
+          const fields = (d.properties||[]).map(p=>({name:p.name,label:p.label,group:p.groupName}));
+          setPdLeadFields(fields);
+        }catch{}}}}>
+        <option value="">Select a HubSpot property...</option>
+        {(()=>{
+          const groups = {};
+          pdLeadFields.forEach(f => { const g = f.group || "other"; if (!groups[g]) groups[g] = []; groups[g].push(f); });
+          return Object.entries(groups).map(([g, fields]) => (
+            <optgroup key={g} label={g.replace(/contactinformation/,"Contact Info").replace(/dealinformation/,"Deal Info").replace(/_/g," ")}>
+              {fields.map(f => <option key={f.name} value={f.name}>{f.label || f.name}</option>)}
+            </optgroup>
+          ));
+        })()}
+        {pdLeadFields.length===0 && <option disabled>Click to load from HubSpot...</option>}
       </select>
     </div>
 
-    {/* Step 3: Show all stages/values for that field */}
+    {/* Step 3: Show stages/values from HubSpot */}
     {pdFieldValues&&(<div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginBottom:16}}>
-      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}><span style={{width:22,height:22,borderRadius:"50%",background:"var(--acc)",color:"#0a0a0c",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700}}>3</span><span style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>Choose the Trigger Value</span></div>
-      <div style={{fontSize:11,color:"var(--t3)",marginBottom:12}}>These are all the current values for <strong style={{color:"var(--t1)"}}>{pdFieldValues.field}</strong> across {pdFieldValues.total} leads. Click the one that should trigger follow-up task creation.</div>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}><span style={{width:22,height:22,borderRadius:"50%",background:"var(--acc)",color:"#0a0a0c",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700}}>3</span><span style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>Choose Trigger Value</span>
+        {pdFieldValues.type==="predefined"&&<span style={{fontSize:9,padding:"2px 8px",background:"rgba(93,168,122,.12)",color:"var(--grn)",borderRadius:4}}>HubSpot-defined stages</span>}
+      </div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:12}}>
+        {pdFieldValues.type==="predefined"
+          ? <>These are the official HubSpot stages for <strong style={{color:"var(--t1)"}}>{pdFieldValues.label}</strong>. Click the one that should trigger task creation.</>
+          : <>Values found in HubSpot for <strong style={{color:"var(--t1)"}}>{pdFieldValues.label}</strong>. Click to select.</>}
+      </div>
 
       {pdFieldValues.values.length === 0 ? (
-        <div style={{fontSize:11,color:"var(--red)"}}>No values found for this field. All {pdFieldValues.empty} leads have this field empty.</div>
+        <div style={{fontSize:11,color:"var(--red)"}}>No values found for this property.</div>
       ) : (<>
         <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:12}}>
           {pdFieldValues.values.map(v => (
             <button key={v.value} onClick={()=>{setPdRule(p=>({...p,triggerValue:v.value,triggerOperator:"equals"}));setPdPreview(null);setPdResults(null)}}
               style={{padding:"8px 14px",borderRadius:8,border:"1px solid "+(pdRule.triggerValue===v.value?"var(--acc)":"var(--bdr)"),background:pdRule.triggerValue===v.value?"var(--acc-d)":"var(--hover)",cursor:"pointer",display:"flex",alignItems:"center",gap:8,transition:"all .15s"}}>
-              <span style={{fontSize:12,color:pdRule.triggerValue===v.value?"var(--acc)":"var(--t1)",fontWeight:pdRule.triggerValue===v.value?600:400}}>{v.value}</span>
-              <span style={{fontSize:10,color:"var(--t3)",fontFamily:"'JetBrains Mono',monospace",background:"var(--card)",padding:"1px 6px",borderRadius:4}}>{v.count}</span>
+              <span style={{fontSize:12,color:pdRule.triggerValue===v.value?"var(--acc)":"var(--t1)",fontWeight:pdRule.triggerValue===v.value?600:400}}>{v.label || v.value}</span>
+              {v.count !== undefined && <span style={{fontSize:10,color:"var(--t3)",fontFamily:"'JetBrains Mono',monospace",background:"var(--card)",padding:"1px 6px",borderRadius:4}}>{v.count}</span>}
             </button>
           ))}
         </div>
-        {pdFieldValues.empty > 0 && <div style={{fontSize:10,color:"var(--t3)"}}>+ {pdFieldValues.empty} leads have this field empty</div>}
 
-        {/* Custom value option */}
         <div style={{marginTop:12,paddingTop:12,borderTop:"1px solid var(--bdr)"}}>
           <div style={{fontSize:10,color:"var(--t3)",marginBottom:6}}>Or use a custom condition:</div>
           <div style={{display:"flex",gap:8,alignItems:"center"}}>
             <select className="inp" style={{width:140}} value={pdRule.triggerOperator} onChange={e=>setPdRule(p=>({...p,triggerOperator:e.target.value}))}>
-              <option value="equals">Equals</option>
-              <option value="contains">Contains</option>
-              <option value="not_empty">Not Empty</option>
-              <option value="greater_than">Greater Than</option>
-              <option value="less_than">Less Than</option>
+              <option value="equals">Equals</option><option value="contains">Contains</option><option value="not_empty">Not Empty</option><option value="greater_than">Greater Than</option><option value="less_than">Less Than</option>
             </select>
-            <input className="inp" style={{flex:1}} value={pdRule.triggerValue} onChange={e=>setPdRule(p=>({...p,triggerValue:e.target.value}))} placeholder={pdRule.triggerOperator==="not_empty"?"(any non-empty value)":"Type value..."} disabled={pdRule.triggerOperator==="not_empty"}/>
+            <input className="inp" style={{flex:1}} value={pdRule.triggerValue} onChange={e=>setPdRule(p=>({...p,triggerValue:e.target.value}))} placeholder={pdRule.triggerOperator==="not_empty"?"(any)":"Type value..."} disabled={pdRule.triggerOperator==="not_empty"}/>
           </div>
         </div>
       </>)}
     </div>)}
 
-    {/* Step 4: AI Prompt + Actions */}
+    {/* Step 4: AI + Run */}
     {pdRule.triggerField && (pdRule.triggerValue || pdRule.triggerOperator === "not_empty") && (<div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginBottom:16}}>
-      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}><span style={{width:22,height:22,borderRadius:"50%",background:"var(--acc)",color:"#0a0a0c",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700}}>4</span><span style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>Configure AI Task Generation</span></div>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}><span style={{width:22,height:22,borderRadius:"50%",background:"var(--acc)",color:"#0a0a0c",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700}}>4</span><span style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>Configure & Run</span></div>
 
       <div style={{padding:10,background:"var(--hover)",borderRadius:8,marginBottom:14,fontSize:11,color:"var(--t2)"}}>
-        🎯 Trigger: When <strong style={{color:"var(--acc)"}}>{pdRule.triggerField}</strong> {pdRule.triggerOperator === "not_empty" ? "is not empty" : `${pdRule.triggerOperator.replace(/_/g," ")} "${pdRule.triggerValue}"`}
-        {pdFieldValues && pdRule.triggerValue && (() => { const match = pdFieldValues.values.find(v => v.value === pdRule.triggerValue); return match ? <span style={{marginLeft:8,color:"var(--t3)"}}>({match.count} leads match)</span> : null; })()}
+        🎯 Trigger: When HubSpot contact <strong style={{color:"var(--acc)"}}>{pdFieldValues?.label||pdRule.triggerField}</strong> {pdRule.triggerOperator==="not_empty"?"is not empty":`${pdRule.triggerOperator.replace(/_/g," ")} "${pdRule.triggerValue}"`}
       </div>
 
       <div className="ig">
-        <div className="il">AI Instructions <span style={{fontWeight:400,textTransform:"none",color:"var(--t3)"}}>— tell AI how to create follow-up tasks</span></div>
-        <textarea className="inp" value={pdRule.aiPrompt} onChange={e=>setPdRule(p=>({...p,aiPrompt:e.target.value}))} style={{minHeight:90}} placeholder={"Based on this contact's status and engagement history, create follow-up tasks for the SDR.\n\nPrioritize:\n- If they have a phone → schedule a call within 24h\n- If VP+ title → high priority executive outreach\n- If they engaged with our signals → reference specific engagement\n- Always include a personalized LinkedIn message\n- Keep tasks specific and actionable"}/>
+        <div className="il">AI Instructions</div>
+        <textarea className="inp" value={pdRule.aiPrompt} onChange={e=>setPdRule(p=>({...p,aiPrompt:e.target.value}))} style={{minHeight:80}} placeholder={"Create follow-up tasks based on this contact's HubSpot data and deal history.\n\nPrioritize:\n- If they have a phone → schedule a call\n- If VP+ title → high priority\n- Reference their deal stage and engagement\n- Include a LinkedIn message task"}/>
       </div>
 
       <div style={{display:"flex",gap:8}}>
         <button className="btn btn-s" disabled={pdLoading} onClick={async()=>{
           setPdLoading(true);setPdPreview(null);
-          try{const res=await fetch("/api/post-demo",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"preview",baseId:bid,rule:pdRule})});setPdPreview(await res.json())}catch(e){setPdPreview({error:e.message})}
+          try{const res=await fetch("/api/post-demo",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"preview",campaignId:camp?.airtableId,apiKey:hsApiKeyRef.current,rule:pdRule})});setPdPreview(await res.json())}catch(e){setPdPreview({error:e.message})}
           setPdLoading(false);
         }}>{pdLoading?"⏳":"👁 Preview"}</button>
-        <button className="btn btn-p btn-s" disabled={pdLoading||!bid} onClick={async()=>{
+        <button className="btn btn-p btn-s" disabled={pdLoading} onClick={async()=>{
           setPdLoading(true);setPdResults(null);
-          try{const res=await fetch("/api/post-demo",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"run",baseId:bid,rule:pdRule})});const d=await res.json();setPdResults(d);if(d.tasksCreated>0){const all=await fetch("/api/airtable",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"list",table:"Tasks",baseId:bid})});if(all.ok){const ad=await all.json();setTasks((ad.records||[]).sort((a,b)=>((b.fields?.Created||"")>(a.fields?.Created||"")?1:-1)))}}}catch(e){setPdResults({error:e.message})}
+          try{const res=await fetch("/api/post-demo",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"run",campaignId:camp?.airtableId,apiKey:hsApiKeyRef.current,baseId:bid,rule:pdRule})});const d=await res.json();setPdResults(d);if(d.tasksCreated>0){const all=await fetch("/api/airtable",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"list",table:"Tasks",baseId:bid})});if(all.ok){const ad=await all.json();setTasks((ad.records||[]).sort((a,b)=>((b.fields?.Created||"")>(a.fields?.Created||"")?1:-1)))}}}catch(e){setPdResults({error:e.message})}
           setPdLoading(false);
-        }}>{pdLoading?"⏳ Generating...":"▶ Run Automation"}</button>
+        }}>{pdLoading?"⏳ Running...":"▶ Run Automation"}</button>
       </div>
     </div>)}
 
     {/* Preview */}
     {pdPreview&&(<div style={{padding:16,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginBottom:16}}>
-      <div style={{fontSize:12,fontWeight:600,color:"var(--t2)",marginBottom:8}}>Preview: {pdPreview.matched||0} leads match</div>
-      {pdPreview.error && <div style={{color:"var(--red)",fontSize:11}}>❌ {pdPreview.error}</div>}
-      {pdPreview.sample?.length > 0 && (<div className="tw"><table><thead><tr><th>Name</th><th>Company</th><th>{pdRule.triggerField}</th></tr></thead>
-        <tbody>{pdPreview.sample.map((s,i) => <tr key={i}><td style={{color:"var(--t1)",fontWeight:500}}>{s.name}</td><td>{s.company}</td><td style={{color:"var(--acc)",fontSize:10}}>{s.value}</td></tr>)}</tbody></table></div>)}
-      {pdPreview.matched===0 && !pdPreview.error && <div style={{fontSize:11,color:"var(--t3)"}}>No leads match. Check your trigger condition.</div>}
+      <div style={{fontSize:12,fontWeight:600,color:"var(--t2)",marginBottom:8}}>Preview: {pdPreview.matched||0} HubSpot contacts match</div>
+      {pdPreview.error&&<div style={{color:"var(--red)",fontSize:11}}>❌ {pdPreview.error}</div>}
+      {pdPreview.sample?.length>0&&(<div className="tw"><table><thead><tr><th>Name</th><th>Company</th><th>Email</th><th>{pdFieldValues?.label||pdRule.triggerField}</th></tr></thead>
+        <tbody>{pdPreview.sample.map((s,i)=><tr key={i}><td style={{color:"var(--t1)",fontWeight:500}}>{s.name}</td><td>{s.company}</td><td style={{fontSize:10}}>{s.email}</td><td style={{color:"var(--acc)",fontSize:10}}>{s.value}</td></tr>)}</tbody></table></div>)}
     </div>)}
 
     {/* Results */}
@@ -1127,16 +1142,16 @@ export default function SignalScope() {
           <div key={s.l} style={{padding:"10px 16px",background:"var(--hover)",borderRadius:8}}><div style={{fontSize:20,fontWeight:700,fontFamily:"'JetBrains Mono',monospace",color:s.c}}>{s.v}</div><div style={{fontSize:9,color:"var(--t3)"}}>{s.l}</div></div>
         ))}
       </div>
-      {pdResults.error && <div style={{color:"var(--red)",fontSize:11,marginBottom:12}}>❌ {pdResults.error}</div>}
-      {pdResults.results?.length > 0 && (<div style={{maxHeight:400,overflowY:"auto"}}>
-        {pdResults.results.map((r,i) => (
+      {pdResults.error&&<div style={{color:"var(--red)",fontSize:11,marginBottom:12}}>❌ {pdResults.error}</div>}
+      {pdResults.results?.length>0&&(<div style={{maxHeight:400,overflowY:"auto"}}>
+        {pdResults.results.map((r,i)=>(
           <div key={i} style={{padding:14,border:"1px solid var(--bdr)",borderRadius:8,marginBottom:8,background:"var(--hover)"}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
               <div><span style={{fontWeight:600,color:"var(--t1)"}}>{r.lead}</span> <span style={{fontSize:10,color:"var(--t3)"}}>— {r.title} at {r.company}</span></div>
-              <span style={{fontSize:9,color:"var(--t3)"}}>{r.engagementCount} prior signals</span>
+              <span style={{fontSize:9,color:"var(--t3)"}}>{r.dealCount} deal{r.dealCount!==1?"s":""}</span>
             </div>
             <div style={{fontSize:10,color:"var(--acc)",marginBottom:6}}>Trigger: {r.trigger}</div>
-            {r.tasks.map((t,j) => (
+            {r.tasks.map((t,j)=>(
               <div key={j} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 10px",background:"var(--card)",borderRadius:6,marginBottom:4}}>
                 <span className={"chip "+(t.priority==="HIGH"?"cr":t.priority==="MEDIUM"?"ca":"cg")}>{t.priority}</span>
                 <span style={{fontSize:10,color:"var(--t2)",flex:1}}><strong style={{color:"var(--t1)"}}>{t.subject}</strong> — {t.action}</span>
@@ -1146,20 +1161,22 @@ export default function SignalScope() {
           </div>
         ))}
       </div>)}
-      {pdResults.tasksCreated > 0 && <div style={{marginTop:12,fontSize:11,color:"var(--grn)"}}>✅ {pdResults.tasksCreated} tasks saved. View on Tasks tab (type: post_demo).</div>}
+      {pdResults.tasksCreated>0&&<div style={{marginTop:12,fontSize:11,color:"var(--grn)"}}>✅ {pdResults.tasksCreated} tasks saved. View on Tasks tab (type: post_demo).</div>}
     </div>)}
 
     {/* Empty state */}
-    {!pdFieldValues && !pdPreview && !pdResults && !pdRule.triggerField && (<div style={{padding:20,background:"var(--hover)",borderRadius:10}}>
+    {!pdFieldValues&&!pdPreview&&!pdResults&&!pdRule.triggerField&&(<div style={{padding:20,background:"var(--hover)",borderRadius:10}}>
       <div style={{fontSize:12,fontWeight:600,color:"var(--t2)",marginBottom:10}}>How it works</div>
       <div style={{fontSize:11,color:"var(--t3)",lineHeight:1.7}}>
         <strong style={{color:"var(--t2)"}}>Step 1:</strong> Name your rule<br/>
-        <strong style={{color:"var(--t2)"}}>Step 2:</strong> Pick a trigger field from your leads (e.g. "Status", "Stage", "Result")<br/>
-        <strong style={{color:"var(--t2)"}}>Step 3:</strong> See all current values for that field — click the one that triggers automation (e.g. "Demo Complete")<br/>
-        <strong style={{color:"var(--t2)"}}>Step 4:</strong> Write AI instructions — what kind of follow-up tasks should be generated<br/>
-        <strong style={{color:"var(--t2)"}}>Run:</strong> AI analyzes each matched lead's profile + engagement history and creates 1-3 personalized tasks per lead
+        <strong style={{color:"var(--t2)"}}>Step 2:</strong> Pick a HubSpot contact property (e.g. lifecyclestage, hs_lead_status)<br/>
+        <strong style={{color:"var(--t2)"}}>Step 3:</strong> See all stages/values from HubSpot — click the trigger (e.g. "salesqualifiedlead")<br/>
+        <strong style={{color:"var(--t2)"}}>Step 4:</strong> Write AI instructions + Run<br/>
+        AI pulls each contact's full HubSpot profile + deal history → generates 1-3 personalized SDR tasks
       </div>
     </div>)}
+
+    </>)}
   </div>)}
 
   {/* ════ COMING SOON ════ */}
