@@ -832,24 +832,37 @@ export async function POST(request) {
         const { campaignId } = body;
         if (!campaignId) return NextResponse.json({ error: "campaignId required" }, { status: 400 });
         try {
-          const res = await fetch(`${AT_API}/${MASTER_BASE_ID}/Campaigns/${campaignId}`, { headers: authHdr });
-          if (!res.ok) return NextResponse.json({ error: "Campaign not found" }, { status: 404 });
-          const rec = await res.json();
-          // Don't expose password or HubSpot key
-          const { "Client Password": _, "HubSpot API Key": __, ...safeFields } = rec.fields || {};
-          return NextResponse.json({ id: rec.id, fields: safeFields, hasPassword: !!rec.fields?.["Client Password"], hasHubSpot: !!rec.fields?.["HubSpot API Key"] });
-        } catch (e) { return NextResponse.json({ error: e.message }, { status: 500 }); }
+          // Try direct record fetch first
+          let rec = null;
+          const directRes = await fetch(`${AT_API}/${MASTER_BASE_ID}/${encodeURIComponent("Campaigns")}/${campaignId}`, { headers: authHdr });
+          if (directRes.ok) {
+            rec = await directRes.json();
+          } else {
+            // Fallback: list all campaigns and find by ID
+            console.log("[GET_CAMPAIGN] Direct fetch failed, falling back to list. Status:", directRes.status);
+            const allCamps = await listCampaigns();
+            rec = allCamps.find(r => r.id === campaignId);
+          }
+          if (!rec) return NextResponse.json({ error: "Campaign not found" }, { status: 404 });
+          const { "Client Password": pw, "HubSpot API Key": hk, ...safeFields } = rec.fields || {};
+          return NextResponse.json({ id: rec.id, fields: safeFields, hasPassword: !!pw, hasHubSpot: !!hk });
+        } catch (e) {
+          console.error("[GET_CAMPAIGN] Error:", e.message);
+          return NextResponse.json({ error: e.message }, { status: 500 });
+        }
       }
       case "validate_client": {
         if (!MASTER_BASE_ID) return NextResponse.json({ error: "No master base" }, { status: 500 });
         const { campaignId: cid, password } = body;
         if (!cid) return NextResponse.json({ error: "campaignId required" }, { status: 400 });
         try {
-          const res = await fetch(`${AT_API}/${MASTER_BASE_ID}/Campaigns/${cid}`, { headers: authHdr });
-          if (!res.ok) return NextResponse.json({ valid: false, error: "Campaign not found" });
-          const rec = await res.json();
+          let rec = null;
+          const directRes = await fetch(`${AT_API}/${MASTER_BASE_ID}/${encodeURIComponent("Campaigns")}/${cid}`, { headers: authHdr });
+          if (directRes.ok) { rec = await directRes.json(); }
+          else { const all = await listCampaigns(); rec = all.find(r => r.id === cid); }
+          if (!rec) return NextResponse.json({ valid: false, error: "Campaign not found" });
           const storedPw = rec.fields?.["Client Password"] || "";
-          if (!storedPw) return NextResponse.json({ valid: true }); // no password set = open access
+          if (!storedPw) return NextResponse.json({ valid: true });
           return NextResponse.json({ valid: password === storedPw });
         } catch (e) { return NextResponse.json({ valid: false, error: e.message }); }
       }

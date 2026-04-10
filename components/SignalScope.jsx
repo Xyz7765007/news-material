@@ -191,11 +191,12 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         try {
           const res = await fetch("/api/airtable", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "get_campaign", campaignId: fixedCampaignId }) });
           const d = await res.json();
-          if (d.error) { setClientAuth("error"); return; }
+          console.log("[CLIENT] Campaign load:", d);
+          if (d.error || !d.id) { console.error("[CLIENT] Campaign error:", d.error); setClientAuth("error"); return; }
           const c = { id: "client_" + d.id, airtableId: d.id, name: d.fields?.Name || "Campaign", emoji: d.fields?.Emoji || "📊", desc: d.fields?.Description || "", badge: "Active", active: true, features: (d.fields?.Features || "").split(",").map(s => s.trim()).filter(Boolean), baseId: d.fields?.["Base ID"] || null };
-          if (d.hasPassword) { setClientAuth("password"); setCamp(null); /* store camp for after auth */ window.__pendingCamp = c; }
+          if (d.hasPassword) { setClientAuth("password"); window.__pendingCamp = c; }
           else { setClientAuth("ok"); setCamp(c); }
-        } catch { setClientAuth("error"); }
+        } catch (e) { console.error("[CLIENT] Load failed:", e); setClientAuth("error"); }
       })();
       return;
     }
@@ -813,7 +814,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
 
   // ═══ CLIENT MODE GATES ════════════════════════════════════
   if (clientMode && clientAuth === "loading") return (<><style>{CSS}</style><div className="landing"><div style={{fontSize:40,marginBottom:16}}>⏳</div><div style={{color:"var(--t3)"}}>Loading...</div></div></>);
-  if (clientMode && clientAuth === "error") return (<><style>{CSS}</style><div className="landing"><div style={{fontSize:40,marginBottom:16}}>❌</div><h1 style={{fontSize:18,marginBottom:8}}>Campaign Not Found</h1><div style={{color:"var(--t3)",fontSize:13}}>This link is invalid or has expired.</div></div></>);
+  if (clientMode && clientAuth === "error") return (<><style>{CSS}</style><div className="landing"><div style={{fontSize:40,marginBottom:16}}>❌</div><h1 style={{fontSize:18,marginBottom:8}}>Campaign Not Found</h1><div style={{color:"var(--t3)",fontSize:13,marginBottom:8}}>This link is invalid or has expired.</div><div style={{color:"var(--t3)",fontSize:10,fontFamily:"'JetBrains Mono',monospace"}}>{fixedCampaignId}</div></div></>);
   if (clientMode && clientAuth === "password") return (<><style>{CSS}</style><div className="landing">
     <div style={{maxWidth:400,padding:40,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:16,textAlign:"center"}}>
       <div style={{fontSize:40,marginBottom:16}}>🔒</div>
