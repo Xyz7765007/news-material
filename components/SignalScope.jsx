@@ -927,7 +927,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
 
   {/* ════ DASHBOARD ════ */}
   {tab==="dashboard"&&!loading&&(<div>
-    <div className="ph"><div><div className="pt">Dashboard</div><div className="pd">{camp.name} — Overview</div></div>
+    <div className="ph"><div><div className="pt">{clientMode ? `${camp.emoji||"📊"} ${camp.name}` : "Dashboard"}</div><div className="pd">{clientMode ? "Your campaign workspace — everything you need is here" : `${camp.name} — Overview`}</div></div>
       <div style={{display:"flex",gap:6}}>
         {hasSignals&&<button className="btn btn-s btn-p" onClick={startScan} disabled={scanning||!accounts.length||!signalRules.length}>{scanning?"⏳ "+Math.round(scanProg)+"%":<>▶ Run Scan</>}</button>}
       </div>
@@ -999,8 +999,60 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       </tr>)})}</tbody></table></div>
     </div>)}
 
-    {tasks.length===0&&accounts.length===0&&(<div className="empty"><div className="em">📡</div><p>Upload accounts & leads, create task rules, and run your first scan</p>
+    {tasks.length===0&&accounts.length===0&&!clientMode&&(<div className="empty"><div className="em">📡</div><p>Upload accounts & leads, create task rules, and run your first scan</p>
       <button className="btn btn-p" onClick={()=>setTab("accounts")}><I.Plus/> Start with Accounts</button>
+    </div>)}
+
+    {/* Client mode: Setup Guide */}
+    {clientMode&&(<div style={{marginTop:24}}>
+      <div style={{fontSize:14,fontWeight:700,color:"var(--t1)",marginBottom:4}}>🚀 Getting Started</div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:16}}>Follow these steps to set up your campaign. Each step unlocks the next.</div>
+      <div style={{display:"flex",flexDirection:"column",gap:10}}>
+        {[
+          {n:"Upload Accounts",d:"Upload your target company list (CSV). These are the companies you want to track signals for.",done:accounts.length>0,act:()=>setTab("accounts"),btn:"Upload Accounts"},
+          {n:"Upload Leads",d:"Upload your contact list (CSV). Leads are the people at those companies you'll reach out to.",done:leads.length>0,act:()=>setTab("leads"),btn:"Upload Leads"},
+          {n:"Create Task Rules",d:"Define what signals to watch for — news mentions, job posts, or score your leads with Top X. Each rule tells the AI what to look for.",done:rules.length>0,act:()=>setTab("rules"),btn:"Create Rule"},
+          {n:"Run a Scan",d:"Execute your task rules against your accounts. The AI scans RSS feeds, job boards, and scores leads to create actionable tasks.",done:tasks.length>0,act:()=>setTab("tasks"),btn:"Go to Tasks"},
+          {n:"Connect HubSpot",d:"Connect your HubSpot CRM to push tasks and leads directly. You can also run Post-Demo automation from your deal pipeline.",done:hsConnected,act:()=>setTab("hubspot"),btn:"Connect HubSpot"},
+          {n:"Enrich & Push",d:"Enrich leads with phone numbers via Apollo, push tasks and leads to HubSpot, or run Post-Demo automation on your deal stages.",done:tasks.some(t=>(t.fields||{}).Phone),act:()=>setTab("tasks"),btn:"Go to Tasks"},
+        ].map((step,i)=>(
+          <div key={i} onClick={step.act} style={{padding:"16px 20px",background:"var(--card)",border:"1px solid "+(step.done?"rgba(93,168,122,.3)":"var(--bdr)"),borderRadius:10,cursor:"pointer",display:"flex",alignItems:"center",gap:14,transition:"all .15s"}} onMouseOver={e=>e.currentTarget.style.borderColor="var(--acc)"} onMouseOut={e=>e.currentTarget.style.borderColor=step.done?"rgba(93,168,122,.3)":"var(--bdr)"}>
+            <div style={{width:32,height:32,borderRadius:"50%",background:step.done?"var(--grn-d)":"var(--hover)",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+              {step.done ? <span style={{color:"var(--grn)",fontSize:14}}>✓</span> : <span style={{color:"var(--t3)",fontSize:12,fontWeight:700}}>{i+1}</span>}
+            </div>
+            <div style={{flex:1}}>
+              <div style={{fontSize:12,fontWeight:600,color:step.done?"var(--grn)":"var(--t1)"}}>{step.n}</div>
+              <div style={{fontSize:10,color:"var(--t3)",marginTop:2,lineHeight:1.4}}>{step.d}</div>
+            </div>
+            {!step.done&&<button className="btn btn-s btn-p" onClick={e=>{e.stopPropagation();step.act()}}>{step.btn} →</button>}
+          </div>
+        ))}
+      </div>
+    </div>)}
+
+    {/* Admin mode: empty state */}
+    {!clientMode&&tasks.length===0&&accounts.length>0&&(<div className="empty" style={{marginTop:20}}><div className="em">⚙️</div><p>Create task rules and run a scan to generate tasks</p>
+      <button className="btn btn-p" onClick={()=>setTab("rules")}><I.Plus/> Create Task Rule</button>
+    </div>)}
+
+    {/* Admin mode: Client Portal Link */}
+    {!clientMode && camp?.airtableId && (<div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginTop:24}}>
+      <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:8}}>🔗 Client Portal</div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:14,lineHeight:1.5}}>Share this link with your client. They get the full SignalScope experience — upload data, create rules, run scans, HubSpot, enrichment, post-demo automation — without Airtable config or campaign switching.</div>
+      <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:12}}>
+        <input className="inp" readOnly value={typeof window!=="undefined"?`${window.location.origin}/client/${camp.airtableId}`:""} style={{flex:1,fontSize:11,fontFamily:"'JetBrains Mono',monospace"}} onClick={e=>e.target.select()}/>
+        <button className="btn btn-s btn-p" onClick={()=>{navigator.clipboard.writeText(`${window.location.origin}/client/${camp.airtableId}`)}}>📋 Copy Link</button>
+      </div>
+      <div className="ig" style={{marginBottom:0}}>
+        <div className="il">Password Protection <span style={{fontWeight:400,textTransform:"none",color:"var(--t3)"}}>— optional, leave blank for open access</span></div>
+        <div style={{display:"flex",gap:8}}>
+          <input className="inp" placeholder="Set a password…" id="cp-pw-input" style={{flex:1}}/>
+          <button className="btn btn-s" onClick={async()=>{
+            const pw = document.getElementById("cp-pw-input")?.value || "";
+            try{ await fetch("/api/airtable",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"update",table:"Campaigns",baseId:undefined,records:[{id:camp.airtableId,fields:{"Client Password":pw}}]})}); }catch{}
+          }}>Save</button>
+        </div>
+      </div>
     </div>)}
   </div>)}
 
@@ -1055,31 +1107,6 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         <LeadsToHubSpotForm leads={leads} owners={hsOwners} onPush={pushLeadsToHS} loading={hsLoading}/>
       )}
     </div>
-
-    {/* Client Portal Link — admin only */}
-    {!clientMode && camp?.airtableId && (<div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginTop:16}}>
-      <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:8}}>🔗 Client Portal</div>
-      <div style={{fontSize:11,color:"var(--t3)",marginBottom:14,lineHeight:1.5}}>Share a client portal link. They get the full SignalScope experience — tasks, rules, scoring, CSV upload, HubSpot, enrichment, post-demo automation — just without Airtable config or campaign switching.</div>
-      {camp?.airtableId ? (<div>
-        <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:12}}>
-          <input className="inp" readOnly value={typeof window!=="undefined"?`${window.location.origin}/client/${camp.airtableId}`:""} style={{flex:1,fontSize:11,fontFamily:"'JetBrains Mono',monospace"}} onClick={e=>e.target.select()}/>
-          <button className="btn btn-s" onClick={()=>{navigator.clipboard.writeText(`${window.location.origin}/client/${camp.airtableId}`);setHsMsg("✅ Client link copied!")}}>📋 Copy</button>
-        </div>
-        <div className="ig" style={{marginBottom:0}}>
-          <div className="il">Password Protection <span style={{fontWeight:400,textTransform:"none",color:"var(--t3)"}}>— optional, leave blank for open access</span></div>
-          <div style={{display:"flex",gap:8}}>
-            <input className="inp" placeholder="Set a password for client access…" id="cp-pw-input" style={{flex:1}}/>
-            <button className="btn btn-s" onClick={async()=>{
-              const pw = document.getElementById("cp-pw-input")?.value || "";
-              try{
-                await fetch("/api/airtable",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"update",table:"Campaigns",baseId:undefined,records:[{id:camp.airtableId,fields:{"Client Password":pw}}]})});
-                setHsMsg(pw ? "✅ Password set" : "✅ Password removed (open access)");
-              }catch(e){setHsMsg("❌ "+e.message)}
-            }}>{<>Save</>}</button>
-          </div>
-        </div>
-      </div>) : <div style={{fontSize:11,color:"var(--t3)"}}>Save this campaign to Airtable first to generate a client link.</div>}
-    </div>)}
     </>)}
   </div>)}
 
