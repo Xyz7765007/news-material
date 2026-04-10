@@ -301,6 +301,8 @@ const SCHEMA = {
     { name: "Emoji", type: "singleLineText" },
     { name: "Tables", type: "multilineText" },
     { name: "HubSpot API Key", type: "singleLineText" },
+    { name: "Client Password", type: "singleLineText" },
+    { name: "Client Access", type: "singleLineText" },
   ],
 };
 
@@ -824,6 +826,32 @@ export async function POST(request) {
         if (!MASTER_BASE_ID) return NextResponse.json({ records: [] });
         const data = await listCampaigns();
         return NextResponse.json({ records: data });
+      }
+      case "get_campaign": {
+        if (!MASTER_BASE_ID) return NextResponse.json({ error: "No master base" }, { status: 500 });
+        const { campaignId } = body;
+        if (!campaignId) return NextResponse.json({ error: "campaignId required" }, { status: 400 });
+        try {
+          const res = await fetch(`${AT_API}/${MASTER_BASE_ID}/Campaigns/${campaignId}`, { headers: authHdr });
+          if (!res.ok) return NextResponse.json({ error: "Campaign not found" }, { status: 404 });
+          const rec = await res.json();
+          // Don't expose password or HubSpot key
+          const { "Client Password": _, "HubSpot API Key": __, ...safeFields } = rec.fields || {};
+          return NextResponse.json({ id: rec.id, fields: safeFields, hasPassword: !!rec.fields?.["Client Password"], hasHubSpot: !!rec.fields?.["HubSpot API Key"] });
+        } catch (e) { return NextResponse.json({ error: e.message }, { status: 500 }); }
+      }
+      case "validate_client": {
+        if (!MASTER_BASE_ID) return NextResponse.json({ error: "No master base" }, { status: 500 });
+        const { campaignId: cid, password } = body;
+        if (!cid) return NextResponse.json({ error: "campaignId required" }, { status: 400 });
+        try {
+          const res = await fetch(`${AT_API}/${MASTER_BASE_ID}/Campaigns/${cid}`, { headers: authHdr });
+          if (!res.ok) return NextResponse.json({ valid: false, error: "Campaign not found" });
+          const rec = await res.json();
+          const storedPw = rec.fields?.["Client Password"] || "";
+          if (!storedPw) return NextResponse.json({ valid: true }); // no password set = open access
+          return NextResponse.json({ valid: password === storedPw });
+        } catch (e) { return NextResponse.json({ valid: false, error: e.message }); }
       }
       case "create_campaign": {
         if (!MASTER_BASE_ID) return NextResponse.json({ error: "No master base configured" }, { status: 500 });

@@ -105,10 +105,14 @@ td{padding:10px 12px;border-bottom:1px solid var(--bdr);color:var(--t2)}tr:last-
 .feat-tag{display:inline-flex;align-items:center;gap:4px;font-size:9px;padding:2px 8px;border-radius:4px;margin:2px}
 `;
 
-export default function SignalScope() {
+export default function SignalScope({ clientMode = false, fixedCampaignId = null }) {
   const [camp, setCamp] = useState(null); // active campaign object
   const [campaigns, setCampaigns] = useState(DEFAULT_CAMPAIGNS);
   const [tab, setTab] = useState("dashboard");
+  // Client mode auth
+  const [clientAuth, setClientAuth] = useState(clientMode ? "loading" : "ok"); // loading | password | ok | error
+  const [clientPw, setClientPw] = useState("");
+  const [clientPwErr, setClientPwErr] = useState("");
   const [accounts, setAccounts] = useState([]);
   const [leads, setLeads] = useState([]);
   const [rules, setRules] = useState([]);
@@ -181,6 +185,20 @@ export default function SignalScope() {
 
   // ─── Load campaign registry from master base ──────────────
   useEffect(() => {
+    if (clientMode && fixedCampaignId) {
+      // Client mode: load single campaign by ID
+      (async () => {
+        try {
+          const res = await fetch("/api/airtable", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "get_campaign", campaignId: fixedCampaignId }) });
+          const d = await res.json();
+          if (d.error) { setClientAuth("error"); return; }
+          const c = { id: "client_" + d.id, airtableId: d.id, name: d.fields?.Name || "Campaign", emoji: d.fields?.Emoji || "📊", desc: d.fields?.Description || "", badge: "Active", active: true, features: (d.fields?.Features || "").split(",").map(s => s.trim()).filter(Boolean), baseId: d.fields?.["Base ID"] || null };
+          if (d.hasPassword) { setClientAuth("password"); setCamp(null); /* store camp for after auth */ window.__pendingCamp = c; }
+          else { setClientAuth("ok"); setCamp(c); }
+        } catch { setClientAuth("error"); }
+      })();
+      return;
+    }
     (async () => {
       try {
         const res = await at("list_campaigns", "");
@@ -220,6 +238,13 @@ export default function SignalScope() {
       loadHubSpot();
     }
   }, [camp]);
+
+  const validateClientPw = async () => {
+    const res = await fetch("/api/airtable", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "validate_client", campaignId: fixedCampaignId, password: clientPw }) });
+    const d = await res.json();
+    if (d.valid) { setClientAuth("ok"); setCamp(window.__pendingCamp || null); }
+    else setClientPwErr("Incorrect password");
+  };
 
   const loadAll = async () => {
     setLoading(true);
@@ -786,6 +811,20 @@ export default function SignalScope() {
     setCamp(prev => ({ ...prev, baseId: newBaseId, tables: info.tableNames.join(", ") }));
   };
 
+  // ═══ CLIENT MODE GATES ════════════════════════════════════
+  if (clientMode && clientAuth === "loading") return (<><style>{CSS}</style><div className="landing"><div style={{fontSize:40,marginBottom:16}}>⏳</div><div style={{color:"var(--t3)"}}>Loading...</div></div></>);
+  if (clientMode && clientAuth === "error") return (<><style>{CSS}</style><div className="landing"><div style={{fontSize:40,marginBottom:16}}>❌</div><h1 style={{fontSize:18,marginBottom:8}}>Campaign Not Found</h1><div style={{color:"var(--t3)",fontSize:13}}>This link is invalid or has expired.</div></div></>);
+  if (clientMode && clientAuth === "password") return (<><style>{CSS}</style><div className="landing">
+    <div style={{maxWidth:400,padding:40,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:16,textAlign:"center"}}>
+      <div style={{fontSize:40,marginBottom:16}}>🔒</div>
+      <h1 style={{fontSize:20,marginBottom:4}}>{window.__pendingCamp?.emoji} {window.__pendingCamp?.name || "Campaign"}</h1>
+      <div style={{fontSize:12,color:"var(--t3)",marginBottom:24}}>Enter the password to access</div>
+      <input className="inp" type="password" placeholder="Password" value={clientPw} onChange={e=>{setClientPw(e.target.value);setClientPwErr("")}} onKeyDown={e=>e.key==="Enter"&&validateClientPw()} style={{marginBottom:12,textAlign:"center"}}/>
+      {clientPwErr && <div style={{color:"var(--red)",fontSize:11,marginBottom:12}}>{clientPwErr}</div>}
+      <button className="btn btn-p" style={{width:"100%",justifyContent:"center"}} onClick={validateClientPw}>Access Campaign</button>
+    </div>
+  </div></>);
+
   // ═══ LANDING ═══════════════════════════════════════════════
   if(!camp){return(<><style>{CSS}</style><div className="landing"><h1>SignalScope</h1><div className="sub">B2B Signal Intelligence Platform</div>
   <div className="cgrid">
@@ -824,17 +863,18 @@ export default function SignalScope() {
     {id:"outreach",label:"💬 LinkedIn Automation",count:null},
     {id:"hubspot",label:"🔗 HubSpot",count:null},
     {id:"post_demo",label:"🤖 Post-Demo Auto",count:null},
-    {id:"coming_soon",label:"🚀 Coming Soon",count:null},
+    ...(!clientMode ? [{id:"coming_soon",label:"🚀 Coming Soon",count:null}] : []),
   ];
 
   return(<><style>{CSS}</style><div className="dash">
-  <div className="side"><div className="side-hd"><div className="side-brand">SignalScope</div><div className="side-camp">{camp.name}</div><div className="side-back" onClick={()=>setCamp(null)}><I.Back/> All Campaigns</div></div>
+  <div className="side"><div className="side-hd"><div className="side-brand">SignalScope</div><div className="side-camp">{camp.name}</div>{!clientMode&&<div className="side-back" onClick={()=>setCamp(null)}><I.Back/> All Campaigns</div>}{clientMode&&camp.desc&&<div style={{fontSize:10,color:"var(--t3)",marginTop:4,lineHeight:1.4}}>{camp.desc}</div>}</div>
   <div className="side-nav">{navs.map((n,i)=> n===null
     ? <div key={"sep"+i} style={{height:1,background:"var(--bdr)",margin:"6px 12px"}}/>
     : <div key={n.id} className={"nav-i"+(tab===n.id?" on":"")} onClick={()=>{setTab(n.id);if(n.id==="outreach")loadOutreachStats()}}><span>{n.label}</span>{n.count!==null&&n.count>0&&<span className="cnt">{n.count}</span>}</div>
   )}</div>
   <div style={{padding:"12px 16px",borderTop:"1px solid var(--bdr)"}}>
-    {/* Airtable Base */}
+    {/* Airtable Base — admin only */}
+    {!clientMode&&(<>
     <div style={{marginBottom:10}}>
       <div style={{fontSize:9,fontWeight:600,color:"var(--t3)",textTransform:"uppercase",letterSpacing:".05em",marginBottom:4}}>Airtable Base</div>
       {editingBase ? (
@@ -871,6 +911,7 @@ export default function SignalScope() {
       {setupStatus.errors?.length>0&&setupStatus.errors.map((e,i)=><div key={i} style={{color:"var(--red)"}}>❌ {e}</div>)}
       {!setupStatus.tables_created?.length&&!setupStatus.fields_created?.length&&!setupStatus.errors?.length&&!setupStatus.test&&<div style={{color:"var(--grn)"}}>✅ All good!</div>}
     </div>)}
+    </>)}
     {/* LinkedIn Status */}
     <div style={{marginTop:10,paddingTop:10,borderTop:"1px solid var(--bdr)"}}>
       <div style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer"}} onClick={()=>setTab("outreach")}>
@@ -1014,6 +1055,31 @@ export default function SignalScope() {
         <LeadsToHubSpotForm leads={leads} owners={hsOwners} onPush={pushLeadsToHS} loading={hsLoading}/>
       )}
     </div>
+
+    {/* Client Portal Link — admin only */}
+    {!clientMode && camp?.airtableId && (<div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginTop:16}}>
+      <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:8}}>🔗 Client Portal</div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:14,lineHeight:1.5}}>Share a client portal link. They get the full SignalScope experience — tasks, rules, scoring, CSV upload, HubSpot, enrichment, post-demo automation — just without Airtable config or campaign switching.</div>
+      {camp?.airtableId ? (<div>
+        <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:12}}>
+          <input className="inp" readOnly value={typeof window!=="undefined"?`${window.location.origin}/client/${camp.airtableId}`:""} style={{flex:1,fontSize:11,fontFamily:"'JetBrains Mono',monospace"}} onClick={e=>e.target.select()}/>
+          <button className="btn btn-s" onClick={()=>{navigator.clipboard.writeText(`${window.location.origin}/client/${camp.airtableId}`);setHsMsg("✅ Client link copied!")}}>📋 Copy</button>
+        </div>
+        <div className="ig" style={{marginBottom:0}}>
+          <div className="il">Password Protection <span style={{fontWeight:400,textTransform:"none",color:"var(--t3)"}}>— optional, leave blank for open access</span></div>
+          <div style={{display:"flex",gap:8}}>
+            <input className="inp" placeholder="Set a password for client access…" id="cp-pw-input" style={{flex:1}}/>
+            <button className="btn btn-s" onClick={async()=>{
+              const pw = document.getElementById("cp-pw-input")?.value || "";
+              try{
+                await fetch("/api/airtable",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"update",table:"Campaigns",baseId:undefined,records:[{id:camp.airtableId,fields:{"Client Password":pw}}]})});
+                setHsMsg(pw ? "✅ Password set" : "✅ Password removed (open access)");
+              }catch(e){setHsMsg("❌ "+e.message)}
+            }}>{<>Save</>}</button>
+          </div>
+        </div>
+      </div>) : <div style={{fontSize:11,color:"var(--t3)"}}>Save this campaign to Airtable first to generate a client link.</div>}
+    </div>)}
     </>)}
   </div>)}
 
