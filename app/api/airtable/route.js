@@ -834,7 +834,7 @@ export async function POST(request) {
         try {
           // Try direct record fetch first
           let rec = null;
-          const directRes = await fetch(`${AT_API}/${MASTER_BASE_ID}/${encodeURIComponent("Campaigns")}/${campaignId}`, { headers: authHdr });
+          const directRes = await fetch(`${API}/${MASTER_BASE_ID}/${encodeURIComponent("Campaigns")}/${campaignId}`, { headers: authHdr });
           if (directRes.ok) {
             rec = await directRes.json();
           } else {
@@ -857,7 +857,7 @@ export async function POST(request) {
         if (!cid) return NextResponse.json({ error: "campaignId required" }, { status: 400 });
         try {
           let rec = null;
-          const directRes = await fetch(`${AT_API}/${MASTER_BASE_ID}/${encodeURIComponent("Campaigns")}/${cid}`, { headers: authHdr });
+          const directRes = await fetch(`${API}/${MASTER_BASE_ID}/${encodeURIComponent("Campaigns")}/${cid}`, { headers: authHdr });
           if (directRes.ok) { rec = await directRes.json(); }
           else { const all = await listCampaigns(); rec = all.find(r => r.id === cid); }
           if (!rec) return NextResponse.json({ valid: false, error: "Campaign not found" });

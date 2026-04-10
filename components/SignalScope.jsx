@@ -113,6 +113,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const [clientAuth, setClientAuth] = useState(clientMode ? "loading" : "ok"); // loading | password | ok | error
   const [clientPw, setClientPw] = useState("");
   const [clientPwErr, setClientPwErr] = useState("");
+  const [clientError, setClientError] = useState("");
   const [accounts, setAccounts] = useState([]);
   const [leads, setLeads] = useState([]);
   const [rules, setRules] = useState([]);
@@ -192,11 +193,11 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
           const res = await fetch("/api/airtable", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "get_campaign", campaignId: fixedCampaignId }) });
           const d = await res.json();
           console.log("[CLIENT] Campaign load:", d);
-          if (d.error || !d.id) { console.error("[CLIENT] Campaign error:", d.error); setClientAuth("error"); return; }
+          if (d.error || !d.id) { console.error("[CLIENT] Campaign error:", d.error); setClientError(d.error || "No campaign ID returned"); setClientAuth("error"); return; }
           const c = { id: "client_" + d.id, airtableId: d.id, name: d.fields?.Name || "Campaign", emoji: d.fields?.Emoji || "📊", desc: d.fields?.Description || "", badge: "Active", active: true, features: (d.fields?.Features || "").split(",").map(s => s.trim()).filter(Boolean), baseId: d.fields?.["Base ID"] || null };
           if (d.hasPassword) { setClientAuth("password"); window.__pendingCamp = c; }
           else { setClientAuth("ok"); setCamp(c); }
-        } catch (e) { console.error("[CLIENT] Load failed:", e); setClientAuth("error"); }
+        } catch (e) { console.error("[CLIENT] Load failed:", e); setClientError(e.message || "Network error"); setClientAuth("error"); }
       })();
       return;
     }
