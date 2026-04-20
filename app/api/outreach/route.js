@@ -657,8 +657,40 @@ export async function POST(request) {
     const body = await request.json();
     const { action, baseId, accountId } = body;
 
+    // Test_unipile is a diagnostic — let it run even without env vars to tell user what's missing
+    if (action === "test_unipile") {
+      const tests = {
+        dsn_set: !!UNIPILE_DSN,
+        key_set: !!UNIPILE_KEY,
+        dsn_value: UNIPILE_DSN ? UNIPILE_DSN.slice(0, 30) + "..." : "NOT SET",
+        key_length: UNIPILE_KEY ? UNIPILE_KEY.length : 0,
+      };
+      if (!UNIPILE_DSN) return NextResponse.json({ ok: false, tests, error: "UNIPILE_DSN environment variable is not set. Add it to Vercel → Settings → Environment Variables, then redeploy." });
+      if (!UNIPILE_KEY) return NextResponse.json({ ok: false, tests, error: "UNIPILE_API_KEY environment variable is not set. Add it to Vercel → Settings → Environment Variables, then redeploy." });
+
+      // DSN format check
+      if (!UNIPILE_DSN.startsWith("http")) {
+        tests.dsn_format_error = "DSN should start with https://";
+        return NextResponse.json({ ok: false, tests, error: "UNIPILE_DSN must be a full URL starting with https://" });
+      }
+
+      try {
+        const listRes = await listAccounts();
+        tests.canListAccounts = listRes.ok;
+        tests.accountsStatus = listRes.status;
+        if (!listRes.ok) {
+          tests.accountsError = typeof listRes.data === "string" ? listRes.data.slice(0, 200) : JSON.stringify(listRes.data).slice(0, 200);
+          const hint = listRes.status === 401 ? "API key is invalid — check UNIPILE_API_KEY in Vercel" : listRes.status === 404 ? "DSN URL is wrong — check UNIPILE_DSN in Vercel" : "Check Unipile dashboard for account status";
+          return NextResponse.json({ ok: false, tests, error: `Unipile returned ${listRes.status}`, hint });
+        }
+        return NextResponse.json({ ok: true, tests, message: "✅ Connection healthy" });
+      } catch (e) {
+        return NextResponse.json({ ok: false, tests, error: "Request failed: " + e.message, hint: "Check that UNIPILE_DSN is the correct URL" });
+      }
+    }
+
     if (!UNIPILE_DSN || !UNIPILE_KEY) {
-      return NextResponse.json({ error: "UNIPILE_DSN and UNIPILE_API_KEY required" }, { status: 500 });
+      return NextResponse.json({ error: "UNIPILE_DSN and UNIPILE_API_KEY environment variables required. Click Test Unipile Connection for diagnostics." }, { status: 400 });
     }
 
     switch (action) {
@@ -674,19 +706,6 @@ export async function POST(request) {
           }, { status: 400 });
         }
         return NextResponse.json(res.data);
-      }
-
-      case "test_unipile": {
-        // Diagnostic: test connection and return config status
-        const tests = { dsn: !!UNIPILE_DSN, key: !!UNIPILE_KEY, dsnValue: UNIPILE_DSN || "NOT SET" };
-        if (!UNIPILE_DSN || !UNIPILE_KEY) {
-          return NextResponse.json({ ok: false, tests, error: "Missing env vars" });
-        }
-        const listRes = await listAccounts();
-        tests.canListAccounts = listRes.ok;
-        tests.accountsStatus = listRes.status;
-        if (!listRes.ok) tests.accountsError = typeof listRes.data === "string" ? listRes.data.slice(0, 200) : JSON.stringify(listRes.data).slice(0, 200);
-        return NextResponse.json({ ok: listRes.ok, tests });
       }
 
       case "list_accounts": {

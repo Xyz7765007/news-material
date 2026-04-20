@@ -282,8 +282,10 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   // ─── Outreach helpers ──────────────────────────────────────
   const outreachAPI = async (action, data = {}) => {
     const res = await fetch("/api/outreach", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, baseId: bid, ...data }) });
-    if (!res.ok) throw new Error("Outreach API " + action + " failed: " + res.status);
-    return res.json();
+    const text = await res.text();
+    let body; try { body = JSON.parse(text); } catch { body = { error: text.slice(0, 300) }; }
+    if (!res.ok) return { ...body, _httpStatus: res.status, _httpOk: false };
+    return body;
   };
 
   const [linkedinError, setLinkedinError] = useState("");
@@ -304,11 +306,20 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     } catch (e) { setLinkedinError(e.message); }
   };
   const testUnipile = async () => {
-    setLinkedinError("");
+    setLinkedinError("🧪 Testing...");
     try {
       const data = await outreachAPI("test_unipile");
-      if (data.ok) setLinkedinError("✅ Unipile connection healthy");
-      else setLinkedinError("❌ " + JSON.stringify(data.tests));
+      const lines = [];
+      if (data.ok) lines.push("✅ " + (data.message || "Connection healthy"));
+      else lines.push("❌ " + (data.error || "Test failed"));
+      if (data.hint) lines.push("💡 " + data.hint);
+      if (data.tests) {
+        lines.push("—");
+        lines.push("DSN set: " + (data.tests.dsn_set ? "✅" : "❌") + (data.tests.dsn_value ? ` (${data.tests.dsn_value})` : ""));
+        lines.push("API key set: " + (data.tests.key_set ? "✅" : "❌") + (data.tests.key_length ? ` (length ${data.tests.key_length})` : ""));
+        if (data.tests.canListAccounts !== undefined) lines.push("Can list accounts: " + (data.tests.canListAccounts ? "✅" : "❌ " + (data.tests.accountsError || data.tests.accountsStatus)));
+      }
+      setLinkedinError(lines.join("\n"));
     } catch (e) { setLinkedinError("❌ " + e.message); }
   };
   const disconnectLinkedIn = async () => {
@@ -1443,7 +1454,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
           ⚠️ Requires <strong>UNIPILE_DSN</strong> and <strong>UNIPILE_API_KEY</strong> environment variables. <a href="https://app.unipile.com" target="_blank" rel="noopener" style={{color:"var(--blu)"}}>Get them from Unipile →</a>
         </div>
         {linkedinError && (
-          <div style={{marginTop:12,padding:"10px 14px",background:linkedinError.startsWith("✅")?"var(--grn-d)":"var(--red-d)",border:"1px solid "+(linkedinError.startsWith("✅")?"rgba(93,168,122,.3)":"rgba(196,92,92,.3)"),borderRadius:8,color:linkedinError.startsWith("✅")?"var(--grn)":"var(--red)",fontSize:11,lineHeight:1.5,wordBreak:"break-word"}}>
+          <div style={{marginTop:12,padding:"10px 14px",background:linkedinError.startsWith("✅")?"var(--grn-d)":"var(--red-d)",border:"1px solid "+(linkedinError.startsWith("✅")?"rgba(93,168,122,.3)":"rgba(196,92,92,.3)"),borderRadius:8,color:linkedinError.startsWith("✅")?"var(--grn)":"var(--red)",fontSize:11,lineHeight:1.5,wordBreak:"break-word",whiteSpace:"pre-wrap",fontFamily:linkedinError.includes("DSN set:")?"'JetBrains Mono',monospace":"inherit"}}>
             {linkedinError}
           </div>
         )}
