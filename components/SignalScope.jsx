@@ -1792,7 +1792,43 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
         setBusy(false); return;
       }
       if (eq.enqueued === 0) {
-        setResult({ error: `Could not add any leads to Airtable. Skipped as dupes: ${eq.skippedDupes||0}. Check Airtable permissions and field schema on the Outreach table.` });
+        const airErr = eq.airtableErrors?.[0]?.body || "";
+        const isMissingTable = airErr.includes("INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND") || airErr.includes("NOT_FOUND");
+        if (isMissingTable) {
+          // Auto-run setup to create the Outreach table, then retry
+          setResult({ ok: true, message: "⚙️ Outreach table missing — auto-running Setup to create it..." });
+          try {
+            const setupRes = await fetch("/api/airtable", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ action: "setup", baseId }),
+            });
+            if (!setupRes.ok) throw new Error("Setup returned " + setupRes.status);
+            setResult({ ok: true, message: "✅ Setup complete. Retrying..." });
+            const eq2 = await outreachAPI("enqueue_leads", { ruleConfig, mode: "manual", selectedIds: ids, count: ids.length });
+            if (eq2.enqueued > 0) {
+              // continue down the send path with eq2
+              const q2 = await outreachAPI("list_queue", { campaign: ruleConfig.name, status: "queued" });
+              const newItems2 = (q2.items || []).filter(i => (i.fields?.Mode || "auto") === "manual");
+              const sortedNew2 = [...newItems2].sort((a,b) => (b.fields?.["Created At"] || "").localeCompare(a.fields?.["Created At"] || "")).slice(0, eq2.enqueued);
+              const sendRes2 = await outreachAPI("send_manual_connections", {
+                accountId: linkedinAccount.id,
+                outreachItemIds: sortedNew2.map(i => i.id),
+                ruleConfig,
+              });
+              if (sendRes2.error) setResult({ error: sendRes2.error });
+              else setResult({ ok: true, message: `✅ Created Outreach table, added ${eq2.enqueued}, sent ${sendRes2.sent} connection request${sendRes2.sent!==1?"s":""}.`, details: sendRes2.results });
+              await loadQueue(); setSelected(new Set()); setBusy(false); return;
+            } else {
+              setResult({ error: "Setup ran but still couldn't create records. Check Airtable token permissions (needs schema.bases:write)." });
+              setBusy(false); return;
+            }
+          } catch (setupErr) {
+            setResult({ error: `🛑 Outreach table is missing and auto-setup failed: ${setupErr.message}\n\n👉 Fix: Click "🔧 Setup" in the left sidebar manually.` });
+            setBusy(false); return;
+          }
+        } else {
+          setResult({ error: `Could not add any leads to Airtable. Skipped as dupes: ${eq.skippedDupes||0}. ${airErr ? "\n\nAirtable error: " + airErr.slice(0, 300) : "Check Airtable permissions and field schema on the Outreach table."}` });
+        }
         setBusy(false); return;
       }
       // Step 2: find the newly-enqueued items — the records just created are Mode=manual, Status=queued
