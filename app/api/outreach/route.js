@@ -102,6 +102,14 @@ function extractLinkedInIdentifier(input) {
 // Unipile invite needs provider_id (LinkedIn member ID), not the URL
 // So we resolve URL → profile → provider_id first
 async function sendInvitation(accountId, profileUrl, message) {
+  // SAFETY: validate message before any Unipile call
+  if (message) {
+    const v = validateMessage(message, "connection_note");
+    if (!v.ok) {
+      console.error("[SEND-BLOCKED] Invitation:", v.error, "message:", message.slice(0, 100));
+      return { ok: false, status: 0, data: { error: "Message validation failed: " + v.error, blocked: true } };
+    }
+  }
   const identifier = extractLinkedInIdentifier(profileUrl);
   // Resolve profile to get provider_id
   const profileRes = await getProfile(accountId, identifier);
@@ -128,6 +136,12 @@ async function disconnectAccount(accountId) {
 // ─── Messaging ───────────────────────────────────────────────
 
 async function startNewChat(accountId, linkedinUrlOrId, text) {
+  // SAFETY: validate first message before any Unipile call
+  const v = validateMessage(text, "first_dm");
+  if (!v.ok) {
+    console.error("[SEND-BLOCKED] DM:", v.error, "text:", (text || "").slice(0, 100));
+    return { ok: false, status: 0, data: { error: "Message validation failed: " + v.error, blocked: true } };
+  }
   // Resolve profile first to get the provider_id
   const identifier = extractLinkedInIdentifier(linkedinUrlOrId);
   let providerId = identifier;
@@ -148,6 +162,12 @@ async function startNewChat(accountId, linkedinUrlOrId, text) {
 }
 
 async function sendMessage(chatId, text) {
+  // SAFETY: validate message before any Unipile call
+  const v = validateMessage(text, "dm_followup");
+  if (!v.ok) {
+    console.error("[SEND-BLOCKED] Follow-up DM:", v.error, "text:", (text || "").slice(0, 100));
+    return { ok: false, status: 0, data: { error: "Message validation failed: " + v.error, blocked: true } };
+  }
   const form = new FormData();
   form.append("text", text);
   return unipileReq(`/chats/${chatId}/messages`, "POST", form);
@@ -201,16 +221,45 @@ async function atList(baseId, table, params = {}) {
 
 async function atCreate(baseId, table, records) {
   const results = [];
+  const errors = [];
   for (let i = 0; i < records.length; i += 10) {
     const batch = records.slice(i, i + 10).map(r => ({ fields: r }));
-    const res = await fetch(`${AT_API}/${baseId}/${encodeURIComponent(table)}`, {
+    let res = await fetch(`${AT_API}/${baseId}/${encodeURIComponent(table)}`, {
       method: "POST", headers: atHdr, body: JSON.stringify({ records: batch }),
     });
-    if (!res.ok) { console.error(`AT create ${table}:`, await res.text()); continue; }
+
+    // If 422 "Unknown field name", remove unknown fields and retry
+    if (res.status === 422) {
+      const errText = await res.text();
+      console.warn(`[AT CREATE] 422 on ${table}, error: ${errText.slice(0,300)}`);
+      const unknownFields = [];
+      // Extract field names from Airtable error messages like "Unknown field name: \"Mode\""
+      const matches = errText.matchAll(/[Uu]nknown field name:?\s*["']([^"']+)["']/g);
+      for (const m of matches) unknownFields.push(m[1]);
+
+      if (unknownFields.length > 0) {
+        console.warn(`[AT CREATE] Retrying without unknown fields: ${unknownFields.join(", ")}`);
+        const cleanBatch = batch.map(r => {
+          const clean = { ...r.fields };
+          for (const uf of unknownFields) delete clean[uf];
+          return { fields: clean };
+        });
+        res = await fetch(`${AT_API}/${baseId}/${encodeURIComponent(table)}`, {
+          method: "POST", headers: atHdr, body: JSON.stringify({ records: cleanBatch }),
+        });
+      }
+    }
+
+    if (!res.ok) {
+      const err = await res.text();
+      console.error(`[AT CREATE] ${table} failed ${res.status}:`, err.slice(0, 300));
+      errors.push({ status: res.status, body: err.slice(0, 300) });
+      continue;
+    }
     const d = await res.json();
     results.push(...(d.records || []));
   }
-  return results;
+  return { records: results, errors };
 }
 
 async function atUpdate(baseId, table, records) {
@@ -261,34 +310,126 @@ async function aiSelectLeads(leads, prompt, count) {
 }
 
 async function aiPersonalizeMessage(template, lead, signal, companyName) {
-  if (!OPENAI_KEY) return fillMergeFields(template, lead, signal, companyName);
+  // Always do deterministic merge first — this is our safety net
+  const deterministic = fillMergeFields(template, lead, signal, companyName);
+
+  if (!OPENAI_KEY) return deterministic;
 
   const f = lead.fields || lead;
+  const names = deriveNames(f);
   const openai = new OpenAI({ apiKey: OPENAI_KEY });
   try {
     const c = await openai.chat.completions.create({
       model: "gpt-5.4-mini", temperature: 0.5, max_tokens: 300,
       messages: [
-        { role: "system", content: `Personalize this LinkedIn message template for the specific lead. Keep the same structure and intent. Make it natural and conversational. Replace merge fields and add personal touches based on the lead's data. Return ONLY the message text, nothing else.` },
-        { role: "user", content: `Template:\n${template}\n\nLead: ${f.Name || "there"}\nTitle: ${f.Title || ""}\nCompany: ${f.Company || companyName || ""}\nLinkedIn: ${f["LinkedIn URL"] || ""}\nSignal: ${signal || ""}` },
+        { role: "system", content: `Personalize this LinkedIn message for the specific lead. Rules:
+1. Keep the same structure and intent as the template.
+2. Replace ALL merge field placeholders like {first_name}, {company}, {title} with the actual data.
+3. Do NOT include any curly braces {...} in your output — every placeholder must be filled.
+4. If a field is empty, rewrite the sentence naturally (don't say "at " or "your role as ").
+5. Make it natural and conversational.
+6. Return ONLY the final message text — no preamble, no quotes, no markdown.` },
+        { role: "user", content: `Template:\n${template}\n\nLead data:\nName: ${names.full || "Unknown"}\nFirst name: ${names.first || "(unknown)"}\nTitle: ${f.Title || "(unknown)"}\nCompany: ${f.Company || companyName || "(unknown)"}\nSignal: ${signal || "(none)"}` },
       ],
     });
-    return c.choices[0]?.message?.content?.trim() || fillMergeFields(template, lead, signal, companyName);
-  } catch {
-    return fillMergeFields(template, lead, signal, companyName);
+    const aiMsg = c.choices[0]?.message?.content?.trim();
+    if (!aiMsg) return deterministic;
+
+    // CRITICAL SAFETY CHECK: if AI left any merge fields unresolved, don't trust it
+    const v = validateMessage(aiMsg, "ai_output");
+    if (!v.ok) {
+      console.warn("[MERGE] AI returned message with unresolved fields, falling back:", v.error, "AI output:", aiMsg.slice(0, 100));
+      return deterministic;
+    }
+    return aiMsg;
+  } catch (e) {
+    console.error("[MERGE] AI personalization failed:", e.message);
+    return deterministic;
   }
+}
+
+// Safely pull a string value from lead fields, never return literal braces
+function safeField(value) {
+  if (value === null || value === undefined) return "";
+  const s = String(value).trim();
+  // Strip any curly braces that leaked from user data (prevents recursion/confusion)
+  return s.replace(/[{}]/g, "");
+}
+
+// Derive first/last name from Name field if dedicated fields missing
+function deriveNames(f) {
+  const fullName = safeField(f.Name || f["Full Name"] || "");
+  const parts = fullName.split(/\s+/).filter(Boolean);
+  return {
+    first: safeField(f["First Name"] || f.first_name || parts[0] || ""),
+    last: safeField(f["Last Name"] || f.last_name || parts.slice(1).join(" ") || ""),
+    full: fullName,
+  };
 }
 
 function fillMergeFields(template, lead, signal, companyName) {
   const f = lead.fields || lead;
-  return (template || "")
-    .replace(/\{name\}/gi, f.Name || f["First Name"] || "there")
-    .replace(/\{first_name\}/gi, f["First Name"] || (f.Name || "").split(" ")[0] || "there")
-    .replace(/\{last_name\}/gi, f["Last Name"] || (f.Name || "").split(" ").slice(1).join(" ") || "")
-    .replace(/\{title\}/gi, f.Title || "")
-    .replace(/\{company\}/gi, f.Company || companyName || "")
-    .replace(/\{signal\}/gi, signal || "")
-    .replace(/\{linkedin\}/gi, f["LinkedIn URL"] || "");
+  const names = deriveNames(f);
+  const title = safeField(f.Title || f.title);
+  const company = safeField(f.Company || f.company || companyName);
+  const linkedin = safeField(f["LinkedIn URL"] || f.linkedin_url);
+  const sig = safeField(signal);
+
+  // Friendly fallbacks — never leave awkward blanks
+  const firstOrFallback = names.first || "there";
+  const nameOrFallback = names.full || firstOrFallback;
+
+  // Handle all case/format variations: {first_name}, {firstName}, {FirstName}, {FIRST_NAME}, etc.
+  // Regex is case-insensitive and accepts optional underscore or camelCase
+  const REPLACERS = [
+    [/\{\s*first[_\s]?name\s*\}/gi, firstOrFallback],
+    [/\{\s*last[_\s]?name\s*\}/gi, names.last],
+    [/\{\s*full[_\s]?name\s*\}/gi, nameOrFallback],
+    [/\{\s*name\s*\}/gi, nameOrFallback],
+    [/\{\s*title\s*\}/gi, title],
+    [/\{\s*role\s*\}/gi, title],
+    [/\{\s*company\s*\}/gi, company],
+    [/\{\s*signal\s*\}/gi, sig],
+    [/\{\s*linkedin(_url)?\s*\}/gi, linkedin],
+  ];
+
+  let out = String(template || "");
+  for (const [re, val] of REPLACERS) out = out.replace(re, val);
+
+  // Clean up artifacts from empty replacements
+  out = out
+    .replace(/\s+,/g, ",")           // "hey , how" -> "hey, how"
+    .replace(/\s+\./g, ".")          // "nice . Great" -> "nice. Great"
+    .replace(/\(\s*\)/g, "")         // empty parens "(your title)"
+    .replace(/\[\s*\]/g, "")         // empty brackets
+    .replace(/ {2,}/g, " ")          // collapse multiple spaces
+    .replace(/\n{3,}/g, "\n\n")      // collapse extra newlines
+    .trim();
+
+  return out;
+}
+
+// Validate a message is safe to send — returns {ok, error}
+function validateMessage(msg, context = "message") {
+  if (!msg || !msg.trim()) return { ok: false, error: `${context} is empty` };
+
+  // CRITICAL: any unreplaced merge field is a DEAL BREAKER
+  const unresolvedMerge = msg.match(/\{[a-zA-Z_][a-zA-Z0-9_\s]*\}/);
+  if (unresolvedMerge) {
+    return { ok: false, error: `${context} contains unresolved merge field: ${unresolvedMerge[0]}. This would send literal text to the lead. Check your template and lead data.` };
+  }
+
+  // Likely template placeholders from other systems
+  if (/\[\s*[A-Z_ ]+\s*\]/.test(msg) && msg.match(/\[[A-Z_ ]{3,}\]/)) {
+    return { ok: false, error: `${context} contains unresolved placeholder like [NAME]. Did you mean {first_name}?` };
+  }
+
+  // LinkedIn connection note limit
+  if (context === "connection_note" && msg.length > 300) {
+    return { ok: false, error: `Connection note too long (${msg.length}/300 chars)` };
+  }
+
+  return { ok: true };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -492,6 +633,22 @@ async function enqueueLeads(baseId, ruleConfig, options = {}) {
 
   if (!eligible.length) return { error: "No eligible leads after dedup", enqueued: 0, skippedDupes };
 
+  // Pre-flight: ensure Outreach table has all fields we'll write.
+  // Airtable will return 422 Unknown field otherwise and atCreate has a retry,
+  // but ensuring up-front gives a cleaner first attempt and persists the schema.
+  const REQUIRED_OUTREACH_FIELDS = [
+    "Lead Name", "LinkedIn URL", "Campaign", "Mode", "Status", "Company", "Title",
+    "Email", "Signal", "DM Step", "Next Action Date", "Created At",
+    "Connection Sent At", "Last DM Sent At", "Unipile Chat ID", "Notes",
+    "Replied At", "Connection Accepted At",
+  ];
+  try {
+    await fetch(`${process.env.VERCEL_URL ? "https://" + process.env.VERCEL_URL : "http://localhost:3000"}/api/airtable`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "ensure_fields", table: "Outreach", fieldNames: REQUIRED_OUTREACH_FIELDS, baseId }),
+    }).catch(() => null);
+  } catch {} // best-effort, atCreate has a retry anyway
+
   // Create outreach queue records
   const records = eligible.map(l => {
     const f = l.fields || {};
@@ -511,8 +668,19 @@ async function enqueueLeads(baseId, ruleConfig, options = {}) {
     };
   });
 
-  const created = await atCreate(baseId, "Outreach", records);
-  return { enqueued: created.length, total: eligible.length, skippedDupes, mode };
+  const createResult = await atCreate(baseId, "Outreach", records);
+  const created = createResult.records || [];
+  const createErrors = createResult.errors || [];
+
+  const response = { enqueued: created.length, total: eligible.length, skippedDupes, mode };
+  if (createErrors.length > 0 && created.length === 0) {
+    response.error = `Airtable create failed: ${createErrors[0].body}`;
+    response.airtableErrors = createErrors;
+  } else if (createErrors.length > 0) {
+    response.warning = `${createErrors.length} batch(es) failed. Partial success.`;
+    response.airtableErrors = createErrors;
+  }
+  return response;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -524,24 +692,44 @@ async function sendManualConnections(baseId, accountId, outreachItemIds, ruleCon
   const queue = await atList(baseId, "Outreach");
   const items = queue.filter(q => outreachItemIds.includes(q.id));
 
-  let sent = 0, errors = 0;
-  const results = [];
-
+  // ─── PRE-FLIGHT VALIDATION ─────────────────────────────────
+  // Resolve every message FIRST. If any fails, abort the whole batch.
+  // This prevents 5 good sends + 10 broken ones scenario.
+  const resolved = [];
+  const validationFailures = [];
   for (const item of items) {
     const f = item.fields || {};
-    if (f.Status !== "queued") {
-      results.push({ id: item.id, name: f["Lead Name"], skipped: "Already processed: " + f.Status });
-      continue;
-    }
-    const linkedinUrl = f["LinkedIn URL"] || "";
-    if (!linkedinUrl) {
-      results.push({ id: item.id, name: f["Lead Name"], skipped: "No LinkedIn URL" });
-      continue;
-    }
-
+    if (f.Status !== "queued") continue;
+    if (!f["LinkedIn URL"]) continue;
     const connMsg = ruleConfig.connectionMessage
       ? await aiPersonalizeMessage(ruleConfig.connectionMessage, f, f.Signal || "", f.Company || "")
       : undefined;
+    if (connMsg) {
+      const v = validateMessage(connMsg, "connection_note");
+      if (!v.ok) {
+        validationFailures.push({ id: item.id, name: f["Lead Name"], error: v.error, preview: connMsg.slice(0, 150) });
+        continue;
+      }
+    }
+    resolved.push({ item, connMsg });
+  }
+
+  if (validationFailures.length > 0) {
+    return {
+      sent: 0,
+      errors: 0,
+      aborted: true,
+      error: `Aborted: ${validationFailures.length} message${validationFailures.length!==1?"s":""} failed validation. Fix your template before sending.`,
+      validationFailures,
+    };
+  }
+
+  let sent = 0, errors = 0;
+  const results = [];
+
+  for (const { item, connMsg } of resolved) {
+    const f = item.fields || {};
+    const linkedinUrl = f["LinkedIn URL"] || "";
 
     const res = await sendInvitation(accountId, linkedinUrl, connMsg);
     if (res.ok) {
@@ -579,10 +767,45 @@ async function triggerManualDMs(baseId, accountId, outreachItemIds, ruleConfig) 
   const items = queue.filter(q => outreachItemIds.includes(q.id));
   const sequence = ruleConfig.dmSequence || [];
 
+  // ─── PRE-FLIGHT VALIDATION ─────────────────────────────────
+  // Resolve every DM message first. If ANY fails, abort entire batch.
+  const resolved = [];
+  const validationFailures = [];
+  for (const item of items) {
+    const f = item.fields || {};
+    const dmStep = parseInt(f["DM Step"] || "0");
+    if (dmStep >= sequence.length) continue; // will be marked completed
+    const step = sequence[dmStep];
+    if (!step || !step.message) {
+      validationFailures.push({ id: item.id, name: f["Lead Name"], error: `No message defined for DM step ${dmStep + 1} in sequence`, preview: "" });
+      continue;
+    }
+    const msg = step.aiGenerate
+      ? await aiPersonalizeMessage(step.message, f, f.Signal || "", f.Company || "")
+      : fillMergeFields(step.message, f, f.Signal || "", f.Company || "");
+    const v = validateMessage(msg, `dm_step_${dmStep + 1}`);
+    if (!v.ok) {
+      validationFailures.push({ id: item.id, name: f["Lead Name"], error: v.error, preview: msg.slice(0, 150) });
+      continue;
+    }
+    resolved.push({ item, msg, dmStep });
+  }
+
+  if (validationFailures.length > 0) {
+    return {
+      sent: 0,
+      errors: 0,
+      skippedReplied: 0,
+      aborted: true,
+      error: `Aborted: ${validationFailures.length} DM${validationFailures.length!==1?"s":""} failed validation. Fix your templates — see details below.`,
+      validationFailures,
+    };
+  }
+
   let sent = 0, errors = 0, skippedReplied = 0;
   const results = [];
 
-  for (const item of items) {
+  for (const { item, msg, dmStep } of resolved) {
     const f = item.fields || {};
 
     // Guard: check reply first
@@ -599,18 +822,6 @@ async function triggerManualDMs(baseId, accountId, outreachItemIds, ruleConfig) 
         continue;
       }
     }
-
-    const dmStep = parseInt(f["DM Step"] || "0");
-    if (dmStep >= sequence.length) {
-      await atUpdate(baseId, "Outreach", [{ id: item.id, fields: { Status: "completed" }}]);
-      results.push({ id: item.id, name: f["Lead Name"], skipped: "Sequence complete" });
-      continue;
-    }
-
-    const step = sequence[dmStep];
-    const msg = step.aiGenerate
-      ? await aiPersonalizeMessage(step.message, f, f.Signal || "", f.Company || "")
-      : fillMergeFields(step.message, f, f.Signal || "", f.Company || "");
 
     let chatRes;
     if (existingChatId) {
@@ -875,7 +1086,40 @@ export async function POST(request) {
         const msg = body.aiGenerate
           ? await aiPersonalizeMessage(body.template, body.lead || {}, body.signal || "", body.company || "")
           : fillMergeFields(body.template, body.lead || {}, body.signal || "", body.company || "");
-        return NextResponse.json({ message: msg });
+        const validation = validateMessage(msg, body.context || "message");
+        return NextResponse.json({ message: msg, valid: validation.ok, validationError: validation.error || null });
+      }
+
+      case "preview_batch": {
+        // Preview messages for multiple leads at once — catch broken templates BEFORE sending
+        if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
+        const template = body.template || "";
+        const leadIds = body.leadIds || [];
+        const outreachItemIds = body.outreachItemIds || [];
+        const context = body.context || "message";
+        const signal = body.signal || "";
+
+        // Load source data
+        let source = [];
+        if (leadIds.length) {
+          const allLeads = await atList(baseId, "Leads");
+          source = allLeads.filter(l => leadIds.includes(l.id));
+        } else if (outreachItemIds.length) {
+          const allQueue = await atList(baseId, "Outreach");
+          source = allQueue.filter(q => outreachItemIds.includes(q.id)).map(q => ({ id: q.id, fields: { Name: q.fields?.["Lead Name"], "First Name": (q.fields?.["Lead Name"] || "").split(" ")[0], Title: q.fields?.Title, Company: q.fields?.Company } }));
+        }
+
+        const previews = [];
+        let issues = 0;
+        for (const lead of source.slice(0, 100)) {
+          const msg = body.aiGenerate
+            ? await aiPersonalizeMessage(template, lead, signal, lead.fields?.Company || "")
+            : fillMergeFields(template, lead, signal, lead.fields?.Company || "");
+          const v = validateMessage(msg, context);
+          if (!v.ok) issues++;
+          previews.push({ leadId: lead.id, name: lead.fields?.Name, message: msg, valid: v.ok, error: v.error });
+        }
+        return NextResponse.json({ previews, issues, total: previews.length });
       }
 
       default:

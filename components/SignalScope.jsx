@@ -1721,6 +1721,7 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
   const [connectionMessage, setConnectionMessage] = useState("Hey {first_name}, came across your profile and would love to connect.");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState(null);
+  const [previews, setPreviews] = useState(null);
 
   const outreachRules = rules.filter(r => {
     const c = r.fields?.["Outreach Config"];
@@ -1766,6 +1767,18 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
   })();
 
   // ─── Actions ───
+  const previewMessages = async (template, context = "connection_note") => {
+    if (selected.size === 0) { setResult({ error: "Select some leads first to preview" }); return; }
+    setBusy(true); setResult(null); setPreviews(null);
+    try {
+      const ids = [...selected].slice(0, 5);
+      const d = await outreachAPI("preview_batch", { template, leadIds: ids, context, signal: ruleConfig.signal || "", aiGenerate: false });
+      setPreviews(d.previews || []);
+      if (d.issues > 0) setResult({ error: `⚠️ ${d.issues}/${d.total} previews have issues — fix template before sending.` });
+    } catch (e) { setResult({ error: e.message }); }
+    setBusy(false);
+  };
+
   const enqueueManual = async () => {
     if (!connectionMessage || connectionMessage.length > 300) { setResult({ error: "Connection note must be 1-300 characters" }); return; }
     if (!confirm(`Add ${selected.size} lead${selected.size!==1?"s":""} to queue and send connection request${selected.size!==1?"s":""} now?\n\nThis uses your LinkedIn account. Hard cap: 30 per batch.`)) return;
@@ -1774,27 +1787,36 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
       const ids = [...selected];
       // Step 1: enqueue
       const eq = await outreachAPI("enqueue_leads", { ruleConfig, mode: "manual", selectedIds: ids, count: ids.length });
-      if (eq.error) { setResult({ error: eq.error }); setBusy(false); return; }
-      // Step 2: find the newly-enqueued items and immediately send
-      const q = await outreachAPI("list_queue", { campaign: ruleConfig.name });
-      const newItems = (q.items || []).filter(i => {
-        const f = i.fields || {};
-        return f.Mode === "manual" && f.Status === "queued";
-      }).slice(-eq.enqueued);
-      if (newItems.length === 0) {
-        setResult({ ok: true, message: `Enqueued ${eq.enqueued}, ${eq.skippedDupes || 0} skipped. Nothing to send.` });
-        await loadQueue();
-        setSelected(new Set());
-        setBusy(false);
-        return;
+      if (eq.error) {
+        setResult({ error: eq.error + (eq.airtableErrors ? "\n\nAirtable: " + JSON.stringify(eq.airtableErrors[0]).slice(0,200) : "") });
+        setBusy(false); return;
       }
+      if (eq.enqueued === 0) {
+        setResult({ error: `Could not add any leads to Airtable. Skipped as dupes: ${eq.skippedDupes||0}. Check Airtable permissions and field schema on the Outreach table.` });
+        setBusy(false); return;
+      }
+      // Step 2: find the newly-enqueued items — the records just created are Mode=manual, Status=queued
+      const q = await outreachAPI("list_queue", { campaign: ruleConfig.name, status: "queued" });
+      const newItems = (q.items || []).filter(i => (i.fields?.Mode || "auto") === "manual");
+      if (newItems.length === 0) {
+        setResult({ error: `Enqueued ${eq.enqueued} to Airtable, but couldn't locate them for sending. Try clicking Refresh.` });
+        setBusy(false); await loadQueue(); return;
+      }
+      // Take only the most recently created — sorted by Created At desc
+      const sortedNew = [...newItems].sort((a,b) => (b.fields?.["Created At"] || "").localeCompare(a.fields?.["Created At"] || "")).slice(0, eq.enqueued);
       const sendRes = await outreachAPI("send_manual_connections", {
         accountId: linkedinAccount.id,
-        outreachItemIds: newItems.map(i => i.id),
+        outreachItemIds: sortedNew.map(i => i.id),
         ruleConfig,
       });
-      if (sendRes.error) setResult({ error: sendRes.error });
-      else setResult({ ok: true, message: `✅ Added ${eq.enqueued}, sent ${sendRes.sent} connection request${sendRes.sent!==1?"s":""}, ${sendRes.errors||0} error${sendRes.errors!==1?"s":""}. ${eq.skippedDupes||0} dupes skipped.`, details: sendRes.results });
+      if (sendRes.aborted && sendRes.validationFailures) {
+        const preview = sendRes.validationFailures.slice(0, 3).map(f => `• ${f.name}: ${f.error}`).join("\n");
+        setResult({ error: `🛑 ${sendRes.error}\n\n${preview}${sendRes.validationFailures.length > 3 ? `\n…and ${sendRes.validationFailures.length - 3} more` : ""}` });
+      } else if (sendRes.error) {
+        setResult({ error: sendRes.error });
+      } else {
+        setResult({ ok: true, message: `✅ Added ${eq.enqueued}, sent ${sendRes.sent} connection request${sendRes.sent!==1?"s":""}, ${sendRes.errors||0} error${sendRes.errors!==1?"s":""}. ${eq.skippedDupes||0} dupes skipped.`, details: sendRes.results });
+      }
       await loadQueue();
       setSelected(new Set());
     } catch (e) { setResult({ error: e.message }); }
@@ -1834,8 +1856,14 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
     setBusy(true); setResult(null);
     try {
       const d = await outreachAPI("trigger_manual_dms", { accountId: linkedinAccount.id, outreachItemIds: [...selected], ruleConfig });
-      if (d.error) setResult({ error: d.error });
-      else setResult({ ok: true, message: `Sent ${d.sent} DMs, ${d.skippedReplied} skipped (already replied), ${d.errors} errors.`, details: d.results });
+      if (d.aborted && d.validationFailures) {
+        const preview = d.validationFailures.slice(0, 3).map(f => `• ${f.name}: ${f.error}`).join("\n");
+        setResult({ error: `🛑 ${d.error}\n\n${preview}${d.validationFailures.length > 3 ? `\n…and ${d.validationFailures.length - 3} more` : ""}` });
+      } else if (d.error) {
+        setResult({ error: d.error });
+      } else {
+        setResult({ ok: true, message: `Sent ${d.sent} DMs, ${d.skippedReplied} skipped (already replied), ${d.errors} errors.`, details: d.results });
+      }
       await loadQueue();
       setSelected(new Set());
     } catch (e) { setResult({ error: e.message }); }
@@ -1884,9 +1912,30 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
       {/* Connection Message */}
       <div className="ig">
         <div className="il">Connection Note <span style={{fontWeight:400,textTransform:"none",color:"var(--t3)"}}>— sent with the invite. Merge fields: {"{first_name}"}, {"{company}"}, {"{title}"}</span></div>
-        <textarea className="inp" value={connectionMessage} onChange={e=>setConnectionMessage(e.target.value)} style={{minHeight:60}} maxLength={300} placeholder="Hey {first_name}, came across your profile and would love to connect."/>
-        <div style={{fontSize:9,color:connectionMessage.length>300?"var(--red)":"var(--t3)",marginTop:2}}>{connectionMessage.length}/300 chars · LinkedIn free-tier limit</div>
+        <textarea className="inp" value={connectionMessage} onChange={e=>{setConnectionMessage(e.target.value);setPreviews(null)}} style={{minHeight:60}} maxLength={300} placeholder="Hey {first_name}, came across your profile and would love to connect."/>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:4}}>
+          <div style={{fontSize:9,color:connectionMessage.length>300?"var(--red)":"var(--t3)"}}>{connectionMessage.length}/300 chars · LinkedIn free-tier limit</div>
+          <button className="btn btn-s" disabled={busy||selected.size===0} onClick={()=>previewMessages(connectionMessage,"connection_note")} style={{fontSize:10}}>{busy?"⏳":"👁 Preview on "+Math.min(selected.size,5)+" sample"+(Math.min(selected.size,5)!==1?"s":"")}</button>
+        </div>
       </div>
+
+      {/* Preview panel */}
+      {previews && previews.length > 0 && (
+        <div style={{padding:12,background:"var(--hover)",borderRadius:8,marginBottom:14}}>
+          <div style={{fontSize:10,color:"var(--t2)",fontWeight:600,marginBottom:8,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <span>🔍 Rendered Preview ({previews.length} sample{previews.length!==1?"s":""})</span>
+            <button className="btn btn-s" style={{fontSize:9,padding:"2px 6px"}} onClick={()=>setPreviews(null)}>✕ Close</button>
+          </div>
+          {previews.map((p, i) => (
+            <div key={i} style={{padding:"8px 10px",background:p.valid?"var(--card)":"var(--red-d)",borderRadius:6,marginBottom:6,border:"1px solid "+(p.valid?"var(--bdr)":"rgba(196,92,92,.4)")}}>
+              <div style={{fontSize:10,color:p.valid?"var(--t2)":"var(--red)",fontWeight:600,marginBottom:2}}>{p.valid?"✅":"❌"} {p.name || "Unknown"}</div>
+              <div style={{fontSize:10,color:"var(--t1)",whiteSpace:"pre-wrap",lineHeight:1.5}}>{p.message}</div>
+              {p.error && <div style={{fontSize:9,color:"var(--red)",marginTop:4,fontStyle:"italic"}}>⚠ {p.error}</div>}
+            </div>
+          ))}
+          <div style={{fontSize:9,color:"var(--t3)",fontStyle:"italic",marginTop:4}}>If any preview has ❌, the batch will be blocked. Fix merge fields first.</div>
+        </div>
+      )}
 
       {/* DM Sequence Preview */}
       {ruleConfig.dmSequence?.length > 0 ? (
@@ -1924,7 +1973,7 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
           </tr>
         );})}</tbody></table>}
       </div>
-      {result && <div style={{marginTop:12,padding:10,borderRadius:6,background:result.error?"var(--red-d)":"var(--grn-d)",color:result.error?"var(--red)":"var(--grn)",fontSize:11}}>{result.error || result.message}</div>}
+      {result && <div style={{marginTop:12,padding:10,borderRadius:6,background:result.error?"var(--red-d)":"var(--grn-d)",color:result.error?"var(--red)":"var(--grn)",fontSize:11,whiteSpace:"pre-wrap"}}>{result.error || result.message}</div>}
     </div>)}
 
     {/* ─── REVIEW QUEUE ─── */}
@@ -1966,7 +2015,7 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
           <td style={{color:"var(--t1)",fontWeight:500}}>{f["Lead Name"]}</td><td style={{fontSize:10}}>{f.Title}</td><td style={{fontSize:10}}>{f.Company}</td>
         </tr>);})}</tbody></table>}
       </div>
-      {result && <div style={{marginTop:12,padding:10,borderRadius:6,background:result.error?"var(--red-d)":"var(--grn-d)",color:result.error?"var(--red)":"var(--grn)",fontSize:11}}>{result.error || result.message}</div>}
+      {result && <div style={{marginTop:12,padding:10,borderRadius:6,background:result.error?"var(--red-d)":"var(--grn-d)",color:result.error?"var(--red)":"var(--grn)",fontSize:11,whiteSpace:"pre-wrap"}}>{result.error || result.message}</div>}
     </div>)}
 
     {/* ─── MARK CONNECTED ─── */}
@@ -1986,7 +2035,7 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
           <td style={{fontSize:10,color:"var(--t3)"}}>{f["Connection Sent At"]?.slice(0,10)||"—"}</td>
         </tr>);})}</tbody></table>}
       </div>
-      {result && <div style={{marginTop:12,padding:10,borderRadius:6,background:result.error?"var(--red-d)":"var(--grn-d)",color:result.error?"var(--red)":"var(--grn)",fontSize:11}}>{result.error || result.message}</div>}
+      {result && <div style={{marginTop:12,padding:10,borderRadius:6,background:result.error?"var(--red-d)":"var(--grn-d)",color:result.error?"var(--red)":"var(--grn)",fontSize:11,whiteSpace:"pre-wrap"}}>{result.error || result.message}</div>}
     </div>)}
 
     {/* ─── TRIGGER DMS ─── */}
