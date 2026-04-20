@@ -286,12 +286,41 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     return res.json();
   };
 
+  const [linkedinError, setLinkedinError] = useState("");
+  const [manualModal, setManualModal] = useState(null); // { mode: "select_leads" | "send_requests" | "trigger_dms", ... }
+
   const connectLinkedIn = async () => {
+    setLinkedinError("");
     try {
       const data = await outreachAPI("get_auth_link", { callbackUrl: window.location.href });
-      if (data.url) window.open(data.url, "_blank", "width=600,height=700");
-      else console.error("No auth URL returned:", data);
-    } catch (e) { console.error("LinkedIn connect error:", e); }
+      if (data.url) {
+        const popup = window.open(data.url, "_blank", "width=600,height=700");
+        if (!popup || popup.closed) setLinkedinError("Popup blocked — allow popups for this site and try again");
+      } else if (data.error) {
+        setLinkedinError((data.error || "") + (data.hint ? " — " + data.hint : "") + (data.details ? " | " + JSON.stringify(data.details).slice(0, 200) : ""));
+      } else {
+        setLinkedinError("Unknown response: " + JSON.stringify(data).slice(0, 200));
+      }
+    } catch (e) { setLinkedinError(e.message); }
+  };
+  const testUnipile = async () => {
+    setLinkedinError("");
+    try {
+      const data = await outreachAPI("test_unipile");
+      if (data.ok) setLinkedinError("✅ Unipile connection healthy");
+      else setLinkedinError("❌ " + JSON.stringify(data.tests));
+    } catch (e) { setLinkedinError("❌ " + e.message); }
+  };
+  const disconnectLinkedIn = async () => {
+    if (!linkedinAccount?.id) return;
+    if (!confirm(`Disconnect ${linkedinAccount.name} from Unipile? This stops all automation for this account.`)) return;
+    try {
+      setOutreachLoading(true);
+      await outreachAPI("disconnect_account", { accountId: linkedinAccount.id });
+      setLinkedinAccount(null);
+      setLinkedinError("✅ Disconnected");
+    } catch (e) { setLinkedinError("❌ " + e.message); }
+    setOutreachLoading(false);
   };
 
   const loadLinkedInAccounts = async () => {
@@ -1376,8 +1405,11 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   {/* ════ LINKEDIN AUTOMATION ════ */}
   {tab==="outreach"&&!loading&&(<div>
     <div className="ph"><div><div className="pt">💬 LinkedIn Automation</div><div className="pd">Connection requests, DM sequences & outreach tracking</div></div>
-      <div style={{display:"flex",gap:6}}>
+      <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+        {linkedinAccount && <button className="btn btn-s btn-p" onClick={()=>setManualModal({mode:"select_leads"})} disabled={outreachLoading}>✋ Manual Mode</button>}
+        {linkedinAccount && <button className="btn btn-s" onClick={async()=>{try{setOutreachLoading(true);const d=await outreachAPI("check_replies",{accountId:linkedinAccount.id});alert(`Checked ${d.checked} items. Found ${d.repliesFound} new replies.${d.replied?.length?"\n\nReplied:\n"+d.replied.join("\n"):""}`);await loadOutreachStats();}catch(e){alert("Error: "+e.message)}setOutreachLoading(false)}} disabled={outreachLoading}>{outreachLoading?"⏳":"✋ Check Replies"}</button>}
         {linkedinAccount && <button className="btn btn-s" onClick={()=>loadOutreachStats()} disabled={outreachLoading}>↻ Refresh</button>}
+        {linkedinAccount && <button className="btn btn-s btn-d" onClick={disconnectLinkedIn} disabled={outreachLoading}>🔌 Disconnect</button>}
       </div>
     </div>
 
@@ -1390,7 +1422,8 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
             <div style={{fontSize:20,marginBottom:8}}>🔑</div>
             <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:6}}>Login Directly</div>
             <div style={{fontSize:10,color:"var(--t3)",lineHeight:1.5,marginBottom:14}}>Connect your own LinkedIn account via Unipile's secure auth.</div>
-            <button className="btn btn-p btn-s" style={{width:"100%",justifyContent:"center"}} onClick={connectLinkedIn}>Connect LinkedIn</button>
+            <button className="btn btn-p btn-s" style={{width:"100%",justifyContent:"center",marginBottom:6}} onClick={connectLinkedIn}>Connect LinkedIn</button>
+            <button className="btn btn-s" style={{width:"100%",justifyContent:"center",fontSize:10}} onClick={testUnipile}>🧪 Test Unipile Connection</button>
           </div>
           {/* Option B: Email to Client */}
           <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10}}>
@@ -1409,6 +1442,11 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         <div style={{marginTop:12,fontSize:10,color:"var(--t3)",lineHeight:1.5}}>
           ⚠️ Requires <strong>UNIPILE_DSN</strong> and <strong>UNIPILE_API_KEY</strong> environment variables. <a href="https://app.unipile.com" target="_blank" rel="noopener" style={{color:"var(--blu)"}}>Get them from Unipile →</a>
         </div>
+        {linkedinError && (
+          <div style={{marginTop:12,padding:"10px 14px",background:linkedinError.startsWith("✅")?"var(--grn-d)":"var(--red-d)",border:"1px solid "+(linkedinError.startsWith("✅")?"rgba(93,168,122,.3)":"rgba(196,92,92,.3)"),borderRadius:8,color:linkedinError.startsWith("✅")?"var(--grn)":"var(--red)",fontSize:11,lineHeight:1.5,wordBreak:"break-word"}}>
+            {linkedinError}
+          </div>
+        )}
       </div>
     ) : (<>
 
@@ -1420,6 +1458,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         {label:"Requests Sent",value:outreachStats.connectionSent,color:"var(--blu)"},
         {label:"Connected",value:outreachStats.connected,color:"var(--grn)"},
         {label:"DMs In Progress",value:outreachStats.dmInProgress,color:"var(--pur)"},
+        {label:"Replied ✋",value:outreachStats.replied||0,color:"var(--grn)"},
         {label:"Completed",value:outreachStats.completed,color:"var(--grn)"},
         {label:"Errors",value:outreachStats.errors,color:"var(--red)"},
       ].map(s => (
@@ -1473,14 +1512,14 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       <tbody>{outreachItems.slice(0,50).map(q => {
         const f = q.fields || {};
         const status = f.Status || "queued";
-        const statusColor = status==="completed"?"cg":status==="error"?"cr":status==="connected"||status.startsWith("dm_")?"cp":status==="connection_sent"?"cb":"ca";
-        return (<tr key={q.id}>
+        const statusColor = status==="replied"?"cg":status==="completed"?"cg":status==="error"?"cr":status==="connected"||status.startsWith("dm_")?"cp":status==="connection_sent"?"cb":"ca";
+        return (<tr key={q.id} style={status==="replied"?{background:"var(--grn-d)"}:{}}>
           <td style={{color:"var(--t1)",fontWeight:500}}>{f["Lead Name"]}</td>
           <td>{f.Company}</td>
           <td style={{fontSize:10}}>{f.Campaign}</td>
-          <td><span className={"chip "+statusColor}>{status.replace(/_/g," ")}</span></td>
+          <td><span className={"chip "+statusColor}>{status==="replied"?"✋ replied":status.replace(/_/g," ")}</span></td>
           <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10}}>{f["DM Step"]||0}</td>
-          <td style={{fontSize:10}}>{f["Next Action Date"]||"—"}</td>
+          <td style={{fontSize:10}}>{status==="replied"?"—":(f["Next Action Date"]||"—")}</td>
         </tr>);
       })}</tbody></table></div>
     </div>)}
@@ -1493,6 +1532,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   {editRule!==null&&<RuleEditor rule={editRule} onSave={saveRule} onClose={()=>setEditRule(null)} availableFields={availableFields}/>}
   {showExportModal&&<ExportModal tasks={selCount>0?fTasks.filter(t=>selectedTasks.has(t.id)):fTasks} accounts={accounts} leads={leads} onClose={()=>setShowExportModal(false)}/>}
   {enrichModal&&<EnrichModal mode={enrichModal.mode} tasks={tasks} rules={rules} fTasks={fTasks} selectedTasks={selectedTasks} onEnrich={enrichTasks} onPush={pushToHubSpot} enrichResults={enrichResults} enrichLoading={enrichLoading} hsConnected={hsConnected} hsOwners={hsOwners} hsLoading={hsLoading} onClose={()=>{setEnrichModal(null);setEnrichResults([])}}/>}
+  {manualModal&&<ManualOutreachModal leads={leads} rules={rules} linkedinAccount={linkedinAccount} outreachAPI={outreachAPI} onClose={()=>setManualModal(null)} baseId={bid}/>}
 
   {/* CSV MODAL */}
   {csvModal&&(<div className="modal-o" onClick={e=>e.target===e.currentTarget&&setCsvModal(null)}><div className="modal" style={{maxWidth:700}}>
@@ -1654,6 +1694,274 @@ function PushToHubSpotForm({ tasks, owners, onPush, loading, rules }) {
 
 // ═══════════════════════════════════════════════════════════════
 // LEADS TO HUBSPOT FORM
+// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// MANUAL OUTREACH MODAL
+// ═══════════════════════════════════════════════════════════════
+function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClose, baseId }) {
+  const [step, setStep] = useState("choose"); // choose | select_new | review_queue | send_connections | mark_connected | trigger_dms
+  const [queue, setQueue] = useState([]);
+  const [queueLoading, setQueueLoading] = useState(false);
+  const [selected, setSelected] = useState(new Set());
+  const [selectedRule, setSelectedRule] = useState("");
+  const [count, setCount] = useState(10);
+  const [companyFilter, setCompanyFilter] = useState("");
+  const [connectionMessage, setConnectionMessage] = useState("Hey {first_name}, came across your profile and would love to connect.");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+
+  const outreachRules = rules.filter(r => {
+    const c = r.fields?.["Outreach Config"];
+    return c && c.length > 5;
+  });
+
+  // Load queue on demand
+  const loadQueue = async () => {
+    setQueueLoading(true);
+    try {
+      const d = await outreachAPI("list_queue", {});
+      setQueue(d.items || []);
+    } catch (e) { console.error(e); }
+    setQueueLoading(false);
+  };
+
+  // Available leads (not already in outreach)
+  const inOutreachLinkedIns = new Set(queue.map(q => (q.fields?.["LinkedIn URL"] || "").toLowerCase().trim()).filter(Boolean));
+  const availableLeads = leads.filter(l => {
+    const f = l.fields || {};
+    const li = (f["LinkedIn URL"] || "").toLowerCase().trim();
+    if (!li) return false;
+    if (inOutreachLinkedIns.has(li)) return false;
+    if (companyFilter && !(f.Company || "").toLowerCase().includes(companyFilter.toLowerCase())) return false;
+    return true;
+  });
+
+  // Queue filtered by status
+  const queueQueued = queue.filter(q => (q.fields?.Status || "queued") === "queued" && (q.fields?.Mode || "auto") === "manual");
+  const queueConnSent = queue.filter(q => (q.fields?.Status || "") === "connection_sent" && (q.fields?.Mode || "auto") === "manual");
+  const queueConnected = queue.filter(q => {
+    const s = (q.fields?.Status || "");
+    return (s === "connected" || s.startsWith("dm_")) && (q.fields?.Mode || "auto") === "manual";
+  });
+
+  const ruleConfig = (() => {
+    if (!selectedRule) return { name: "Manual Outreach", connectionMessage, dmSequence: [] };
+    const r = rules.find(x => x.id === selectedRule);
+    try {
+      const cfg = JSON.parse(r?.fields?.["Outreach Config"] || "{}");
+      return { ...cfg, name: r?.fields?.Name || "Manual", connectionMessage: connectionMessage || cfg.connectionMessage };
+    } catch { return { name: "Manual", connectionMessage, dmSequence: [] }; }
+  })();
+
+  // ─── Actions ───
+  const enqueueManual = async () => {
+    setBusy(true); setResult(null);
+    try {
+      const ids = [...selected];
+      const d = await outreachAPI("enqueue_leads", { ruleConfig, mode: "manual", selectedIds: ids, count: ids.length });
+      setResult({ ok: true, message: `Enqueued ${d.enqueued} lead${d.enqueued !== 1 ? "s" : ""} (${d.skippedDupes || 0} skipped — already in outreach).` });
+      await loadQueue();
+      setSelected(new Set());
+    } catch (e) { setResult({ error: e.message }); }
+    setBusy(false);
+  };
+
+  const sendConnections = async () => {
+    if (selected.size === 0) return;
+    if (!confirm(`Send ${selected.size} connection request${selected.size !== 1 ? "s" : ""}?\n\nThis will use your LinkedIn account. You'll hit LinkedIn's rate limits if you send too many per day — we cap at 30 per batch.`)) return;
+    setBusy(true); setResult(null);
+    try {
+      const d = await outreachAPI("send_manual_connections", { accountId: linkedinAccount.id, outreachItemIds: [...selected], ruleConfig });
+      if (d.error) setResult({ error: d.error });
+      else setResult({ ok: true, message: `Sent ${d.sent}, errors: ${d.errors}`, details: d.results });
+      await loadQueue();
+      setSelected(new Set());
+    } catch (e) { setResult({ error: e.message }); }
+    setBusy(false);
+  };
+
+  const markConnected = async () => {
+    if (selected.size === 0) return;
+    setBusy(true); setResult(null);
+    try {
+      const d = await outreachAPI("mark_connected", { outreachItemIds: [...selected] });
+      setResult({ ok: true, message: `Marked ${d.marked} as connected. Now you can trigger DMs.` });
+      await loadQueue();
+      setSelected(new Set());
+    } catch (e) { setResult({ error: e.message }); }
+    setBusy(false);
+  };
+
+  const triggerDMs = async () => {
+    if (selected.size === 0) return;
+    if (!selectedRule) { alert("Select a Task Rule to get the DM sequence"); return; }
+    if (!confirm(`Send DM to ${selected.size} lead${selected.size !== 1 ? "s" : ""}?\n\nReplied leads will be skipped automatically.`)) return;
+    setBusy(true); setResult(null);
+    try {
+      const d = await outreachAPI("trigger_manual_dms", { accountId: linkedinAccount.id, outreachItemIds: [...selected], ruleConfig });
+      if (d.error) setResult({ error: d.error });
+      else setResult({ ok: true, message: `Sent ${d.sent} DMs, ${d.skippedReplied} skipped (already replied), ${d.errors} errors.`, details: d.results });
+      await loadQueue();
+      setSelected(new Set());
+    } catch (e) { setResult({ error: e.message }); }
+    setBusy(false);
+  };
+
+  const toggle = (id) => { setSelected(p => { const n = new Set(p); if (n.has(id)) n.delete(id); else n.add(id); return n; }); };
+  const selectAll = (items, limit = 30) => setSelected(new Set(items.slice(0, limit).map(i => i.id)));
+
+  return (<div className="modal-o" onClick={e=>e.target===e.currentTarget&&onClose()}><div className="modal" style={{maxWidth:900,maxHeight:"90vh"}}>
+    <div className="modal-h">
+      <span style={{fontWeight:600}}>✋ Manual Outreach</span>
+      <button className="btn btn-s" onClick={onClose}>✕</button>
+    </div>
+    <div className="modal-b" style={{maxHeight:"calc(90vh - 140px)",overflowY:"auto"}}>
+
+    {/* ─── CHOOSE STEP ─── */}
+    {step==="choose"&&(<div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:16,lineHeight:1.6}}>Manual mode gives you full control. Unlike auto mode, <strong>you</strong> decide which leads get connection requests and when to send follow-up DMs.</div>
+
+      <div className="ig"><div className="il">Task Rule (for DM sequence & messages)</div>
+        <select className="inp" value={selectedRule} onChange={e=>{setSelectedRule(e.target.value);const r=rules.find(x=>x.id===e.target.value);if(r){try{const c=JSON.parse(r.fields?.["Outreach Config"]||"{}");if(c.connectionMessage)setConnectionMessage(c.connectionMessage);}catch{}}}}>
+          <option value="">Custom (no pre-defined sequence)</option>
+          {outreachRules.map(r => <option key={r.id} value={r.id}>{r.fields?.Name || "Rule"}</option>)}
+        </select>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginTop:16}}>
+        <div onClick={async()=>{await loadQueue();setStep("select_new")}} style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,cursor:"pointer"}}>
+          <div style={{fontSize:20,marginBottom:8}}>👥</div>
+          <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:6}}>1. Add Leads to Queue</div>
+          <div style={{fontSize:10,color:"var(--t3)",lineHeight:1.5}}>Pick specific leads, then send them connection requests. Each lead tracked separately.</div>
+        </div>
+        <div onClick={async()=>{await loadQueue();setStep("review_queue")}} style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,cursor:"pointer"}}>
+          <div style={{fontSize:20,marginBottom:8}}>📋</div>
+          <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:6}}>2. Review & Act on Queue</div>
+          <div style={{fontSize:10,color:"var(--t3)",lineHeight:1.5}}>See pending, sent requests, and accepted. Mark as connected or trigger DMs.</div>
+        </div>
+      </div>
+    </div>)}
+
+    {/* ─── SELECT NEW LEADS ─── */}
+    {step==="select_new"&&(<div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:12}}>Pick leads to add to your manual outreach queue. Only leads with LinkedIn URLs and not already in outreach are shown.</div>
+
+      <div style={{display:"flex",gap:8,marginBottom:12}}>
+        <input className="inp" placeholder="Filter by company…" value={companyFilter} onChange={e=>setCompanyFilter(e.target.value)} style={{flex:1}}/>
+        <button className="btn btn-s" onClick={()=>selectAll(availableLeads, 30)}>Select top 30</button>
+        <button className="btn btn-s" onClick={()=>setSelected(new Set())}>Clear</button>
+      </div>
+
+      <div style={{fontSize:10,color:"var(--t3)",marginBottom:8}}>{availableLeads.length} available · {selected.size} selected · 30 max per batch (safety cap)</div>
+
+      <div style={{maxHeight:360,overflowY:"auto",border:"1px solid var(--bdr)",borderRadius:8}}>
+        {availableLeads.length === 0 ? <div style={{padding:40,textAlign:"center",color:"var(--t3)",fontSize:11}}>No available leads. Upload leads with LinkedIn URLs, or they're all in outreach already.</div> :
+        <table><thead><tr><th style={{width:32}}></th><th>Name</th><th>Title</th><th>Company</th></tr></thead>
+        <tbody>{availableLeads.slice(0, 200).map(l => { const f = l.fields || {}; const isSel = selected.has(l.id); return (
+          <tr key={l.id} onClick={()=>toggle(l.id)} style={{cursor:"pointer",background:isSel?"var(--acc-d)":""}}>
+            <td><input type="checkbox" checked={isSel} onChange={()=>toggle(l.id)} onClick={e=>e.stopPropagation()} style={{accentColor:"var(--acc)"}}/></td>
+            <td style={{color:"var(--t1)",fontWeight:500}}>{f.Name}</td><td style={{fontSize:10}}>{f.Title}</td><td style={{fontSize:10}}>{f.Company}</td>
+          </tr>
+        );})}</tbody></table>}
+      </div>
+      {result && <div style={{marginTop:12,padding:10,borderRadius:6,background:result.error?"var(--red-d)":"var(--grn-d)",color:result.error?"var(--red)":"var(--grn)",fontSize:11}}>{result.error || result.message}</div>}
+    </div>)}
+
+    {/* ─── REVIEW QUEUE ─── */}
+    {step==="review_queue"&&(<div>
+      <div style={{display:"flex",gap:10,marginBottom:14}}>
+        <div style={{flex:1,padding:"10px 14px",background:"var(--hover)",borderRadius:8,cursor:"pointer",border:"1px solid "+(step==="send_connections"?"var(--acc)":"transparent")}} onClick={()=>{setSelected(new Set());setStep("send_connections")}}>
+          <div style={{fontSize:18,fontWeight:700,fontFamily:"'JetBrains Mono',monospace",color:"var(--amb)"}}>{queueQueued.length}</div>
+          <div style={{fontSize:9,color:"var(--t3)"}}>In Queue (not sent)</div>
+        </div>
+        <div style={{flex:1,padding:"10px 14px",background:"var(--hover)",borderRadius:8,cursor:"pointer"}} onClick={()=>{setSelected(new Set());setStep("mark_connected")}}>
+          <div style={{fontSize:18,fontWeight:700,fontFamily:"'JetBrains Mono',monospace",color:"var(--blu)"}}>{queueConnSent.length}</div>
+          <div style={{fontSize:9,color:"var(--t3)"}}>Request Sent</div>
+        </div>
+        <div style={{flex:1,padding:"10px 14px",background:"var(--hover)",borderRadius:8,cursor:"pointer"}} onClick={()=>{setSelected(new Set());setStep("trigger_dms")}}>
+          <div style={{fontSize:18,fontWeight:700,fontFamily:"'JetBrains Mono',monospace",color:"var(--grn)"}}>{queueConnected.length}</div>
+          <div style={{fontSize:9,color:"var(--t3)"}}>Connected (ready for DM)</div>
+        </div>
+      </div>
+      <div style={{fontSize:11,color:"var(--t3)",lineHeight:1.6}}>Click a card above to act on that group. The flow is: <strong>Queue</strong> → Send Connection → <strong>Request Sent</strong> → Mark as Connected when they accept → <strong>Connected</strong> → Trigger DM sequence.</div>
+    </div>)}
+
+    {/* ─── SEND CONNECTIONS ─── */}
+    {step==="send_connections"&&(<div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:12}}>Select leads from the queue to send connection requests to. <strong style={{color:"var(--amb)"}}>Safety cap: 30 per batch.</strong></div>
+      <div className="ig"><div className="il">Connection Message <span style={{fontWeight:400,textTransform:"none",color:"var(--t3)"}}>— {"{first_name}"}, {"{company}"} merge fields supported</span></div>
+        <textarea className="inp" value={connectionMessage} onChange={e=>setConnectionMessage(e.target.value)} style={{minHeight:60}} maxLength={300}/>
+        <div style={{fontSize:9,color:"var(--t3)",marginTop:2}}>{connectionMessage.length}/300 chars · LinkedIn limit</div>
+      </div>
+      <div style={{display:"flex",gap:8,marginBottom:8}}>
+        <button className="btn btn-s" onClick={()=>selectAll(queueQueued, 30)}>Select 30</button>
+        <button className="btn btn-s" onClick={()=>setSelected(new Set())}>Clear</button>
+        <span style={{fontSize:10,color:"var(--t3)",marginLeft:"auto",alignSelf:"center"}}>{selected.size}/30 selected · {queueQueued.length} in queue</span>
+      </div>
+      <div style={{maxHeight:260,overflowY:"auto",border:"1px solid var(--bdr)",borderRadius:8}}>
+        {queueQueued.length===0?<div style={{padding:30,textAlign:"center",color:"var(--t3)",fontSize:11}}>Queue empty. Add leads first.</div>:
+        <table><thead><tr><th style={{width:32}}></th><th>Name</th><th>Title</th><th>Company</th></tr></thead>
+        <tbody>{queueQueued.map(q=>{const f=q.fields||{};const isSel=selected.has(q.id);return (<tr key={q.id} onClick={()=>selected.size<30||isSel?toggle(q.id):null} style={{cursor:"pointer",background:isSel?"var(--acc-d)":""}}>
+          <td><input type="checkbox" checked={isSel} disabled={!isSel&&selected.size>=30} onChange={()=>toggle(q.id)} onClick={e=>e.stopPropagation()} style={{accentColor:"var(--acc)"}}/></td>
+          <td style={{color:"var(--t1)",fontWeight:500}}>{f["Lead Name"]}</td><td style={{fontSize:10}}>{f.Title}</td><td style={{fontSize:10}}>{f.Company}</td>
+        </tr>);})}</tbody></table>}
+      </div>
+      {result && <div style={{marginTop:12,padding:10,borderRadius:6,background:result.error?"var(--red-d)":"var(--grn-d)",color:result.error?"var(--red)":"var(--grn)",fontSize:11}}>{result.error || result.message}</div>}
+    </div>)}
+
+    {/* ─── MARK CONNECTED ─── */}
+    {step==="mark_connected"&&(<div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:12,lineHeight:1.6}}>Check LinkedIn for accepted connections, then select them here to move into the DM-ready group. <strong>This doesn't send anything</strong> — just updates status.</div>
+      <div style={{display:"flex",gap:8,marginBottom:8}}>
+        <button className="btn btn-s" onClick={()=>selectAll(queueConnSent, 100)}>Select All</button>
+        <button className="btn btn-s" onClick={()=>setSelected(new Set())}>Clear</button>
+        <span style={{fontSize:10,color:"var(--t3)",marginLeft:"auto",alignSelf:"center"}}>{selected.size} selected · {queueConnSent.length} pending</span>
+      </div>
+      <div style={{maxHeight:300,overflowY:"auto",border:"1px solid var(--bdr)",borderRadius:8}}>
+        {queueConnSent.length===0?<div style={{padding:30,textAlign:"center",color:"var(--t3)",fontSize:11}}>No pending connection requests.</div>:
+        <table><thead><tr><th style={{width:32}}></th><th>Name</th><th>Company</th><th>Sent</th></tr></thead>
+        <tbody>{queueConnSent.map(q=>{const f=q.fields||{};const isSel=selected.has(q.id);return (<tr key={q.id} onClick={()=>toggle(q.id)} style={{cursor:"pointer",background:isSel?"var(--acc-d)":""}}>
+          <td><input type="checkbox" checked={isSel} onChange={()=>toggle(q.id)} onClick={e=>e.stopPropagation()} style={{accentColor:"var(--acc)"}}/></td>
+          <td style={{color:"var(--t1)",fontWeight:500}}>{f["Lead Name"]}</td><td style={{fontSize:10}}>{f.Company}</td>
+          <td style={{fontSize:10,color:"var(--t3)"}}>{f["Connection Sent At"]?.slice(0,10)||"—"}</td>
+        </tr>);})}</tbody></table>}
+      </div>
+      {result && <div style={{marginTop:12,padding:10,borderRadius:6,background:result.error?"var(--red-d)":"var(--grn-d)",color:result.error?"var(--red)":"var(--grn)",fontSize:11}}>{result.error || result.message}</div>}
+    </div>)}
+
+    {/* ─── TRIGGER DMS ─── */}
+    {step==="trigger_dms"&&(<div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:12,lineHeight:1.6}}>Send the next DM in the sequence to connected leads. Replied leads will be auto-skipped.</div>
+      {!selectedRule && <div style={{padding:10,background:"var(--red-d)",color:"var(--red)",borderRadius:6,fontSize:11,marginBottom:12}}>⚠️ Select a Task Rule on the first screen to use its DM sequence.</div>}
+      <div style={{display:"flex",gap:8,marginBottom:8}}>
+        <button className="btn btn-s" onClick={()=>selectAll(queueConnected, 50)}>Select 50</button>
+        <button className="btn btn-s" onClick={()=>setSelected(new Set())}>Clear</button>
+        <span style={{fontSize:10,color:"var(--t3)",marginLeft:"auto",alignSelf:"center"}}>{selected.size}/50 · {queueConnected.length} connected</span>
+      </div>
+      <div style={{maxHeight:300,overflowY:"auto",border:"1px solid var(--bdr)",borderRadius:8}}>
+        {queueConnected.length===0?<div style={{padding:30,textAlign:"center",color:"var(--t3)",fontSize:11}}>No connected leads yet. Mark some as connected first.</div>:
+        <table><thead><tr><th style={{width:32}}></th><th>Name</th><th>Company</th><th>DM Step</th></tr></thead>
+        <tbody>{queueConnected.map(q=>{const f=q.fields||{};const isSel=selected.has(q.id);return (<tr key={q.id} onClick={()=>selected.size<50||isSel?toggle(q.id):null} style={{cursor:"pointer",background:isSel?"var(--acc-d)":""}}>
+          <td><input type="checkbox" checked={isSel} disabled={!isSel&&selected.size>=50} onChange={()=>toggle(q.id)} onClick={e=>e.stopPropagation()} style={{accentColor:"var(--acc)"}}/></td>
+          <td style={{color:"var(--t1)",fontWeight:500}}>{f["Lead Name"]}</td><td style={{fontSize:10}}>{f.Company}</td>
+          <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10}}>{f["DM Step"]||0}</td>
+        </tr>);})}</tbody></table>}
+      </div>
+      {result && <div style={{marginTop:12,padding:10,borderRadius:6,background:result.error?"var(--red-d)":"var(--grn-d)",color:result.error?"var(--red)":"var(--grn)",fontSize:11,whiteSpace:"pre-wrap"}}>{result.error || result.message}</div>}
+    </div>)}
+
+    </div>
+    <div className="modal-f">
+      {step==="choose"&&<button className="btn" onClick={onClose}>Close</button>}
+      {step==="select_new"&&<><button className="btn" onClick={()=>setStep("choose")}>← Back</button><button className="btn btn-p" disabled={busy||selected.size===0} onClick={enqueueManual}>{busy?"⏳":`Add ${selected.size} to Queue`}</button></>}
+      {step==="review_queue"&&<button className="btn" onClick={()=>setStep("choose")}>← Back</button>}
+      {step==="send_connections"&&<><button className="btn" onClick={()=>setStep("review_queue")}>← Back</button><button className="btn btn-p" disabled={busy||selected.size===0||!linkedinAccount} onClick={sendConnections}>{busy?"⏳ Sending…":`Send ${selected.size} Connection Request${selected.size!==1?"s":""}`}</button></>}
+      {step==="mark_connected"&&<><button className="btn" onClick={()=>setStep("review_queue")}>← Back</button><button className="btn btn-p" disabled={busy||selected.size===0} onClick={markConnected}>{busy?"⏳":`Mark ${selected.size} as Connected`}</button></>}
+      {step==="trigger_dms"&&<><button className="btn" onClick={()=>setStep("review_queue")}>← Back</button><button className="btn btn-p" disabled={busy||selected.size===0||!linkedinAccount||!selectedRule} onClick={triggerDMs}>{busy?"⏳ Sending…":`Send DM to ${selected.size}`}</button></>}
+    </div>
+  </div></div>);
+}
+
 // ═══════════════════════════════════════════════════════════════
 function LeadsToHubSpotForm({ leads, owners, onPush, loading }) {
   const [ownerId, setOwnerId] = useState("");
