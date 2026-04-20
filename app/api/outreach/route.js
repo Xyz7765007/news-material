@@ -454,6 +454,11 @@ async function enqueueLeads(baseId, ruleConfig, options = {}) {
   const leads = await atList(baseId, "Leads");
   if (!leads.length) return { error: "No leads found", enqueued: 0 };
 
+  // Defensive: manual mode with empty selection = noop, not auto fallback
+  if (mode === "manual" && !selectedIds.length) {
+    return { error: "No leads selected. Check the boxes next to leads you want to add.", enqueued: 0, skippedDupes: 0 };
+  }
+
   // GLOBAL DEDUP — check ALL outreach records across ALL campaigns
   const existing = await atList(baseId, "Outreach");
   const existingLinkedIns = new Set(
@@ -463,7 +468,7 @@ async function enqueueLeads(baseId, ruleConfig, options = {}) {
   let eligible;
   let skippedDupes = 0;
 
-  if (mode === "manual" && selectedIds.length) {
+  if (mode === "manual") {
     // Manual mode: user picked specific lead IDs
     eligible = leads.filter(l => selectedIds.includes(l.id));
     // Still dedupe against existing outreach

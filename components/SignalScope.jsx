@@ -1767,11 +1767,34 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
 
   // ─── Actions ───
   const enqueueManual = async () => {
+    if (!connectionMessage || connectionMessage.length > 300) { setResult({ error: "Connection note must be 1-300 characters" }); return; }
+    if (!confirm(`Add ${selected.size} lead${selected.size!==1?"s":""} to queue and send connection request${selected.size!==1?"s":""} now?\n\nThis uses your LinkedIn account. Hard cap: 30 per batch.`)) return;
     setBusy(true); setResult(null);
     try {
       const ids = [...selected];
-      const d = await outreachAPI("enqueue_leads", { ruleConfig, mode: "manual", selectedIds: ids, count: ids.length });
-      setResult({ ok: true, message: `Enqueued ${d.enqueued} lead${d.enqueued !== 1 ? "s" : ""} (${d.skippedDupes || 0} skipped — already in outreach).` });
+      // Step 1: enqueue
+      const eq = await outreachAPI("enqueue_leads", { ruleConfig, mode: "manual", selectedIds: ids, count: ids.length });
+      if (eq.error) { setResult({ error: eq.error }); setBusy(false); return; }
+      // Step 2: find the newly-enqueued items and immediately send
+      const q = await outreachAPI("list_queue", { campaign: ruleConfig.name });
+      const newItems = (q.items || []).filter(i => {
+        const f = i.fields || {};
+        return f.Mode === "manual" && f.Status === "queued";
+      }).slice(-eq.enqueued);
+      if (newItems.length === 0) {
+        setResult({ ok: true, message: `Enqueued ${eq.enqueued}, ${eq.skippedDupes || 0} skipped. Nothing to send.` });
+        await loadQueue();
+        setSelected(new Set());
+        setBusy(false);
+        return;
+      }
+      const sendRes = await outreachAPI("send_manual_connections", {
+        accountId: linkedinAccount.id,
+        outreachItemIds: newItems.map(i => i.id),
+        ruleConfig,
+      });
+      if (sendRes.error) setResult({ error: sendRes.error });
+      else setResult({ ok: true, message: `✅ Added ${eq.enqueued}, sent ${sendRes.sent} connection request${sendRes.sent!==1?"s":""}, ${sendRes.errors||0} error${sendRes.errors!==1?"s":""}. ${eq.skippedDupes||0} dupes skipped.`, details: sendRes.results });
       await loadQueue();
       setSelected(new Set());
     } catch (e) { setResult({ error: e.message }); }
@@ -1842,21 +1865,46 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
 
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginTop:16}}>
         <div onClick={async()=>{await loadQueue();setStep("select_new")}} style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,cursor:"pointer"}}>
-          <div style={{fontSize:20,marginBottom:8}}>👥</div>
-          <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:6}}>1. Add Leads to Queue</div>
-          <div style={{fontSize:10,color:"var(--t3)",lineHeight:1.5}}>Pick specific leads, then send them connection requests. Each lead tracked separately.</div>
+          <div style={{fontSize:20,marginBottom:8}}>📤</div>
+          <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:6}}>1. Send Connection Requests</div>
+          <div style={{fontSize:10,color:"var(--t3)",lineHeight:1.5}}>Pick leads, write a custom connection note, and send invites. Preview the DM sequence that will trigger after acceptance.</div>
         </div>
         <div onClick={async()=>{await loadQueue();setStep("review_queue")}} style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,cursor:"pointer"}}>
           <div style={{fontSize:20,marginBottom:8}}>📋</div>
-          <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:6}}>2. Review & Act on Queue</div>
-          <div style={{fontSize:10,color:"var(--t3)",lineHeight:1.5}}>See pending, sent requests, and accepted. Mark as connected or trigger DMs.</div>
+          <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:6}}>2. Review Queue & Trigger DMs</div>
+          <div style={{fontSize:10,color:"var(--t3)",lineHeight:1.5}}>Track sent requests, mark accepted ones as connected, then trigger your DM sequence to connected leads.</div>
         </div>
       </div>
     </div>)}
 
     {/* ─── SELECT NEW LEADS ─── */}
     {step==="select_new"&&(<div>
-      <div style={{fontSize:11,color:"var(--t3)",marginBottom:12}}>Pick leads to add to your manual outreach queue. Only leads with LinkedIn URLs and not already in outreach are shown.</div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:12}}>Pick leads and set your connection note. Only leads with LinkedIn URLs not already in outreach are shown.</div>
+
+      {/* Connection Message */}
+      <div className="ig">
+        <div className="il">Connection Note <span style={{fontWeight:400,textTransform:"none",color:"var(--t3)"}}>— sent with the invite. Merge fields: {"{first_name}"}, {"{company}"}, {"{title}"}</span></div>
+        <textarea className="inp" value={connectionMessage} onChange={e=>setConnectionMessage(e.target.value)} style={{minHeight:60}} maxLength={300} placeholder="Hey {first_name}, came across your profile and would love to connect."/>
+        <div style={{fontSize:9,color:connectionMessage.length>300?"var(--red)":"var(--t3)",marginTop:2}}>{connectionMessage.length}/300 chars · LinkedIn free-tier limit</div>
+      </div>
+
+      {/* DM Sequence Preview */}
+      {ruleConfig.dmSequence?.length > 0 ? (
+        <div style={{padding:12,background:"var(--hover)",borderRadius:8,marginBottom:14}}>
+          <div style={{fontSize:10,color:"var(--t2)",fontWeight:600,marginBottom:6}}>📨 DM Sequence (from "{rules.find(r=>r.id===selectedRule)?.fields?.Name}") — triggers after connection accepted:</div>
+          {ruleConfig.dmSequence.map((s, i) => (
+            <div key={i} style={{padding:"6px 0",borderBottom:i<ruleConfig.dmSequence.length-1?"1px solid var(--bdr)":"none"}}>
+              <div style={{fontSize:10,color:"var(--t3)",marginBottom:2}}>Step {i + 1}{s.daysAfterPrev ? ` · ${s.daysAfterPrev} day${s.daysAfterPrev!==1?"s":""} after previous` : i === 0 ? " · immediately after acceptance" : ""}{s.aiGenerate ? " · AI-personalized" : ""}</div>
+              <div style={{fontSize:10,color:"var(--t2)",lineHeight:1.4}}>{(s.message || "").slice(0, 120)}{(s.message||"").length > 120 ? "…" : ""}</div>
+            </div>
+          ))}
+          <div style={{fontSize:9,color:"var(--t3)",marginTop:8,fontStyle:"italic"}}>💡 You'll trigger DMs manually from Review Queue once LinkedIn shows the connection was accepted.</div>
+        </div>
+      ) : (
+        <div style={{padding:12,background:"var(--hover)",borderRadius:8,marginBottom:14,fontSize:11,color:"var(--t3)"}}>
+          ⚠️ No DM sequence configured. {selectedRule ? "This rule has no DMs set up." : "Pick a Task Rule on the previous screen to use its DM sequence, or you'll only send the connection request."}
+        </div>
+      )}
 
       <div style={{display:"flex",gap:8,marginBottom:12}}>
         <input className="inp" placeholder="Filter by company…" value={companyFilter} onChange={e=>setCompanyFilter(e.target.value)} style={{flex:1}}/>
@@ -1866,7 +1914,7 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
 
       <div style={{fontSize:10,color:"var(--t3)",marginBottom:8}}>{availableLeads.length} available · {selected.size} selected · 30 max per batch (safety cap)</div>
 
-      <div style={{maxHeight:360,overflowY:"auto",border:"1px solid var(--bdr)",borderRadius:8}}>
+      <div style={{maxHeight:280,overflowY:"auto",border:"1px solid var(--bdr)",borderRadius:8}}>
         {availableLeads.length === 0 ? <div style={{padding:40,textAlign:"center",color:"var(--t3)",fontSize:11}}>No available leads. Upload leads with LinkedIn URLs, or they're all in outreach already.</div> :
         <table><thead><tr><th style={{width:32}}></th><th>Name</th><th>Title</th><th>Company</th></tr></thead>
         <tbody>{availableLeads.slice(0, 200).map(l => { const f = l.fields || {}; const isSel = selected.has(l.id); return (
@@ -1965,7 +2013,7 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
     </div>
     <div className="modal-f">
       {step==="choose"&&<button className="btn" onClick={onClose}>Close</button>}
-      {step==="select_new"&&<><button className="btn" onClick={()=>setStep("choose")}>← Back</button><button className="btn btn-p" disabled={busy||selected.size===0} onClick={enqueueManual}>{busy?"⏳":`Add ${selected.size} to Queue`}</button></>}
+      {step==="select_new"&&<><button className="btn" onClick={()=>setStep("choose")}>← Back</button><button className="btn btn-p" disabled={busy||selected.size===0||!linkedinAccount} onClick={enqueueManual}>{busy?"⏳ Sending…":`Send ${selected.size} Connection Request${selected.size!==1?"s":""}`}</button></>}
       {step==="review_queue"&&<button className="btn" onClick={()=>setStep("choose")}>← Back</button>}
       {step==="send_connections"&&<><button className="btn" onClick={()=>setStep("review_queue")}>← Back</button><button className="btn btn-p" disabled={busy||selected.size===0||!linkedinAccount} onClick={sendConnections}>{busy?"⏳ Sending…":`Send ${selected.size} Connection Request${selected.size!==1?"s":""}`}</button></>}
       {step==="mark_connected"&&<><button className="btn" onClick={()=>setStep("review_queue")}>← Back</button><button className="btn btn-p" disabled={busy||selected.size===0} onClick={markConnected}>{busy?"⏳":`Mark ${selected.size} as Connected`}</button></>}
