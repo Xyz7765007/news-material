@@ -321,8 +321,22 @@ const SCHEMA = {
     { name: "Emoji", type: "singleLineText" },
     { name: "Tables", type: "multilineText" },
     { name: "HubSpot API Key", type: "singleLineText" },
+    { name: "Smartlead API Key", type: "singleLineText" },
+    { name: "Sender Profile", type: "multilineText" },
+    { name: "Email Reference", type: "multilineText" },
+    { name: "Email Purpose", type: "multilineText" },
+    { name: "Email CTA Link", type: "singleLineText" },
+    { name: "Email CTA Purpose", type: "multilineText" },
     { name: "Client Password", type: "singleLineText" },
     { name: "Client Access", type: "singleLineText" },
+  ],
+  "Email Offers": [
+    { name: "Name", type: "singleLineText" },
+    { name: "Offer Description", type: "multilineText" },
+    { name: "CTA Link", type: "singleLineText" },
+    { name: "CTA Purpose", type: "multilineText" },
+    { name: "Last Used At", type: "singleLineText" },
+    { name: "Use Count", type: "number", options: { precision: 0 } },
   ],
 };
 

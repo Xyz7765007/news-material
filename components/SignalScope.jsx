@@ -960,6 +960,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     {id:"tasks",label:"Tasks",count:tasks.length},
     null,
     {id:"outreach",label:"💬 LinkedIn Automation",count:null},
+    {id:"email_campaign",label:"📧 Email Campaign",count:null},
     {id:"hubspot",label:"🔗 HubSpot",count:null},
     {id:"post_demo",label:"🤖 Post-Demo Auto",count:null},
     ...(!clientMode ? [{id:"coming_soon",label:"🚀 Coming Soon",count:null}] : []),
@@ -1264,6 +1265,9 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     </div>)}
     </>)}
   </div>)}
+
+  {/* ════ EMAIL CAMPAIGN ════ */}
+  {tab==="email_campaign"&&!loading&&(<EmailCampaignTab baseId={bid} campaign={camp} leads={leads} />)}
 
   {/* ════ COMING SOON ════ */}
   {tab==="coming_soon"&&(<div>
@@ -1786,6 +1790,782 @@ function PushToHubSpotForm({ tasks, owners, onPush, loading, rules }) {
 // ═══════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════
 // MANUAL OUTREACH MODAL
+// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// EMAIL CAMPAIGN TAB — Sender Profile + Offers Library + AI Generation
+// ═══════════════════════════════════════════════════════════════
+function EmailCampaignTab({ baseId, campaign, leads }) {
+  const [step, setStep] = useState(1); // 1=leads, 2=context, 3=generate, 4=review, 5=smartlead, 6=launch
+  const [tags, setTags] = useState([]);
+  const [selectedTag, setSelectedTag] = useState("");
+  const [tagLeads, setTagLeads] = useState([]);
+  const [selectedLeadIds, setSelectedLeadIds] = useState(new Set());
+
+  // Sender Profile (one per campaign, on Campaigns master table)
+  const [senderProfile, setSenderProfile] = useState("");
+  const [senderEditing, setSenderEditing] = useState(false);
+  const [senderDraft, setSenderDraft] = useState("");
+  const [senderSaving, setSenderSaving] = useState(false);
+
+  // Offers library (per-campaign Email Offers table)
+  const [offers, setOffers] = useState([]);
+  const [selectedOfferId, setSelectedOfferId] = useState(null);
+  const [offerForm, setOfferForm] = useState({ name: "", offerDescription: "", ctaLink: "", ctaPurpose: "" });
+  const [showOfferModal, setShowOfferModal] = useState(false); // for creating/editing
+  const [offerModalMode, setOfferModalMode] = useState("create"); // create | edit
+  const [savingOffer, setSavingOffer] = useState(false);
+
+  // Advanced (collapsed by default)
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [referenceEmail, setReferenceEmail] = useState("");
+  const [factors, setFactors] = useState({ name: true, title: true, company: true, industry: true, signals: true, companySize: true, location: false, linkedin: false, bio: false });
+
+  // Sequence
+  const [sequenceLength, setSequenceLength] = useState(1);
+  const [delays] = useState([0, 3, 5, 7]);
+
+  // Generation
+  const [generating, setGenerating] = useState(false);
+  const [generated, setGenerated] = useState([]);
+  const [bulkFeedback, setBulkFeedback] = useState("");
+  const [perLeadFeedback, setPerLeadFeedback] = useState({});
+
+  // Smartlead
+  const [slKey, setSlKey] = useState("");
+  const [slMasked, setSlMasked] = useState("");
+  const slKeyRef = useRef("");
+  const [slCampaigns, setSlCampaigns] = useState([]);
+  const [slMailboxes, setSlMailboxes] = useState([]);
+  const [slMode, setSlMode] = useState("new");
+  const [slCampaignName, setSlCampaignName] = useState("");
+  const [slExistingCampaign, setSlExistingCampaign] = useState("");
+  const [slMailboxIds, setSlMailboxIds] = useState(new Set());
+  const [slSchedule, setSlSchedule] = useState({
+    timezone: "America/New_York",
+    days_of_the_week: [1,2,3,4,5],
+    start_hour: "09:00",
+    end_hour: "17:00",
+    min_time_btw_emails: 10,
+    max_new_leads_per_day: 20,
+  });
+  const [slSettings, setSlSettings] = useState({ stop_lead_settings: "REPLY_TO_AN_EMAIL", track_settings: ["DONT_TRACK_EMAIL_OPEN"], send_as_plain_text: false });
+  const [activateOnLaunch, setActivateOnLaunch] = useState(false);
+
+  const [launching, setLaunching] = useState(false);
+  const [launchResult, setLaunchResult] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const ec = async (action, data = {}) => {
+    const res = await fetch("/api/email-campaign", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, baseId, campaignId: campaign?.airtableId, ...data }),
+    });
+    return res.json();
+  };
+
+  // Load on mount: tags, sender profile, offers, smartlead key
+  useEffect(() => {
+    if (!baseId || !campaign?.airtableId) return;
+    (async () => {
+      try {
+        const [t, sp, os, k] = await Promise.all([
+          ec("list_campaign_tags"),
+          ec("get_sender_profile"),
+          ec("list_offers"),
+          ec("get_smartlead_key"),
+        ]);
+        setTags(t.tags || []);
+        setSenderProfile(sp.senderProfile || "");
+        setSenderDraft(sp.senderProfile || "");
+        setOffers(os.offers || []);
+        if (k.hasKey) { setSlMasked(k.masked || ""); if (k.rawKey) slKeyRef.current = k.rawKey; }
+      } catch (e) { console.error(e); }
+    })();
+  }, [baseId, campaign?.airtableId]);
+
+  const loadTagLeads = async (tag) => {
+    setBusy(true); setErr("");
+    try {
+      const r = await ec("list_leads_by_tag", { campaignTag: tag });
+      setTagLeads(r.leads || []);
+      setSelectedLeadIds(new Set((r.leads || []).map(l => l.id)));
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+
+  const saveSenderProfile = async () => {
+    if (!senderDraft.trim()) { setErr("Sender profile cannot be empty"); return; }
+    setSenderSaving(true); setErr("");
+    try {
+      const r = await ec("save_sender_profile", { senderProfile: senderDraft.trim() });
+      if (r.ok) { setSenderProfile(senderDraft.trim()); setSenderEditing(false); }
+      else setErr(r.error || "Save failed");
+    } catch (e) { setErr(e.message); }
+    setSenderSaving(false);
+  };
+
+  const openCreateOffer = () => {
+    setOfferForm({ name: "", offerDescription: "", ctaLink: "", ctaPurpose: "" });
+    setOfferModalMode("create");
+    setShowOfferModal(true);
+  };
+
+  const openEditOffer = (o) => {
+    const f = o.fields || {};
+    setOfferForm({
+      id: o.id,
+      name: f.Name || "",
+      offerDescription: f["Offer Description"] || "",
+      ctaLink: f["CTA Link"] || "",
+      ctaPurpose: f["CTA Purpose"] || "",
+    });
+    setOfferModalMode("edit");
+    setShowOfferModal(true);
+  };
+
+  const saveOffer = async () => {
+    if (!offerForm.name.trim()) { setErr("Offer name required"); return; }
+    if (!offerForm.offerDescription.trim()) { setErr("What this offers is required"); return; }
+    setSavingOffer(true); setErr("");
+    try {
+      const action = offerModalMode === "edit" ? "update_offer" : "save_offer";
+      const payload = offerModalMode === "edit"
+        ? { offerId: offerForm.id, name: offerForm.name, offerDescription: offerForm.offerDescription, ctaLink: offerForm.ctaLink, ctaPurpose: offerForm.ctaPurpose }
+        : offerForm;
+      const r = await ec(action, payload);
+      if (r.ok) {
+        const refresh = await ec("list_offers");
+        setOffers(refresh.offers || []);
+        setShowOfferModal(false);
+        // If create, auto-select the new offer
+        if (offerModalMode === "create") {
+          const newest = (refresh.offers || []).find(o => o.fields?.Name === offerForm.name);
+          if (newest) setSelectedOfferId(newest.id);
+        }
+      } else setErr(r.error || "Save failed");
+    } catch (e) { setErr(e.message); }
+    setSavingOffer(false);
+  };
+
+  const deleteOffer = async (offerId, name) => {
+    if (!confirm(`Delete offer "${name}"? This can't be undone.`)) return;
+    setBusy(true);
+    try {
+      await ec("delete_offer", { offerId });
+      const refresh = await ec("list_offers");
+      setOffers(refresh.offers || []);
+      if (selectedOfferId === offerId) setSelectedOfferId(null);
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+
+  // Get the active offer (for generating)
+  const activeOffer = offers.find(o => o.id === selectedOfferId);
+  const offerReady = !!activeOffer && !!senderProfile;
+
+  const generateAll = async () => {
+    if (selectedLeadIds.size === 0) { setErr("Select leads first"); return; }
+    if (!senderProfile) { setErr("Sender profile is required — set it in Step 2"); setStep(2); return; }
+    if (!activeOffer) { setErr("Pick or create an offer in Step 2"); setStep(2); return; }
+
+    setGenerating(true); setErr(""); setGenerated([]);
+    try {
+      const f = activeOffer.fields || {};
+      const config = {
+        senderProfile,
+        purpose: f["Offer Description"] || "",
+        ctaLink: f["CTA Link"] || "",
+        ctaPurpose: f["CTA Purpose"] || "",
+        referenceEmail: referenceEmail || "",
+        sequenceLength,
+      };
+      const r = await ec("generate_emails", {
+        leadIds: [...selectedLeadIds],
+        config,
+        factors,
+      });
+      if (r.error) { setErr(r.error); setGenerating(false); return; }
+      setGenerated(r.results || []);
+      // Mark offer as used
+      try { await ec("update_offer", { offerId: activeOffer.id, markUsed: true }); } catch {}
+      setStep(4);
+    } catch (e) { setErr(e.message); }
+    setGenerating(false);
+  };
+
+  const regenerateSingle = async (leadId) => {
+    const fb = perLeadFeedback[leadId] || "";
+    setBusy(true); setErr("");
+    try {
+      const f = activeOffer.fields || {};
+      const config = {
+        senderProfile,
+        purpose: f["Offer Description"] || "",
+        ctaLink: f["CTA Link"] || "",
+        ctaPurpose: f["CTA Purpose"] || "",
+        referenceEmail: referenceEmail || "",
+        sequenceLength,
+      };
+      const r = await ec("regenerate_email", { leadId, config, factors, feedback: fb });
+      if (r.ok) {
+        setGenerated(p => p.map(g => g.leadId === leadId ? r : g));
+        setPerLeadFeedback(p => ({ ...p, [leadId]: "" }));
+      } else setErr(r.error || "Regen failed");
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+
+  const regenerateAll = async () => {
+    if (!bulkFeedback.trim()) { setErr("Write some feedback first (e.g. 'make it shorter', 'less salesy')"); return; }
+    setGenerating(true); setErr("");
+    try {
+      const f = activeOffer.fields || {};
+      const config = {
+        senderProfile,
+        purpose: f["Offer Description"] || "",
+        ctaLink: f["CTA Link"] || "",
+        ctaPurpose: f["CTA Purpose"] || "",
+        referenceEmail: referenceEmail || "",
+        sequenceLength,
+      };
+      const out = [];
+      for (const g of generated) {
+        const r2 = await ec("regenerate_email", { leadId: g.leadId, config, factors, feedback: bulkFeedback });
+        out.push(r2.ok ? r2 : g);
+      }
+      setGenerated(out);
+      setBulkFeedback("");
+    } catch (e) { setErr(e.message); }
+    setGenerating(false);
+  };
+
+  const connectSmartlead = async () => {
+    if (!slKey) { setErr("Enter API key"); return; }
+    setBusy(true); setErr("");
+    try {
+      const r = await ec("save_smartlead_key", { apiKey: slKey });
+      if (r.ok) { slKeyRef.current = slKey; setSlMasked(r.masked); setSlKey(""); await loadSlData(); }
+      else setErr(r.error || "Failed");
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+
+  const loadSlData = async () => {
+    if (!slKeyRef.current) return;
+    setBusy(true);
+    try {
+      const [c, a] = await Promise.all([
+        ec("list_smartlead_campaigns", { apiKey: slKeyRef.current }),
+        ec("list_smartlead_email_accounts", { apiKey: slKeyRef.current }),
+      ]);
+      setSlCampaigns(c.campaigns || []);
+      setSlMailboxes(a.accounts || []);
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+
+  useEffect(() => { if (slKeyRef.current && step === 5) loadSlData(); }, [step]);
+
+  const launchCampaign = async () => {
+    const validEmails = generated.filter(g => g.ok && g.email);
+    if (validEmails.length === 0) { setErr("No valid emails to launch"); return; }
+    if (slMode === "new" && !slCampaignName) { setErr("Campaign name required"); return; }
+    if (slMode === "new" && slMailboxIds.size === 0) { setErr("Pick at least one mailbox"); return; }
+    if (!confirm(`Launch ${validEmails.length} emails via Smartlead?\n\nMode: ${slMode === "new" ? `New campaign "${slCampaignName}"` : "Add to existing"}\nMailboxes: ${slMailboxIds.size}\nSequence: ${sequenceLength} step${sequenceLength!==1?"s":""}\n${activateOnLaunch ? "⚠️ Will ACTIVATE & start sending" : "Will create as DRAFT"}`)) return;
+
+    setLaunching(true); setErr(""); setLaunchResult(null);
+    try {
+      const r = await ec("launch_smartlead_campaign", {
+        apiKey: slKeyRef.current,
+        mode: slMode,
+        existingCampaignId: slMode === "existing" ? slExistingCampaign : null,
+        campaignName: slCampaignName,
+        emailAccountIds: [...slMailboxIds],
+        schedule: slSchedule,
+        settings: slSettings,
+        generatedEmails: validEmails,
+        sequenceConfig: { length: sequenceLength, delays },
+        activate: activateOnLaunch,
+      });
+      setLaunchResult(r);
+      if (r.ok) setStep(6);
+      else setErr(r.error || "Launch failed");
+    } catch (e) { setErr(e.message); }
+    setLaunching(false);
+  };
+
+  const toggleLead = (id) => setSelectedLeadIds(p => { const n = new Set(p); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+  const toggleMailbox = (id) => setSlMailboxIds(p => { const n = new Set(p); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+
+  const stepLabels = ["Pick Leads", "Set Context", "Generate", "Review", "Smartlead", "Launch"];
+
+  // Step 2 readiness check — must have sender profile + offer selected
+  const canAdvanceFromStep2 = !!senderProfile && !!selectedOfferId;
+
+  return (<div>
+    <div className="ph"><div><div className="pt">📧 Email Campaign</div><div className="pd">AI-personalized cold email campaigns via Smartlead</div></div></div>
+
+    {/* Step indicator */}
+    <div style={{display:"flex",gap:4,marginBottom:24,padding:12,background:"var(--card)",borderRadius:10}}>
+      {stepLabels.map((label, i) => {
+        const num = i + 1;
+        const isActive = step === num;
+        const isDone = step > num;
+        return (
+          <div key={i} style={{flex:1,padding:"8px 10px",borderRadius:6,background:isActive?"var(--acc-d)":isDone?"var(--grn-d)":"var(--hover)",cursor:isDone?"pointer":"default"}} onClick={()=>{if(isDone)setStep(num)}}>
+            <div style={{fontSize:9,color:isActive?"var(--acc)":isDone?"var(--grn)":"var(--t3)",fontWeight:600}}>{isDone?"✓":num}. {label}</div>
+          </div>
+        );
+      })}
+    </div>
+
+    {err && <div style={{padding:"10px 14px",background:"var(--red-d)",color:"var(--red)",borderRadius:8,marginBottom:16,fontSize:11,whiteSpace:"pre-wrap"}}>{err}</div>}
+
+    {/* ───────────────── STEP 1: PICK LEADS ───────────────── */}
+    {step===1 && (<div>
+      <div style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,marginBottom:16}}>
+        <div style={{fontSize:13,fontWeight:600,marginBottom:6}}>👋 Welcome — let's send some emails</div>
+        <div style={{fontSize:11,color:"var(--t2)",lineHeight:1.6}}>This wizard takes you through 6 steps. First, pick which group of leads to email — these are your imported lead lists tagged by Campaign Tag (set when you uploaded the CSV).</div>
+      </div>
+
+      <div style={{fontSize:12,fontWeight:600,marginBottom:8,color:"var(--t1)"}}>Step 1 · Which list do you want to email?</div>
+      {tags.length === 0 ? (
+        <div className="empty"><div className="em">📭</div><p>No campaign tags found. Upload leads from the Leads tab first — make sure to add a Campaign Tag while importing.</p></div>
+      ) : (
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(200px,1fr))",gap:10,marginBottom:20}}>
+          {tags.map(t => (
+            <div key={t.tag} onClick={()=>{setSelectedTag(t.tag);loadTagLeads(t.tag)}} style={{padding:"14px 16px",border:"1px solid "+(selectedTag===t.tag?"var(--acc)":"var(--bdr)"),background:selectedTag===t.tag?"var(--acc-d)":"var(--card)",borderRadius:8,cursor:"pointer"}}>
+              <div style={{fontSize:13,fontWeight:600,color:selectedTag===t.tag?"var(--acc)":"var(--t1)"}}>{t.tag}</div>
+              <div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>{t.count} lead{t.count!==1?"s":""}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {tagLeads.length > 0 && (<div>
+        <div style={{padding:10,background:"var(--hover)",borderRadius:6,marginBottom:10,fontSize:11,color:"var(--t2)"}}>
+          ✓ Loaded <strong>{tagLeads.length} leads</strong> with email addresses · {selectedLeadIds.size} selected · uncheck any you want to skip
+        </div>
+        <div style={{display:"flex",gap:8,marginBottom:8}}>
+          <button className="btn btn-s" onClick={()=>setSelectedLeadIds(new Set(tagLeads.map(l=>l.id)))}>Select All</button>
+          <button className="btn btn-s" onClick={()=>setSelectedLeadIds(new Set())}>Clear</button>
+        </div>
+        <div style={{maxHeight:300,overflowY:"auto",border:"1px solid var(--bdr)",borderRadius:8,marginBottom:16}}>
+          <table><thead><tr><th style={{width:32}}></th><th>Name</th><th>Email</th><th>Title</th><th>Company</th></tr></thead>
+          <tbody>{tagLeads.slice(0,500).map(l=>{const f=l.fields||{};const sel=selectedLeadIds.has(l.id);return (<tr key={l.id} onClick={()=>toggleLead(l.id)} style={{cursor:"pointer",background:sel?"var(--acc-d)":""}}>
+            <td><input type="checkbox" checked={sel} onChange={()=>toggleLead(l.id)} onClick={e=>e.stopPropagation()}/></td>
+            <td style={{color:"var(--t1)"}}>{f.Name}</td><td style={{fontSize:10,color:"var(--blu)"}}>{f.Email}</td><td style={{fontSize:10}}>{f.Title}</td><td style={{fontSize:10}}>{f.Company}</td>
+          </tr>);})}</tbody></table>
+        </div>
+        <button className="btn btn-p" disabled={selectedLeadIds.size===0} onClick={()=>setStep(2)}>Next: Set Context →</button>
+      </div>)}
+    </div>)}
+
+    {/* ───────────────── STEP 2: CONTEXT (Sender + Offer) ───────────────── */}
+    {step===2 && (<div>
+      <div style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,marginBottom:16}}>
+        <div style={{fontSize:13,fontWeight:600,marginBottom:6}}>📝 Set the email context</div>
+        <div style={{fontSize:11,color:"var(--t2)",lineHeight:1.6}}>Two things are needed: <strong>who you are</strong> (set once, reused forever) and <strong>what this campaign offers</strong> (pick a saved offer or create a new one). The AI uses both to personalize emails.</div>
+      </div>
+
+      {/* ──────── SENDER PROFILE ──────── */}
+      <div style={{padding:16,background:senderProfile?"var(--card)":"var(--amb-d)",border:"1px solid "+(senderProfile?"var(--bdr)":"rgba(212,165,89,.4)"),borderRadius:10,marginBottom:14}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+          <div>
+            <div style={{fontSize:12,fontWeight:600,color:senderProfile?"var(--t1)":"var(--amb)"}}>👤 Who you are</div>
+            <div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>One sentence about your company. Set once per campaign — the AI uses this in every email.</div>
+          </div>
+          {senderProfile && !senderEditing && (
+            <button className="btn btn-s" onClick={()=>{setSenderEditing(true);setSenderDraft(senderProfile)}}>✏️ Edit</button>
+          )}
+        </div>
+
+        {!senderProfile && !senderEditing && (
+          <div>
+            <div style={{padding:10,background:"var(--card)",borderRadius:6,fontSize:11,color:"var(--t3)",fontStyle:"italic",marginBottom:8}}>
+              <strong>Example:</strong> "Side Kick — AI-powered SDR infrastructure for B2B SaaS founders who want pipeline without hiring SDRs"
+            </div>
+            <textarea className="inp" value={senderDraft} onChange={e=>setSenderDraft(e.target.value)} placeholder="e.g. Volopay — corporate cards built for field-based businesses (construction, logistics, facilities)" style={{minHeight:60}}/>
+            <button className="btn btn-p btn-s" disabled={senderSaving||!senderDraft.trim()} onClick={saveSenderProfile} style={{marginTop:8}}>{senderSaving?"⏳ Saving…":"💾 Save Sender Profile"}</button>
+          </div>
+        )}
+
+        {senderProfile && !senderEditing && (
+          <div style={{padding:10,background:"var(--hover)",borderRadius:6,fontSize:11,color:"var(--t1)",lineHeight:1.5}}>
+            ✓ {senderProfile}
+          </div>
+        )}
+
+        {senderEditing && (
+          <div>
+            <textarea className="inp" value={senderDraft} onChange={e=>setSenderDraft(e.target.value)} style={{minHeight:60}}/>
+            <div style={{display:"flex",gap:6,marginTop:8}}>
+              <button className="btn btn-p btn-s" disabled={senderSaving} onClick={saveSenderProfile}>{senderSaving?"⏳":"💾 Save"}</button>
+              <button className="btn btn-s" onClick={()=>{setSenderEditing(false);setSenderDraft(senderProfile)}}>Cancel</button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ──────── OFFER LIBRARY ──────── */}
+      <div style={{padding:16,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginBottom:14}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+          <div>
+            <div style={{fontSize:12,fontWeight:600,color:"var(--t1)"}}>🎯 Pick a campaign offer</div>
+            <div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>What you're pitching with this email batch. Reusable — saved offers can be picked instantly next time.</div>
+          </div>
+          <button className="btn btn-p btn-s" onClick={openCreateOffer}>+ New Offer</button>
+        </div>
+
+        {offers.length === 0 ? (
+          <div style={{padding:14,background:"var(--hover)",borderRadius:8,textAlign:"center"}}>
+            <div style={{fontSize:11,color:"var(--t2)",marginBottom:8}}>No offers saved yet. Create your first one — it'll be saved for future use.</div>
+            <button className="btn btn-p btn-s" onClick={openCreateOffer}>+ Create First Offer</button>
+          </div>
+        ) : (
+          <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:8}}>
+            {offers.map(o => {
+              const f = o.fields || {};
+              const isSelected = selectedOfferId === o.id;
+              return (
+                <div key={o.id} style={{position:"relative",border:"1px solid "+(isSelected?"var(--acc)":"var(--bdr)"),background:isSelected?"var(--acc-d)":"var(--hover)",borderRadius:8,padding:"8px 12px",cursor:"pointer",minWidth:140,maxWidth:200}} onClick={()=>setSelectedOfferId(o.id)}>
+                  <div style={{fontSize:11,fontWeight:600,color:isSelected?"var(--acc)":"var(--t1)",marginBottom:2}}>{f.Name || "Untitled"}</div>
+                  <div style={{fontSize:9,color:"var(--t3)",lineHeight:1.4,maxHeight:30,overflow:"hidden"}}>{(f["Offer Description"] || "").slice(0,60)}{(f["Offer Description"]||"").length>60?"…":""}</div>
+                  <div style={{display:"flex",gap:4,marginTop:6,opacity:isSelected?1:0.6}}>
+                    <button className="btn btn-s" style={{fontSize:9,padding:"2px 6px"}} onClick={e=>{e.stopPropagation();openEditOffer(o)}}>✏️</button>
+                    <button className="btn btn-s" style={{fontSize:9,padding:"2px 6px"}} onClick={e=>{e.stopPropagation();deleteOffer(o.id, f.Name)}}>🗑️</button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {activeOffer && (
+          <div style={{marginTop:10,padding:12,background:"var(--hover)",borderRadius:8}}>
+            <div style={{fontSize:10,color:"var(--acc)",fontWeight:600,marginBottom:4}}>USING: {activeOffer.fields?.Name}</div>
+            <div style={{fontSize:11,color:"var(--t1)",lineHeight:1.5,marginBottom:6}}>{activeOffer.fields?.["Offer Description"]}</div>
+            <div style={{fontSize:10,color:"var(--t2)"}}>CTA: <a href={activeOffer.fields?.["CTA Link"]} target="_blank" rel="noopener" style={{color:"var(--blu)"}}>{activeOffer.fields?.["CTA Link"]}</a> — {activeOffer.fields?.["CTA Purpose"]}</div>
+          </div>
+        )}
+      </div>
+
+      {/* ──────── SEQUENCE LENGTH ──────── */}
+      <div style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,marginBottom:14}}>
+        <div style={{fontSize:12,fontWeight:600,marginBottom:6}}>📨 Sequence length</div>
+        <div style={{fontSize:10,color:"var(--t3)",marginBottom:8}}>1 = single email · 2-4 = initial + follow-ups generated together (each follow-up references previous)</div>
+        <div style={{display:"flex",gap:6}}>
+          {[1,2,3,4].map(n => (
+            <button key={n} className={"btn btn-s"+(sequenceLength===n?" btn-p":"")} onClick={()=>setSequenceLength(n)}>{n} email{n!==1?"s":""}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* ──────── ADVANCED (collapsed) ──────── */}
+      <div style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,marginBottom:16}}>
+        <div onClick={()=>setShowAdvanced(!showAdvanced)} style={{cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div>
+            <div style={{fontSize:11,fontWeight:600,color:"var(--t1)"}}>{showAdvanced?"▾":"▸"} Advanced (optional)</div>
+            <div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>Reference email & personalization factor controls — most users can skip</div>
+          </div>
+        </div>
+        {showAdvanced && (
+          <div style={{marginTop:14,paddingTop:14,borderTop:"1px solid var(--bdr)"}}>
+            <div className="ig">
+              <div className="il">Reference Email <span style={{fontWeight:400,textTransform:"none",color:"var(--t3)"}}>— optional, AI matches its tone/structure</span></div>
+              <textarea className="inp" value={referenceEmail} onChange={e=>setReferenceEmail(e.target.value)} style={{minHeight:80}} placeholder="Paste a past email that worked well — leave blank if you don't have one"/>
+            </div>
+            <div className="ig">
+              <div className="il">Personalization Factors <span style={{fontWeight:400,textTransform:"none",color:"var(--t3)"}}>— what AI uses about each lead</span></div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))",gap:6,padding:10,background:"var(--hover)",borderRadius:6}}>
+                {Object.keys(factors).map(k => (
+                  <label key={k} style={{display:"flex",alignItems:"center",gap:6,fontSize:11,cursor:"pointer"}}>
+                    <input type="checkbox" checked={factors[k]} onChange={e=>setFactors(p=>({...p,[k]:e.target.checked}))}/>
+                    <span style={{color:factors[k]?"var(--t1)":"var(--t3)"}}>{k.replace(/([A-Z])/g," $1").toLowerCase()}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div style={{display:"flex",gap:8}}>
+        <button className="btn" onClick={()=>setStep(1)}>← Back</button>
+        <button className="btn btn-p" disabled={!canAdvanceFromStep2} onClick={()=>setStep(3)}>{!canAdvanceFromStep2?(senderProfile?"Pick or create an offer ↑":"Set sender profile ↑"):"Next: Generate →"}</button>
+      </div>
+    </div>)}
+
+    {/* ───────────────── STEP 3: GENERATE (confirmation) ───────────────── */}
+    {step===3 && (<div>
+      <div style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,marginBottom:16}}>
+        <div style={{fontSize:13,fontWeight:600,marginBottom:6}}>✨ Ready to generate</div>
+        <div style={{fontSize:11,color:"var(--t2)",lineHeight:1.6}}>Claude (Sonnet 4.6) will write {sequenceLength === 1 ? "one personalized email" : `${sequenceLength} emails (initial + ${sequenceLength - 1} follow-ups)`} for each lead, using the sender profile and offer you set. Takes about {Math.ceil(selectedLeadIds.size * 2 / 60)} minute{Math.ceil(selectedLeadIds.size * 2 / 60)!==1?"s":""}.</div>
+      </div>
+
+      <div style={{padding:16,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginBottom:16}}>
+        <div style={{fontSize:11,marginBottom:8}}><strong style={{color:"var(--t3)"}}>List:</strong> {selectedTag} · {selectedLeadIds.size} leads</div>
+        <div style={{fontSize:11,marginBottom:8}}><strong style={{color:"var(--t3)"}}>Sender:</strong> {senderProfile.slice(0,80)}{senderProfile.length>80?"…":""}</div>
+        <div style={{fontSize:11,marginBottom:8}}><strong style={{color:"var(--t3)"}}>Offer:</strong> {activeOffer?.fields?.Name}</div>
+        <div style={{fontSize:11,marginBottom:8}}><strong style={{color:"var(--t3)"}}>Sequence:</strong> {sequenceLength} email{sequenceLength!==1?"s":""}</div>
+        <div style={{fontSize:11}}><strong style={{color:"var(--t3)"}}>Personalization:</strong> {Object.keys(factors).filter(k=>factors[k]).join(", ")}</div>
+      </div>
+
+      <div style={{display:"flex",gap:8}}>
+        <button className="btn" onClick={()=>setStep(2)}>← Back</button>
+        <button className="btn btn-p" disabled={generating} onClick={generateAll}>{generating?`⏳ Generating ${selectedLeadIds.size} email${selectedLeadIds.size!==1?"s":""}…`:`✨ Generate ${selectedLeadIds.size} email${selectedLeadIds.size!==1?"s":""}`}</button>
+      </div>
+    </div>)}
+
+    {/* ───────────────── STEP 4: REVIEW ───────────────── */}
+    {step===4 && (<div>
+      <div style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,marginBottom:16}}>
+        <div style={{fontSize:13,fontWeight:600,marginBottom:6}}>👀 Review the emails</div>
+        <div style={{fontSize:11,color:"var(--t2)",lineHeight:1.6}}>Each lead got a personalized email. To improve all of them at once, write feedback below and click Regenerate All. To improve just one, use the per-lead feedback box.</div>
+      </div>
+
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+        <div style={{fontSize:11,color:"var(--t2)"}}>{generated.filter(g=>g.ok).length}/{generated.length} successful</div>
+      </div>
+
+      {/* Bulk regen */}
+      <div style={{padding:12,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,marginBottom:16}}>
+        <div style={{fontSize:11,fontWeight:600,marginBottom:6}}>🔄 Improve all emails with feedback</div>
+        <div style={{display:"flex",gap:8}}>
+          <input className="inp" placeholder="e.g. make them shorter, less salesy, mention their funding round…" value={bulkFeedback} onChange={e=>setBulkFeedback(e.target.value)} style={{flex:1}}/>
+          <button className="btn btn-s" disabled={generating||!bulkFeedback} onClick={regenerateAll}>{generating?"⏳":"Regenerate All"}</button>
+        </div>
+      </div>
+
+      <div style={{maxHeight:500,overflowY:"auto",display:"flex",flexDirection:"column",gap:10,marginBottom:16}}>
+        {generated.map(g => (
+          <div key={g.leadId} style={{padding:14,background:"var(--card)",border:"1px solid "+(g.ok?"var(--bdr)":"rgba(196,92,92,.4)"),borderRadius:8}}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
+              <div>
+                <div style={{fontSize:12,fontWeight:600,color:"var(--t1)"}}>{g.name}</div>
+                <div style={{fontSize:10,color:"var(--t3)"}}>{g.email} · {g.title} @ {g.company}</div>
+              </div>
+              {!g.ok && <span style={{fontSize:10,color:"var(--red)"}}>❌ {g.error}</span>}
+            </div>
+            {g.ok && g.emails && g.emails.map((e, i) => (
+              <div key={i} style={{padding:10,background:"var(--hover)",borderRadius:6,marginBottom:6}}>
+                {g.emails.length > 1 && <div style={{fontSize:9,color:"var(--acc)",fontWeight:600,marginBottom:4}}>{i===0?"INITIAL":`FOLLOW-UP ${i}`} {i>0&&`· Day ${delays.slice(1,i+1).reduce((a,b)=>a+b,0)}`}</div>}
+                <div style={{fontSize:11,fontWeight:600,marginBottom:4}}>Subject: {e.subject}</div>
+                <div style={{fontSize:11,color:"var(--t2)",whiteSpace:"pre-wrap",lineHeight:1.5}}>{e.body}</div>
+              </div>
+            ))}
+            {g.ok && (
+              <div style={{display:"flex",gap:6,marginTop:8}}>
+                <input className="inp" placeholder="Feedback for just this lead's email…" value={perLeadFeedback[g.leadId]||""} onChange={e=>setPerLeadFeedback(p=>({...p,[g.leadId]:e.target.value}))} style={{flex:1,fontSize:10}}/>
+                <button className="btn btn-s" disabled={busy} onClick={()=>regenerateSingle(g.leadId)}>{busy?"⏳":"🔄"}</button>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      <div style={{display:"flex",gap:8}}>
+        <button className="btn" onClick={()=>setStep(3)}>← Back</button>
+        <button className="btn btn-p" disabled={generated.filter(g=>g.ok).length===0} onClick={()=>setStep(5)}>Approve {generated.filter(g=>g.ok).length} & Continue →</button>
+      </div>
+    </div>)}
+
+    {/* ───────────────── STEP 5: SMARTLEAD ───────────────── */}
+    {step===5 && (<div>
+      <div style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,marginBottom:16}}>
+        <div style={{fontSize:13,fontWeight:600,marginBottom:6}}>📤 Smartlead Setup</div>
+        <div style={{fontSize:11,color:"var(--t2)",lineHeight:1.6}}>Smartlead handles the actual sending — mailbox rotation, scheduling, deliverability. Connect once and it's saved for future campaigns.</div>
+      </div>
+
+      {!slMasked ? (
+        <div style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,marginBottom:16}}>
+          <div style={{fontSize:12,fontWeight:600,marginBottom:8}}>1. Connect Smartlead</div>
+          <div style={{fontSize:11,marginBottom:8,color:"var(--t3)"}}>Get your API key from <a href="https://app.smartlead.ai/app/settings/profile" target="_blank" rel="noopener" style={{color:"var(--blu)"}}>app.smartlead.ai/app/settings/profile</a></div>
+          <div style={{display:"flex",gap:8}}>
+            <input className="inp" type="password" placeholder="Paste Smartlead API key" value={slKey} onChange={e=>setSlKey(e.target.value)} style={{flex:1}}/>
+            <button className="btn btn-p btn-s" disabled={busy||!slKey} onClick={connectSmartlead}>{busy?"⏳":"Connect"}</button>
+          </div>
+        </div>
+      ) : (
+        <div style={{padding:10,background:"var(--grn-d)",color:"var(--grn)",borderRadius:8,marginBottom:16,fontSize:11,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <span>✅ Smartlead connected: {slMasked}</span>
+          <button className="btn btn-s" onClick={loadSlData} disabled={busy}>{busy?"⏳":"↻ Refresh"}</button>
+        </div>
+      )}
+
+      {slMasked && (<div>
+        {/* Mode */}
+        <div style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,marginBottom:14}}>
+          <div style={{fontSize:11,fontWeight:600,marginBottom:6}}>2. Campaign Mode</div>
+          <div style={{fontSize:10,color:"var(--t3)",marginBottom:8}}>Create a brand new Smartlead campaign or add these leads to one that already exists</div>
+          <div style={{display:"flex",gap:8,marginBottom:10}}>
+            <button className={"btn btn-s"+(slMode==="new"?" btn-p":"")} onClick={()=>setSlMode("new")}>➕ Create New</button>
+            <button className={"btn btn-s"+(slMode==="existing"?" btn-p":"")} onClick={()=>setSlMode("existing")}>📂 Add to Existing</button>
+          </div>
+
+          {slMode === "new" ? (
+            <input className="inp" placeholder="Campaign name (e.g. Q2 Construction Outreach)" value={slCampaignName} onChange={e=>setSlCampaignName(e.target.value)}/>
+          ) : (
+            <select className="inp" value={slExistingCampaign} onChange={e=>setSlExistingCampaign(e.target.value)}>
+              <option value="">Pick a Smartlead campaign…</option>
+              {slCampaigns.map(c => <option key={c.id} value={c.id}>{c.name} ({c.status})</option>)}
+            </select>
+          )}
+        </div>
+
+        {slMode === "new" && (<>
+          {/* Mailboxes */}
+          <div style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,marginBottom:14}}>
+            <div style={{fontSize:11,fontWeight:600,marginBottom:6}}>3. Pick Mailboxes ({slMailboxIds.size} selected)</div>
+            <div style={{fontSize:10,color:"var(--t3)",marginBottom:8}}>These email accounts will rotate sending. Pick warmed-up accounts only.</div>
+            <div style={{maxHeight:160,overflowY:"auto",display:"flex",flexDirection:"column",gap:4}}>
+              {slMailboxes.map(m => (
+                <label key={m.id} style={{display:"flex",alignItems:"center",gap:8,padding:6,borderRadius:4,background:slMailboxIds.has(m.id)?"var(--acc-d)":"transparent",cursor:"pointer"}}>
+                  <input type="checkbox" checked={slMailboxIds.has(m.id)} onChange={()=>toggleMailbox(m.id)}/>
+                  <span style={{fontSize:11,flex:1}}>{m.from_email || m.from_name || m.email} <span style={{color:"var(--t3)",fontSize:9}}>· {m.warmup_details?.status || ""}</span></span>
+                </label>
+              ))}
+              {slMailboxes.length === 0 && <div style={{fontSize:10,color:"var(--t3)"}}>No mailboxes found in Smartlead — add some at app.smartlead.ai first</div>}
+            </div>
+          </div>
+
+          {/* Schedule */}
+          <div style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,marginBottom:14}}>
+            <div style={{fontSize:11,fontWeight:600,marginBottom:6}}>4. Schedule</div>
+            <div style={{fontSize:10,color:"var(--t3)",marginBottom:8}}>When and how fast Smartlead will send. Defaults are safe.</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
+              <div>
+                <div style={{fontSize:10,color:"var(--t3)",marginBottom:2}}>Timezone</div>
+                <select className="inp" value={slSchedule.timezone} onChange={e=>setSlSchedule(p=>({...p,timezone:e.target.value}))}>
+                  <option value="America/New_York">ET (New York)</option>
+                  <option value="America/Los_Angeles">PT (Los Angeles)</option>
+                  <option value="America/Chicago">CT (Chicago)</option>
+                  <option value="Europe/London">UK</option>
+                  <option value="Asia/Kolkata">IST</option>
+                </select>
+              </div>
+              <div>
+                <div style={{fontSize:10,color:"var(--t3)",marginBottom:2}}>Days/Week</div>
+                <select className="inp" value={slSchedule.days_of_the_week.join(",")} onChange={e=>setSlSchedule(p=>({...p,days_of_the_week:e.target.value.split(",").map(Number)}))}>
+                  <option value="1,2,3,4,5">Mon-Fri</option>
+                  <option value="0,1,2,3,4,5,6">All days</option>
+                  <option value="1,2,3,4">Mon-Thu</option>
+                </select>
+              </div>
+              <div>
+                <div style={{fontSize:10,color:"var(--t3)",marginBottom:2}}>Start hour</div>
+                <input className="inp" type="time" value={slSchedule.start_hour} onChange={e=>setSlSchedule(p=>({...p,start_hour:e.target.value}))}/>
+              </div>
+              <div>
+                <div style={{fontSize:10,color:"var(--t3)",marginBottom:2}}>End hour</div>
+                <input className="inp" type="time" value={slSchedule.end_hour} onChange={e=>setSlSchedule(p=>({...p,end_hour:e.target.value}))}/>
+              </div>
+              <div>
+                <div style={{fontSize:10,color:"var(--t3)",marginBottom:2}}>Min minutes between emails (per mailbox)</div>
+                <input className="inp" type="number" value={slSchedule.min_time_btw_emails} onChange={e=>setSlSchedule(p=>({...p,min_time_btw_emails:parseInt(e.target.value)||10}))}/>
+              </div>
+              <div>
+                <div style={{fontSize:10,color:"var(--t3)",marginBottom:2}}>Max new leads/day (per mailbox)</div>
+                <input className="inp" type="number" value={slSchedule.max_new_leads_per_day} onChange={e=>setSlSchedule(p=>({...p,max_new_leads_per_day:parseInt(e.target.value)||20}))}/>
+              </div>
+            </div>
+          </div>
+
+          {/* Settings */}
+          <div style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,marginBottom:14}}>
+            <div style={{fontSize:11,fontWeight:600,marginBottom:6}}>5. Tracking & Behavior</div>
+            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:11,cursor:"pointer",marginBottom:6}}>
+              <input type="checkbox" checked={slSettings.stop_lead_settings === "REPLY_TO_AN_EMAIL"} onChange={e=>setSlSettings(p=>({...p,stop_lead_settings:e.target.checked?"REPLY_TO_AN_EMAIL":"CLICK_ON_A_LINK"}))}/>
+              Stop sequence when lead replies (recommended)
+            </label>
+            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:11,cursor:"pointer",marginBottom:6}}>
+              <input type="checkbox" checked={!slSettings.track_settings.includes("DONT_TRACK_EMAIL_OPEN")} onChange={e=>setSlSettings(p=>({...p,track_settings:e.target.checked?[]:["DONT_TRACK_EMAIL_OPEN"]}))}/>
+              Track opens (may hurt deliverability)
+            </label>
+            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:11,cursor:"pointer"}}>
+              <input type="checkbox" checked={slSettings.send_as_plain_text} onChange={e=>setSlSettings(p=>({...p,send_as_plain_text:e.target.checked}))}/>
+              Send as plain text (better deliverability)
+            </label>
+          </div>
+        </>)}
+
+        {/* Activate */}
+        <div style={{padding:14,background:activateOnLaunch?"var(--grn-d)":"var(--card)",border:"1px solid "+(activateOnLaunch?"rgba(93,168,122,.4)":"var(--bdr)"),borderRadius:8,marginBottom:14}}>
+          <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,cursor:"pointer"}}>
+            <input type="checkbox" checked={activateOnLaunch} onChange={e=>setActivateOnLaunch(e.target.checked)}/>
+            <strong style={{color:activateOnLaunch?"var(--grn)":"var(--t1)"}}>Activate immediately</strong>
+          </label>
+          <div style={{fontSize:10,color:"var(--t3)",marginTop:4,marginLeft:24}}>{activateOnLaunch ? "⚠️ Emails will start sending right away per your schedule" : "Will create as DRAFT — review in Smartlead before activating"}</div>
+        </div>
+      </div>)}
+
+      <div style={{display:"flex",gap:8}}>
+        <button className="btn" onClick={()=>setStep(4)}>← Back</button>
+        <button className="btn btn-p" disabled={launching||!slMasked||(slMode==="new"&&(!slCampaignName||slMailboxIds.size===0))||(slMode==="existing"&&!slExistingCampaign)} onClick={launchCampaign}>{launching?"⏳ Launching…":`🚀 Launch ${generated.filter(g=>g.ok).length} email${generated.filter(g=>g.ok).length!==1?"s":""}`}</button>
+      </div>
+    </div>)}
+
+    {/* ───────────────── STEP 6: RESULT ───────────────── */}
+    {step===6 && launchResult && (<div>
+      <div style={{padding:20,background:launchResult.ok?"var(--grn-d)":"var(--red-d)",border:"1px solid "+(launchResult.ok?"rgba(93,168,122,.4)":"rgba(196,92,92,.4)"),borderRadius:10,marginBottom:16}}>
+        <div style={{fontSize:18,fontWeight:700,color:launchResult.ok?"var(--grn)":"var(--red)",marginBottom:8}}>{launchResult.ok ? "🚀 Campaign launched!" : "❌ Launch failed"}</div>
+        {launchResult.ok && (<>
+          <div style={{fontSize:12,color:"var(--t1)",marginBottom:4}}>Smartlead campaign ID: <span style={{fontFamily:"'JetBrains Mono',monospace"}}>{launchResult.smartleadCampaignId}</span></div>
+          <div style={{fontSize:12,color:"var(--t1)",marginBottom:8}}>Added {launchResult.added} leads {launchResult.skipped > 0 && `(${launchResult.skipped} skipped)`}</div>
+          {launchResult.smartleadUrl && <a href={launchResult.smartleadUrl} target="_blank" rel="noopener" style={{color:"var(--blu)",fontSize:12}}>→ Open in Smartlead</a>}
+        </>)}
+      </div>
+      {launchResult.log && (
+        <div style={{padding:12,background:"var(--card)",borderRadius:8,marginBottom:16}}>
+          <div style={{fontSize:10,fontWeight:600,color:"var(--t2)",marginBottom:6}}>Launch Log</div>
+          {launchResult.log.map((l,i)=><div key={i} style={{fontSize:10,color:"var(--t2)",fontFamily:"'JetBrains Mono',monospace",lineHeight:1.6}}>{l}</div>)}
+        </div>
+      )}
+      <button className="btn" onClick={()=>{setStep(1);setGenerated([]);setSelectedTag("");setLaunchResult(null);}}>+ New Email Campaign</button>
+    </div>)}
+
+    {/* ───────────────── OFFER MODAL ───────────────── */}
+    {showOfferModal && (
+      <div className="modal-o" onClick={e=>e.target===e.currentTarget&&setShowOfferModal(false)}>
+        <div className="modal" style={{maxWidth:600}}>
+          <div className="modal-h"><div style={{fontSize:14,fontWeight:600}}>{offerModalMode==="edit"?"✏️ Edit Offer":"➕ New Offer"}</div><button className="btn btn-s" onClick={()=>setShowOfferModal(false)}>✕</button></div>
+          <div style={{padding:16}}>
+            <div style={{padding:10,background:"var(--hover)",borderRadius:6,fontSize:10,color:"var(--t2)",marginBottom:14,lineHeight:1.5}}>
+              💡 <strong>Tip:</strong> The "What this offers" field is the most important — be specific about who it helps and what changes for them. Avoid vague phrases like "we help businesses grow."
+            </div>
+
+            <div className="ig">
+              <div className="il">Offer Name <span style={{fontWeight:400,textTransform:"none",color:"var(--t3)"}}>— short label, just for you</span></div>
+              <input className="inp" value={offerForm.name} onChange={e=>setOfferForm(p=>({...p,name:e.target.value}))} placeholder="e.g. Q2 Construction Outbound, Capital One Displacement"/>
+            </div>
+
+            <div className="ig">
+              <div className="il">What this offers <span style={{fontWeight:400,textTransform:"none",color:"var(--t3)"}}>— 2-3 sentences, AI uses this heavily</span></div>
+              <textarea className="inp" value={offerForm.offerDescription} onChange={e=>setOfferForm(p=>({...p,offerDescription:e.target.value}))} style={{minHeight:100}} placeholder="e.g. We help construction & logistics CFOs replace their existing corporate cards with Volopay's field-team-friendly product. Our customers cut expense reimbursement time by 70% and gain real-time spend visibility across distributed teams."/>
+            </div>
+
+            <div className="ig">
+              <div className="il">CTA Link</div>
+              <input className="inp" value={offerForm.ctaLink} onChange={e=>setOfferForm(p=>({...p,ctaLink:e.target.value}))} placeholder="https://cal.com/yourname/15min"/>
+            </div>
+
+            <div className="ig">
+              <div className="il">CTA Purpose <span style={{fontWeight:400,textTransform:"none",color:"var(--t3)"}}>— what they get if they click</span></div>
+              <input className="inp" value={offerForm.ctaPurpose} onChange={e=>setOfferForm(p=>({...p,ctaPurpose:e.target.value}))} placeholder="15-min call to walk through how it fits your AP workflow"/>
+            </div>
+
+            <div style={{display:"flex",gap:8,marginTop:14}}>
+              <button className="btn btn-p" disabled={savingOffer||!offerForm.name||!offerForm.offerDescription} onClick={saveOffer}>{savingOffer?"⏳ Saving…":(offerModalMode==="edit"?"💾 Update Offer":"💾 Save Offer")}</button>
+              <button className="btn" onClick={()=>setShowOfferModal(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    )}
+  </div>);
+}
+
 // ═══════════════════════════════════════════════════════════════
 function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClose, baseId }) {
   const [step, setStep] = useState("choose"); // choose | select_new | review_queue | send_connections | mark_connected | trigger_dms
