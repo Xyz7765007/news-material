@@ -57,15 +57,18 @@ async function unipileReq(path, method = "GET", body = null) {
 
 // ─── Account Management ──────────────────────────────────────
 
-async function getHostedAuthLink(callbackUrl) {
+async function getHostedAuthLink(callbackUrl, reconnectAccountId = null) {
   // Unipile hosted auth requires ISO date for expiresOn, proper field names
   const expiresOn = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
   const payload = {
-    type: "create",
+    type: reconnectAccountId ? "reconnect" : "create",
     providers: ["LINKEDIN"],
     api_url: UNIPILE_DSN,
     expiresOn,
   };
+  if (reconnectAccountId) {
+    payload.reconnect_account = reconnectAccountId;
+  }
   if (callbackUrl) {
     payload.success_redirect_url = callbackUrl;
     payload.failure_redirect_url = callbackUrl;
@@ -942,7 +945,7 @@ export async function POST(request) {
 
     switch (action) {
       case "get_auth_link": {
-        const res = await getHostedAuthLink(body.callbackUrl);
+        const res = await getHostedAuthLink(body.callbackUrl, body.reconnectAccountId || null);
         if (!res.ok || !res.data?.url) {
           console.error("[UNIPILE] Auth link failed:", res.status, res.data);
           return NextResponse.json({

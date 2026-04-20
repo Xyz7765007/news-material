@@ -335,13 +335,69 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     setOutreachLoading(false);
   };
 
+  const [disconnectedAccounts, setDisconnectedAccounts] = useState([]);
   const loadLinkedInAccounts = async () => {
     try {
       const data = await outreachAPI("list_accounts");
       const items = data.items || data.accounts || (Array.isArray(data) ? data : []);
-      const li = items.find(a => (a.type || a.provider || "").toUpperCase() === "LINKEDIN");
-      if (li) setLinkedinAccount({ id: li.id || li.account_id, name: li.name || li.connection_params?.im_username || "LinkedIn", type: "LINKEDIN" });
+      const linkedinItems = items.filter(a => (a.type || a.provider || "").toUpperCase() === "LINKEDIN");
+      // Unipile account sources include status: "OK" = good, "ERROR_*" / "STOPPED" / "DISCONNECTED" = needs re-auth
+      const isHealthy = (a) => {
+        const sources = a.sources || [];
+        if (sources.length === 0) return false;
+        return sources.some(s => (s.status || "").toUpperCase() === "OK");
+      };
+      const healthy = linkedinItems.filter(isHealthy);
+      const dead = linkedinItems.filter(a => !isHealthy(a));
+      setDisconnectedAccounts(dead.map(a => ({ id: a.id || a.account_id, name: a.name || "LinkedIn" })));
+      if (healthy.length > 0) {
+        const li = healthy[0];
+        setLinkedinAccount({ id: li.id || li.account_id, name: li.name || li.connection_params?.im_username || "LinkedIn", type: "LINKEDIN" });
+      } else {
+        setLinkedinAccount(null);
+      }
     } catch (e) { console.log("No LinkedIn accounts:", e.message); }
+  };
+
+  const reconnectAccount = async (accountId) => {
+    setLinkedinError("🔄 Generating reconnect link...");
+    try {
+      const data = await outreachAPI("get_auth_link", { callbackUrl: window.location.href, reconnectAccountId: accountId });
+      if (data.url) {
+        const popup = window.open(data.url, "_blank", "width=600,height=700");
+        if (!popup || popup.closed) setLinkedinError("Popup blocked — allow popups for this site and try again");
+        else setLinkedinError("✅ Reconnect window opened — complete auth in the popup, then click Refresh.");
+      } else if (data.error) {
+        setLinkedinError((data.error || "") + (data.hint ? " — " + data.hint : ""));
+      } else {
+        setLinkedinError("Unknown response: " + JSON.stringify(data).slice(0, 200));
+      }
+    } catch (e) { setLinkedinError(e.message); }
+  };
+
+  const removeAccount = async (accountId, name) => {
+    if (!confirm(`Remove ${name} from Unipile permanently? Use this if you don't want to reconnect.`)) return;
+    setOutreachLoading(true);
+    try {
+      await outreachAPI("disconnect_account", { accountId });
+      setLinkedinError(`✅ Removed ${name}`);
+      await loadLinkedInAccounts();
+    } catch (e) { setLinkedinError("❌ " + e.message); }
+    setOutreachLoading(false);
+  };
+
+  const cleanupDisconnectedAccounts = async () => {
+    if (disconnectedAccounts.length === 0) return;
+    if (!confirm(`Delete ${disconnectedAccounts.length} disconnected LinkedIn account${disconnectedAccounts.length!==1?"s":""} from Unipile? This frees up your account slots.`)) return;
+    setOutreachLoading(true);
+    let deleted = 0;
+    for (const a of disconnectedAccounts) {
+      try { await outreachAPI("disconnect_account", { accountId: a.id }); deleted++; }
+      catch (e) { console.error("Cleanup failed for", a.id, e); }
+    }
+    setLinkedinError(`✅ Cleaned up ${deleted} disconnected account${deleted!==1?"s":""}`);
+    await loadLinkedInAccounts();
+    setOutreachLoading(false);
   };
 
   const loadOutreachStats = async (campaign) => {
@@ -1454,6 +1510,27 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         <div style={{marginTop:12,fontSize:10,color:"var(--t3)",lineHeight:1.5}}>
           ⚠️ Requires <strong>UNIPILE_DSN</strong> and <strong>UNIPILE_API_KEY</strong> environment variables. <a href="https://app.unipile.com" target="_blank" rel="noopener" style={{color:"var(--blu)"}}>Get them from Unipile →</a>
         </div>
+        {disconnectedAccounts.length > 0 && (
+          <div style={{marginTop:12,padding:"14px 16px",background:"var(--red-d)",border:"1px solid rgba(196,92,92,.3)",borderRadius:8}}>
+            <div style={{color:"var(--red)",fontWeight:600,fontSize:11,marginBottom:6}}>⚠️ {disconnectedAccounts.length} disconnected LinkedIn account{disconnectedAccounts.length!==1?"s":""}</div>
+            <div style={{color:"var(--t2)",fontSize:10,marginBottom:10,lineHeight:1.5}}>Each account uses a Unipile slot. Reconnect to re-authenticate (usually LinkedIn needed a checkpoint), or remove to free the slot.</div>
+            <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              {disconnectedAccounts.map(a => (
+                <div key={a.id} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 10px",background:"var(--card)",borderRadius:6}}>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:11,color:"var(--t1)",fontWeight:500}}>{a.name}</div>
+                    <div style={{fontSize:9,color:"var(--t3)",fontFamily:"'JetBrains Mono',monospace"}}>{a.id}</div>
+                  </div>
+                  <button className="btn btn-s btn-p" style={{fontSize:10}} onClick={()=>reconnectAccount(a.id)} disabled={outreachLoading}>🔄 Reconnect</button>
+                  <button className="btn btn-s btn-d" style={{fontSize:10}} onClick={()=>removeAccount(a.id, a.name)} disabled={outreachLoading}>🗑️ Remove</button>
+                </div>
+              ))}
+            </div>
+            {disconnectedAccounts.length > 1 && (
+              <button className="btn btn-s" style={{fontSize:10,marginTop:8}} onClick={cleanupDisconnectedAccounts} disabled={outreachLoading}>{outreachLoading?"⏳":"🧹 Remove all "+disconnectedAccounts.length}</button>
+            )}
+          </div>
+        )}
         {linkedinError && (
           <div style={{marginTop:12,padding:"10px 14px",background:linkedinError.startsWith("✅")?"var(--grn-d)":"var(--red-d)",border:"1px solid "+(linkedinError.startsWith("✅")?"rgba(93,168,122,.3)":"rgba(196,92,92,.3)"),borderRadius:8,color:linkedinError.startsWith("✅")?"var(--grn)":"var(--red)",fontSize:11,lineHeight:1.5,wordBreak:"break-word",whiteSpace:"pre-wrap",fontFamily:linkedinError.includes("DSN set:")?"'JetBrains Mono',monospace":"inherit"}}>
             {linkedinError}
@@ -1802,7 +1879,15 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
               method: "POST", headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ action: "setup", baseId }),
             });
-            if (!setupRes.ok) throw new Error("Setup returned " + setupRes.status);
+            const setupBody = await setupRes.json().catch(() => ({}));
+            if (!setupRes.ok || setupBody.errors?.length > 0) {
+              const errText = (setupBody.errors || []).join("; ") || ("HTTP " + setupRes.status);
+              // Detect auth failure - common when PAT lacks schema.bases:write
+              if (errText.includes("401") || errText.includes("403") || errText.includes("Auth") || errText.includes("scope") || errText.includes("PERMISSION")) {
+                throw new Error(`PAT permission issue: ${errText}\n\n👉 Fix: Go to https://airtable.com/create/tokens → edit your token → add scopes: "data.records:read", "data.records:write", "schema.bases:read", "schema.bases:write" → make sure this base (${baseId}) is in the token's allowed bases.`);
+              }
+              throw new Error(errText);
+            }
             setResult({ ok: true, message: "✅ Setup complete. Retrying..." });
             const eq2 = await outreachAPI("enqueue_leads", { ruleConfig, mode: "manual", selectedIds: ids, count: ids.length });
             if (eq2.enqueued > 0) {
