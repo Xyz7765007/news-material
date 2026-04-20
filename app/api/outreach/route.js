@@ -11,8 +11,27 @@ const AT_API = "https://api.airtable.com/v0";
 // UNIPILE API HELPERS
 // ═══════════════════════════════════════════════════════════════
 
+// Build the actual request URL. Vercel blocks non-standard ports.
+// Unipile supports moving the port to a query param when custom ports are blocked.
+// e.g. https://api1.unipile.com:15009/api/v1/accounts
+//   -> https://api1.unipile.com/api/v1/accounts?port=15009
+function buildUnipileUrl(path) {
+  if (!UNIPILE_DSN) return null;
+  let dsn = UNIPILE_DSN.replace(/\/$/, ""); // strip trailing slash
+  let portParam = "";
+  const match = dsn.match(/^(https?:\/\/[^:\/]+)(?::(\d+))?/i);
+  if (match && match[2]) {
+    // Has custom port — rewrite to standard 443 and pass as query param
+    dsn = match[1];
+    portParam = `port=${match[2]}`;
+  }
+  const sep = path.includes("?") ? "&" : "?";
+  const qs = portParam ? `${sep}${portParam}` : "";
+  return `${dsn}/api/v1${path}${qs}`;
+}
+
 async function unipileReq(path, method = "GET", body = null) {
-  const url = `${UNIPILE_DSN}/api/v1${path}`;
+  const url = buildUnipileUrl(path);
   const opts = {
     method,
     headers: { "X-API-KEY": UNIPILE_KEY, "Accept": "application/json" },
@@ -25,10 +44,15 @@ async function unipileReq(path, method = "GET", body = null) {
       opts.body = JSON.stringify(body);
     }
   }
-  const res = await fetch(url, opts);
-  const text = await res.text();
-  try { return { ok: res.ok, status: res.status, data: JSON.parse(text) }; }
-  catch { return { ok: res.ok, status: res.status, data: text }; }
+  try {
+    const res = await fetch(url, opts);
+    const text = await res.text();
+    try { return { ok: res.ok, status: res.status, data: JSON.parse(text), url }; }
+    catch { return { ok: res.ok, status: res.status, data: text, url }; }
+  } catch (e) {
+    console.error("[UNIPILE] Fetch error:", e.message, "URL:", url);
+    return { ok: false, status: 0, data: { error: e.message, url }, fetchError: true };
+  }
 }
 
 // ─── Account Management ──────────────────────────────────────
@@ -662,7 +686,7 @@ export async function POST(request) {
       const tests = {
         dsn_set: !!UNIPILE_DSN,
         key_set: !!UNIPILE_KEY,
-        dsn_value: UNIPILE_DSN ? UNIPILE_DSN.slice(0, 30) + "..." : "NOT SET",
+        dsn_value: UNIPILE_DSN ? UNIPILE_DSN.slice(0, 40) + (UNIPILE_DSN.length > 40 ? "..." : "") : "NOT SET",
         key_length: UNIPILE_KEY ? UNIPILE_KEY.length : 0,
       };
       if (!UNIPILE_DSN) return NextResponse.json({ ok: false, tests, error: "UNIPILE_DSN environment variable is not set. Add it to Vercel → Settings → Environment Variables, then redeploy." });
@@ -674,14 +698,21 @@ export async function POST(request) {
         return NextResponse.json({ ok: false, tests, error: "UNIPILE_DSN must be a full URL starting with https://" });
       }
 
+      // Show the actual URL that will be called (with port→query param workaround applied)
+      tests.request_url = buildUnipileUrl("/accounts");
+
       try {
         const listRes = await listAccounts();
         tests.canListAccounts = listRes.ok;
         tests.accountsStatus = listRes.status;
         if (!listRes.ok) {
           tests.accountsError = typeof listRes.data === "string" ? listRes.data.slice(0, 200) : JSON.stringify(listRes.data).slice(0, 200);
-          const hint = listRes.status === 401 ? "API key is invalid — check UNIPILE_API_KEY in Vercel" : listRes.status === 404 ? "DSN URL is wrong — check UNIPILE_DSN in Vercel" : "Check Unipile dashboard for account status";
-          return NextResponse.json({ ok: false, tests, error: `Unipile returned ${listRes.status}`, hint });
+          let hint;
+          if (listRes.fetchError) hint = "Network error — Vercel may be blocking the port. DSN was auto-rewritten to use port as query param, but the request still failed. Double-check DSN in Unipile dashboard.";
+          else if (listRes.status === 401) hint = "API key is invalid — check UNIPILE_API_KEY in Vercel";
+          else if (listRes.status === 404) hint = "DSN URL is wrong — check UNIPILE_DSN in Vercel dashboard";
+          else hint = "Check Unipile dashboard for account status";
+          return NextResponse.json({ ok: false, tests, error: `Unipile returned ${listRes.status || "network error"}`, hint });
         }
         return NextResponse.json({ ok: true, tests, message: "✅ Connection healthy" });
       } catch (e) {

@@ -317,6 +317,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         lines.push("—");
         lines.push("DSN set: " + (data.tests.dsn_set ? "✅" : "❌") + (data.tests.dsn_value ? ` (${data.tests.dsn_value})` : ""));
         lines.push("API key set: " + (data.tests.key_set ? "✅" : "❌") + (data.tests.key_length ? ` (length ${data.tests.key_length})` : ""));
+        if (data.tests.request_url) lines.push("Request URL: " + data.tests.request_url);
         if (data.tests.canListAccounts !== undefined) lines.push("Can list accounts: " + (data.tests.canListAccounts ? "✅" : "❌ " + (data.tests.accountsError || data.tests.accountsStatus)));
       }
       setLinkedinError(lines.join("\n"));
