@@ -2021,8 +2021,12 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
     setBusy(true);
     try {
       await ga("oauth_disconnect");
-      setMsg("✅ Disconnected");
-      await loadConfig();
+      // Optimistic reset — immediately show as disconnected without waiting for Airtable read
+      setConfig(c => ({ ...c, hasOAuth: false, oauthEmail: "", hasServiceAccount: false, serviceAccountEmail: "", authMode: "none" }));
+      setSyncResult(null);
+      setMsg("✅ Disconnected. Sign in again to reconnect.");
+      // Background refresh to sync with Airtable truth (may be slightly delayed)
+      setTimeout(() => loadConfig(), 1500);
     } catch (e) { setMsg("❌ " + e.message); }
     setBusy(false);
   };
