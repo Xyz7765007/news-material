@@ -595,6 +595,33 @@ export async function POST(request) {
           return NextResponse.json({ error: `Leads fetch failed: ${e.message}` }, { status: 400 });
         }
 
+        // 3b. Pre-create all GA fields on Leads table so the batch updates don't race
+        // This avoids the issue where parallel batches each try to create the same missing field
+        try {
+          const tablesRes = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables`, { headers: atHdr });
+          if (tablesRes.ok) {
+            const { tables } = await tablesRes.json();
+            const leadsTable = (tables || []).find(t => t.name === "Leads");
+            if (leadsTable) {
+              const existingFieldNames = new Set((leadsTable.fields || []).map(f => f.name));
+              const requiredFields = [
+                "GA Sessions", "GA Engaged Sessions", "GA Views", "GA Views Per Session",
+                "GA Engagement Time", "GA Avg Session Duration", "GA Last Visit",
+                "GA Engagement Score", "GA Last Synced At",
+              ];
+              const missing = requiredFields.filter(f => !existingFieldNames.has(f));
+              if (missing.length > 0) {
+                await ensureTableFields(baseId, "Leads", missing);
+                // Wait a bit for Airtable Meta API to propagate new fields to PATCH endpoint
+                await new Promise(r => setTimeout(r, 2000));
+              }
+            }
+          }
+        } catch (e) {
+          console.error("[GA] Pre-flight field creation failed:", e);
+          // Continue anyway — per-batch retry will catch missing fields
+        }
+
         const leadsWithCodes = leads.filter(l => l.fields?.["Custom Code"]);
         const totalLeads = leads.length;
         const leadsTracked = leadsWithCodes.length;
