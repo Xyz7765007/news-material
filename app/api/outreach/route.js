@@ -968,10 +968,37 @@ export async function POST(request) {
         // Persist which LinkedIn account this campaign uses
         if (!body.campaignId) return NextResponse.json({ error: "campaignId required" }, { status: 400 });
         try {
-          await fetch(`${AT_API}/${MASTER_BASE_ID}/${encodeURIComponent("Campaigns")}/${body.campaignId}`, {
+          let res = await fetch(`${AT_API}/${MASTER_BASE_ID}/${encodeURIComponent("Campaigns")}/${body.campaignId}`, {
             method: "PATCH", headers: atHdr,
             body: JSON.stringify({ fields: { "LinkedIn Account ID": body.accountId || "" } }),
           });
+          // If 422 (field doesn't exist yet), create it then retry
+          if (res.status === 422) {
+            const errText = await res.text();
+            if (errText.includes("Unknown field") || errText.includes("LinkedIn Account ID")) {
+              // Create the field via Airtable Meta API
+              const tablesRes = await fetch(`https://api.airtable.com/v0/meta/bases/${MASTER_BASE_ID}/tables`, { headers: atHdr });
+              if (tablesRes.ok) {
+                const { tables } = await tablesRes.json();
+                const campaignsTable = (tables || []).find(t => t.name === "Campaigns");
+                if (campaignsTable) {
+                  await fetch(`https://api.airtable.com/v0/meta/bases/${MASTER_BASE_ID}/tables/${campaignsTable.id}/fields`, {
+                    method: "POST", headers: atHdr,
+                    body: JSON.stringify({ name: "LinkedIn Account ID", type: "singleLineText" }),
+                  });
+                  // Retry the PATCH
+                  res = await fetch(`${AT_API}/${MASTER_BASE_ID}/${encodeURIComponent("Campaigns")}/${body.campaignId}`, {
+                    method: "PATCH", headers: atHdr,
+                    body: JSON.stringify({ fields: { "LinkedIn Account ID": body.accountId || "" } }),
+                  });
+                }
+              }
+            }
+          }
+          if (!res.ok) {
+            const err = await res.text();
+            return NextResponse.json({ error: `Airtable PATCH failed (${res.status}): ${err.slice(0, 300)}` }, { status: 400 });
+          }
           return NextResponse.json({ ok: true });
         } catch (e) {
           return NextResponse.json({ error: e.message }, { status: 500 });

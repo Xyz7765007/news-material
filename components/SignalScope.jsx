@@ -435,8 +435,21 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     try {
       const r = await outreachAPI("save_assigned_account", { campaignId: camp.airtableId, accountId });
       if (r.ok) {
-        setLinkedinError("✅ Account assigned to this campaign");
-        await loadLinkedInAccounts();
+        // Optimistic update — set linkedinAccount immediately so UI flips to connected state
+        if (accountId) {
+          const acc = allHealthyAccounts.find(a => a.id === accountId);
+          if (acc) {
+            setLinkedinAccount({ id: acc.id, name: acc.name, email: acc.email, type: "LINKEDIN" });
+            setLinkedinError(`✅ Assigned ${acc.name} to ${camp.name}`);
+          } else {
+            setLinkedinError("✅ Account assigned (refreshing...)");
+          }
+        } else {
+          setLinkedinAccount(null);
+          setLinkedinError("✅ Unassigned from this campaign");
+        }
+        // Background refresh to confirm
+        loadLinkedInAccounts();
       } else {
         setLinkedinError(r.error || "Failed to assign");
       }
