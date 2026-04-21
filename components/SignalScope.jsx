@@ -2644,34 +2644,52 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
       const ids = [...selected];
       // Step 1: enqueue
       const eq = await outreachAPI("enqueue_leads", { ruleConfig, mode: "manual", selectedIds: ids, count: ids.length });
-      if (eq.error) {
+
+      // Detect missing Outreach table on BOTH error paths
+      const airErr = eq.airtableErrors?.[0]?.body || eq.error || "";
+      const isMissingTable = airErr.includes("INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND") || airErr.includes("NOT_FOUND");
+
+      if (eq.error && !isMissingTable) {
         setResult({ error: eq.error + (eq.airtableErrors ? "\n\nAirtable: " + JSON.stringify(eq.airtableErrors[0]).slice(0,200) : "") });
         setBusy(false); return;
       }
-      if (eq.enqueued === 0) {
-        const airErr = eq.airtableErrors?.[0]?.body || "";
-        const isMissingTable = airErr.includes("INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND") || airErr.includes("NOT_FOUND");
+      if (eq.enqueued === 0 || isMissingTable) {
         if (isMissingTable) {
           // Auto-run setup to create the Outreach table, then retry
-          setResult({ ok: true, message: "⚙️ Outreach table missing — auto-running Setup to create it..." });
+          setResult({ ok: true, message: "⚙️ Outreach table missing — running Setup to create it. This takes ~10 seconds..." });
           try {
             const setupRes = await fetch("/api/airtable", {
               method: "POST", headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ action: "setup", baseId }),
             });
             const setupBody = await setupRes.json().catch(() => ({}));
-            if (!setupRes.ok || setupBody.errors?.length > 0) {
-              const errText = (setupBody.errors || []).join("; ") || ("HTTP " + setupRes.status);
-              // Detect auth failure - common when PAT lacks schema.bases:write
-              if (errText.includes("401") || errText.includes("403") || errText.includes("Auth") || errText.includes("scope") || errText.includes("PERMISSION")) {
-                throw new Error(`PAT permission issue: ${errText}\n\n👉 Fix: Go to https://airtable.com/create/tokens → edit your token → add scopes: "data.records:read", "data.records:write", "schema.bases:read", "schema.bases:write" → make sure this base (${baseId}) is in the token's allowed bases.`);
+            const setupErrMsgs = (setupBody.errors || []).join("; ");
+            const setupFailedBadly = !setupRes.ok || (setupBody.errors?.length > 0 && !setupBody.tables_created?.includes("Outreach"));
+
+            // Detect PAT permission issues specifically
+            const isPATError = setupErrMsgs.includes("401") || setupErrMsgs.includes("403") || setupErrMsgs.includes("Auth") || setupErrMsgs.includes("scope") || setupErrMsgs.includes("PERMISSION") || setupErrMsgs.includes("permission");
+
+            if (isPATError || setupFailedBadly) {
+              // Auto-run the diagnostic to figure out EXACTLY what's wrong
+              setResult({ ok: true, message: "🔍 Setup failed — running deep diagnostic..." });
+              try {
+                const diagRes = await fetch("/api/airtable", {
+                  method: "POST", headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ action: "diagnose", baseId }),
+                });
+                const diag = await diagRes.json();
+                const stepsStr = (diag.steps || []).map(s => `  • ${s.step}: ${s.ok?"✓":"✗"} (status ${s.status||"n/a"})${s.bodyPreview?" → "+s.bodyPreview.slice(0,150):""}`).join("\n");
+                const tablesStr = (diag.existingTables || []).map(t => t.name).join(", ") || "none";
+                setResult({ error: `🔍 DIAGNOSTIC RESULT\n\n${diag.conclusion || "No conclusion returned"}\n\nTables currently in base: ${tablesStr}\nOutreach table exists: ${diag.hasOutreachTable ? "YES" : "NO"}\n\nSteps:\n${stepsStr}\n\nSetup errors: ${setupErrMsgs || "(none)"}` });
+              } catch (diagErr) {
+                setResult({ error: `🛑 Setup failed AND diagnostic also failed.\n\nSetup errors: ${setupErrMsgs || "HTTP " + setupRes.status}\nDiagnostic error: ${diagErr.message}\n\nTry these manually:\n1. https://airtable.com/create/tokens → verify schema.bases:write scope\n2. Make sure base ${baseId} is in token's allowed bases\n3. Try regenerating the token from scratch` });
               }
-              throw new Error(errText);
+              setBusy(false); return;
             }
-            setResult({ ok: true, message: "✅ Setup complete. Retrying..." });
+
+            setResult({ ok: true, message: `✅ Outreach table created (${setupBody.tables_created?.join(", ") || "Outreach"}). Retrying send...` });
             const eq2 = await outreachAPI("enqueue_leads", { ruleConfig, mode: "manual", selectedIds: ids, count: ids.length });
             if (eq2.enqueued > 0) {
-              // continue down the send path with eq2
               const q2 = await outreachAPI("list_queue", { campaign: ruleConfig.name, status: "queued" });
               const newItems2 = (q2.items || []).filter(i => (i.fields?.Mode || "auto") === "manual");
               const sortedNew2 = [...newItems2].sort((a,b) => (b.fields?.["Created At"] || "").localeCompare(a.fields?.["Created At"] || "")).slice(0, eq2.enqueued);
@@ -2684,17 +2702,18 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
               else setResult({ ok: true, message: `✅ Created Outreach table, added ${eq2.enqueued}, sent ${sendRes2.sent} connection request${sendRes2.sent!==1?"s":""}.`, details: sendRes2.results });
               await loadQueue(); setSelected(new Set()); setBusy(false); return;
             } else {
-              setResult({ error: "Setup ran but still couldn't create records. Check Airtable token permissions (needs schema.bases:write)." });
+              const e2Err = eq2.airtableErrors?.[0]?.body || eq2.error || "unknown";
+              setResult({ error: `Setup completed but retry still fails. Airtable says: ${e2Err.slice(0, 400)}` });
               setBusy(false); return;
             }
           } catch (setupErr) {
-            setResult({ error: `🛑 Outreach table is missing and auto-setup failed: ${setupErr.message}\n\n👉 Fix: Click "🔧 Setup" in the left sidebar manually.` });
+            setResult({ error: `🛑 Auto-setup crashed: ${setupErr.message}\n\n👉 Go to https://airtable.com/create/tokens and verify your token has schema.bases:write scope + access to base ${baseId}.` });
             setBusy(false); return;
           }
         } else {
           setResult({ error: `Could not add any leads to Airtable. Skipped as dupes: ${eq.skippedDupes||0}. ${airErr ? "\n\nAirtable error: " + airErr.slice(0, 300) : "Check Airtable permissions and field schema on the Outreach table."}` });
+          setBusy(false); return;
         }
-        setBusy(false); return;
       }
       // Step 2: find the newly-enqueued items — the records just created are Mode=manual, Status=queued
       const q = await outreachAPI("list_queue", { campaign: ruleConfig.name, status: "queued" });

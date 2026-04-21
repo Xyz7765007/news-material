@@ -491,7 +491,12 @@ async function setupSchema(baseId) {
     tables_found: tables.map(t => t.name),
   };
 
+  // Campaigns table only lives on the master base, not per-campaign bases
+  const isMasterBase = baseId === MASTER_BASE_ID;
+  const MASTER_ONLY_TABLES = ["Campaigns"];
+
   for (const [tableName, requiredFields] of Object.entries(SCHEMA)) {
+    if (!isMasterBase && MASTER_ONLY_TABLES.includes(tableName)) continue;
     const r = await ensureTable(baseId, tableName, requiredFields, tables);
     results.tables_created.push(...r.tables_created);
     results.fields_created.push(...r.fields_created);
@@ -928,6 +933,97 @@ export async function POST(request) {
       case "setup": {
         const results = await setupSchema(baseId);
         return NextResponse.json(results);
+      }
+      case "diagnose": {
+        // Verbose diagnostic: probe every step and return detailed status
+        const diag = { baseId, steps: [], ok: true };
+
+        // Step 1: Can we fetch tables at all?
+        try {
+          const res = await fetch(`${metaUrl(baseId)}/tables`, { headers: authHdr });
+          const bodyText = await res.text();
+          diag.steps.push({
+            step: "fetchTables",
+            status: res.status,
+            ok: res.ok,
+            bodyPreview: bodyText.slice(0, 400),
+          });
+          if (!res.ok) { diag.ok = false; diag.conclusion = `Can't even list tables. Status ${res.status}. Token likely lacks schema.bases:read OR doesn't have access to base ${baseId}.`; return NextResponse.json(diag); }
+          const { tables } = JSON.parse(bodyText);
+          diag.existingTables = (tables || []).map(t => ({ name: t.name, id: t.id, fieldCount: t.fields?.length || 0 }));
+          diag.hasOutreachTable = diag.existingTables.some(t => t.name === "Outreach");
+
+          // Step 2: If Outreach table doesn't exist, try to create it
+          if (!diag.hasOutreachTable) {
+            const OUTREACH_FIELDS = SCHEMA["Outreach"].map(f => ({ name: f.name, type: f.type, options: f.options }));
+            try {
+              const createRes = await fetch(`${metaUrl(baseId)}/tables`, {
+                method: "POST",
+                headers: { ...authHdr, "Content-Type": "application/json" },
+                body: JSON.stringify({ name: "Outreach", fields: OUTREACH_FIELDS }),
+              });
+              const createBody = await createRes.text();
+              diag.steps.push({
+                step: "createOutreachTable",
+                status: createRes.status,
+                ok: createRes.ok,
+                bodyPreview: createBody.slice(0, 400),
+              });
+              if (!createRes.ok) {
+                diag.ok = false;
+                if (createRes.status === 403) diag.conclusion = `Creating the Outreach table was blocked with 403. Your token likely lacks schema.bases:write. Even if the Airtable UI says it's enabled, double-check by regenerating the token from scratch with all 4 scopes.`;
+                else if (createRes.status === 422) diag.conclusion = `Airtable rejected the Outreach table schema (422). Raw: ${createBody.slice(0, 300)}`;
+                else diag.conclusion = `Create failed with ${createRes.status}: ${createBody.slice(0, 300)}`;
+                return NextResponse.json(diag);
+              }
+              diag.createdOutreachTable = true;
+            } catch (e) {
+              diag.steps.push({ step: "createOutreachTable", error: e.message });
+              diag.ok = false;
+              diag.conclusion = `Create request threw: ${e.message}`;
+              return NextResponse.json(diag);
+            }
+          }
+
+          // Step 3: Try a test write to Outreach
+          try {
+            const testRes = await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Outreach")}`, {
+              method: "POST",
+              headers: authHdr,
+              body: JSON.stringify({ records: [{ fields: { "Lead Name": "_diagnostic_test_", Status: "test" } }] }),
+            });
+            const testBody = await testRes.text();
+            diag.steps.push({
+              step: "testWrite",
+              status: testRes.status,
+              ok: testRes.ok,
+              bodyPreview: testBody.slice(0, 400),
+            });
+            if (testRes.ok) {
+              // Clean up the test record
+              const parsed = JSON.parse(testBody);
+              const recId = parsed.records?.[0]?.id;
+              if (recId) {
+                await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Outreach")}/${recId}`, { method: "DELETE", headers: authHdr });
+                diag.steps.push({ step: "cleanupTest", ok: true });
+              }
+              diag.conclusion = `✅ Everything works. Base can be written to, Outreach table exists and accepts records. If you're still seeing errors in the UI, it's a caching issue — hard-reload the page (Cmd+Shift+R).`;
+            } else {
+              diag.ok = false;
+              if (testRes.status === 403) diag.conclusion = `Can list/create tables but can't write records (403). Token is missing data.records:write scope for this base.`;
+              else if (testRes.status === 422) diag.conclusion = `Airtable rejected the test write with 422 — a field name doesn't match. Raw: ${testBody.slice(0, 300)}`;
+              else diag.conclusion = `Write failed with ${testRes.status}: ${testBody.slice(0, 300)}`;
+            }
+          } catch (e) {
+            diag.steps.push({ step: "testWrite", error: e.message });
+            diag.ok = false;
+            diag.conclusion = `Test write threw: ${e.message}`;
+          }
+
+          return NextResponse.json(diag);
+        } catch (e) {
+          return NextResponse.json({ ...diag, error: e.message, ok: false, conclusion: `Diagnostic crashed: ${e.message}` });
+        }
       }
       case "test": {
         const results = await testConnection(baseId);
