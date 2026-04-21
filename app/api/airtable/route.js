@@ -322,6 +322,7 @@ const SCHEMA = {
     { name: "Tables", type: "multilineText" },
     { name: "HubSpot API Key", type: "singleLineText" },
     { name: "Smartlead API Key", type: "singleLineText" },
+    { name: "LinkedIn Account ID", type: "singleLineText" },
     { name: "Sender Profile", type: "multilineText" },
     { name: "Email Reference", type: "multilineText" },
     { name: "Email Purpose", type: "multilineText" },

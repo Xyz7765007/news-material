@@ -4,6 +4,7 @@ import OpenAI from "openai";
 const UNIPILE_DSN = process.env.UNIPILE_DSN; // e.g. https://api1.unipile.com:13371
 const UNIPILE_KEY = process.env.UNIPILE_API_KEY;
 const AIRTABLE_KEY = process.env.AIRTABLE_API_KEY;
+const MASTER_BASE_ID = process.env.AIRTABLE_BASE_ID;
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 const AT_API = "https://api.airtable.com/v0";
 
@@ -961,6 +962,32 @@ export async function POST(request) {
       case "list_accounts": {
         const res = await listAccounts();
         return NextResponse.json(res.data);
+      }
+
+      case "save_assigned_account": {
+        // Persist which LinkedIn account this campaign uses
+        if (!body.campaignId) return NextResponse.json({ error: "campaignId required" }, { status: 400 });
+        try {
+          await fetch(`${AT_API}/${MASTER_BASE_ID}/${encodeURIComponent("Campaigns")}/${body.campaignId}`, {
+            method: "PATCH", headers: atHdr,
+            body: JSON.stringify({ fields: { "LinkedIn Account ID": body.accountId || "" } }),
+          });
+          return NextResponse.json({ ok: true });
+        } catch (e) {
+          return NextResponse.json({ error: e.message }, { status: 500 });
+        }
+      }
+
+      case "get_assigned_account": {
+        if (!body.campaignId) return NextResponse.json({ error: "campaignId required" }, { status: 400 });
+        try {
+          const r = await fetch(`${AT_API}/${MASTER_BASE_ID}/${encodeURIComponent("Campaigns")}/${body.campaignId}`, { headers: atHdr });
+          if (!r.ok) return NextResponse.json({ accountId: "" });
+          const rec = await r.json();
+          return NextResponse.json({ accountId: rec.fields?.["LinkedIn Account ID"] || "" });
+        } catch (e) {
+          return NextResponse.json({ accountId: "", error: e.message });
+        }
       }
 
       case "get_account": {

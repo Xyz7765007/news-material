@@ -296,8 +296,42 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     try {
       const data = await outreachAPI("get_auth_link", { callbackUrl: window.location.href });
       if (data.url) {
+        // Track current healthy account IDs — any NEW ones after popup closes is the just-connected one
+        const beforeIds = new Set(allHealthyAccounts.map(a => a.id));
         const popup = window.open(data.url, "_blank", "width=600,height=700");
-        if (!popup || popup.closed) setLinkedinError("Popup blocked — allow popups for this site and try again");
+        if (!popup || popup.closed) {
+          setLinkedinError("Popup blocked — allow popups for this site and try again");
+          return;
+        }
+        setLinkedinError("🔗 Auth window opened — complete login then come back. Auto-assigning to this campaign once connected...");
+
+        // Poll for popup close, then check for new account
+        const pollInterval = setInterval(async () => {
+          if (popup.closed) {
+            clearInterval(pollInterval);
+            // Give Unipile a moment to register the account
+            setTimeout(async () => {
+              try {
+                const d = await outreachAPI("list_accounts");
+                const items = d.items || d.accounts || (Array.isArray(d) ? d : []);
+                const linkedinItems = items.filter(a => (a.type || a.provider || "").toUpperCase() === "LINKEDIN");
+                const nowHealthy = linkedinItems.filter(a => (a.sources || []).some(s => (s.status || "").toUpperCase() === "OK"));
+                const newAccount = nowHealthy.find(a => !beforeIds.has(a.id || a.account_id));
+                if (newAccount && camp?.airtableId) {
+                  const newId = newAccount.id || newAccount.account_id;
+                  await outreachAPI("save_assigned_account", { campaignId: camp.airtableId, accountId: newId });
+                  setLinkedinError(`✅ Connected ${newAccount.name || "new account"} and assigned to ${camp.name}`);
+                  await loadLinkedInAccounts();
+                } else {
+                  await loadLinkedInAccounts();
+                  setLinkedinError("✓ Auth window closed. If the account is connected, pick it from the list to assign.");
+                }
+              } catch (e) { console.error(e); }
+            }, 2000);
+          }
+        }, 1000);
+        // Safety timeout after 10 min
+        setTimeout(() => clearInterval(pollInterval), 600000);
       } else if (data.error) {
         setLinkedinError((data.error || "") + (data.hint ? " — " + data.hint : "") + (data.details ? " | " + JSON.stringify(data.details).slice(0, 200) : ""));
       } else {
@@ -325,23 +359,32 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   };
   const disconnectLinkedIn = async () => {
     if (!linkedinAccount?.id) return;
-    if (!confirm(`Disconnect ${linkedinAccount.name} from Unipile? This stops all automation for this account.`)) return;
+    const choice = confirm(`Fully DELETE ${linkedinAccount.name} from Unipile?\n\n• OK = Delete permanently from Unipile (affects all campaigns using this account)\n• Cancel = Just unassign from this campaign (account stays in Unipile)`);
     try {
       setOutreachLoading(true);
-      await outreachAPI("disconnect_account", { accountId: linkedinAccount.id });
+      if (choice) {
+        await outreachAPI("disconnect_account", { accountId: linkedinAccount.id });
+        setLinkedinError("✅ Deleted from Unipile");
+      }
+      // Either way, unassign from this campaign
+      if (camp?.airtableId) {
+        await outreachAPI("save_assigned_account", { campaignId: camp.airtableId, accountId: "" });
+      }
       setLinkedinAccount(null);
-      setLinkedinError("✅ Disconnected");
+      await loadLinkedInAccounts();
+      if (!choice) setLinkedinError("✅ Unassigned from this campaign");
     } catch (e) { setLinkedinError("❌ " + e.message); }
     setOutreachLoading(false);
   };
 
   const [disconnectedAccounts, setDisconnectedAccounts] = useState([]);
+  const [allHealthyAccounts, setAllHealthyAccounts] = useState([]); // all OK LinkedIn accounts across Unipile
+
   const loadLinkedInAccounts = async () => {
     try {
       const data = await outreachAPI("list_accounts");
       const items = data.items || data.accounts || (Array.isArray(data) ? data : []);
       const linkedinItems = items.filter(a => (a.type || a.provider || "").toUpperCase() === "LINKEDIN");
-      // Unipile account sources include status: "OK" = good, "ERROR_*" / "STOPPED" / "DISCONNECTED" = needs re-auth
       const isHealthy = (a) => {
         const sources = a.sources || [];
         if (sources.length === 0) return false;
@@ -350,13 +393,55 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       const healthy = linkedinItems.filter(isHealthy);
       const dead = linkedinItems.filter(a => !isHealthy(a));
       setDisconnectedAccounts(dead.map(a => ({ id: a.id || a.account_id, name: a.name || "LinkedIn" })));
-      if (healthy.length > 0) {
-        const li = healthy[0];
-        setLinkedinAccount({ id: li.id || li.account_id, name: li.name || li.connection_params?.im_username || "LinkedIn", type: "LINKEDIN" });
+
+      const healthyMapped = healthy.map(a => ({
+        id: a.id || a.account_id,
+        name: a.name || a.connection_params?.im_username || "LinkedIn",
+        email: a.connection_params?.mail || a.connection_params?.im_username || "",
+      }));
+      setAllHealthyAccounts(healthyMapped);
+
+      // Which account is assigned to THIS campaign?
+      let assignedId = null;
+      if (camp?.airtableId) {
+        try {
+          const r = await outreachAPI("get_assigned_account", { campaignId: camp.airtableId });
+          assignedId = r.accountId || null;
+        } catch {}
+      }
+
+      if (assignedId && healthyMapped.find(a => a.id === assignedId)) {
+        // Use the campaign's assigned account
+        const li = healthyMapped.find(a => a.id === assignedId);
+        setLinkedinAccount({ id: li.id, name: li.name, email: li.email, type: "LINKEDIN" });
+      } else if (assignedId && !healthyMapped.find(a => a.id === assignedId)) {
+        // Assigned account is missing/disconnected — show as unassigned
+        setLinkedinAccount(null);
+        if (dead.find(a => a.id === assignedId)) {
+          setLinkedinError(`⚠️ The LinkedIn account assigned to this campaign is disconnected. Reconnect it or pick a different account below.`);
+        } else {
+          setLinkedinError(`⚠️ The LinkedIn account assigned to this campaign no longer exists in Unipile. Pick a different account below.`);
+        }
       } else {
+        // No assignment — don't auto-pick. Make user explicitly assign one to avoid sending from wrong account.
         setLinkedinAccount(null);
       }
     } catch (e) { console.log("No LinkedIn accounts:", e.message); }
+  };
+
+  const assignAccountToCampaign = async (accountId) => {
+    if (!camp?.airtableId) { setLinkedinError("No campaign loaded"); return; }
+    setOutreachLoading(true);
+    try {
+      const r = await outreachAPI("save_assigned_account", { campaignId: camp.airtableId, accountId });
+      if (r.ok) {
+        setLinkedinError("✅ Account assigned to this campaign");
+        await loadLinkedInAccounts();
+      } else {
+        setLinkedinError(r.error || "Failed to assign");
+      }
+    } catch (e) { setLinkedinError(e.message); }
+    setOutreachLoading(false);
   };
 
   const reconnectAccount = async (accountId) => {
@@ -1481,19 +1566,50 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         {linkedinAccount && <button className="btn btn-s btn-p" onClick={()=>setManualModal({mode:"select_leads"})} disabled={outreachLoading}>✋ Manual Mode</button>}
         {linkedinAccount && <button className="btn btn-s" onClick={async()=>{try{setOutreachLoading(true);const d=await outreachAPI("check_replies",{accountId:linkedinAccount.id});alert(`Checked ${d.checked} items. Found ${d.repliesFound} new replies.${d.replied?.length?"\n\nReplied:\n"+d.replied.join("\n"):""}`);await loadOutreachStats();}catch(e){alert("Error: "+e.message)}setOutreachLoading(false)}} disabled={outreachLoading}>{outreachLoading?"⏳":"✋ Check Replies"}</button>}
         {linkedinAccount && <button className="btn btn-s" onClick={()=>loadOutreachStats()} disabled={outreachLoading}>↻ Refresh</button>}
+        {linkedinAccount && <button className="btn btn-s" onClick={async()=>{if(!confirm(`Unassign ${linkedinAccount.name} from ${camp?.name}?\n\nThe account stays connected in Unipile — you can reassign it anytime.`))return;await assignAccountToCampaign("");}} disabled={outreachLoading}>🔄 Switch Account</button>}
         {linkedinAccount && <button className="btn btn-s btn-d" onClick={disconnectLinkedIn} disabled={outreachLoading}>🔌 Disconnect</button>}
       </div>
     </div>
 
+    {/* Show assigned account badge */}
+    {linkedinAccount && (
+      <div style={{marginBottom:16,padding:"10px 14px",background:"var(--grn-d)",border:"1px solid rgba(93,168,122,.3)",borderRadius:8,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div>
+          <div style={{fontSize:11,fontWeight:600,color:"var(--grn)"}}>✅ Using: {linkedinAccount.name}{linkedinAccount.email?` (${linkedinAccount.email})`:""}</div>
+          <div style={{fontSize:9,color:"var(--t3)",marginTop:2}}>All outreach from <strong>{camp?.name}</strong> campaign goes through this account</div>
+        </div>
+      </div>
+    )}
+
     {/* Connection Setup */}
     {!linkedinAccount ? (
       <div style={{marginBottom:24}}>
+        {allHealthyAccounts.length > 0 && (
+          <div style={{marginBottom:16,padding:16,background:"var(--acc-d)",border:"1px solid rgba(212,165,89,.4)",borderRadius:10}}>
+            <div style={{fontSize:12,fontWeight:600,color:"var(--acc)",marginBottom:4}}>👋 Pick a LinkedIn account for this campaign</div>
+            <div style={{fontSize:10,color:"var(--t2)",marginBottom:12,lineHeight:1.5}}>You have {allHealthyAccounts.length} healthy LinkedIn account{allHealthyAccounts.length!==1?"s":""} already connected. Assign one to <strong>{camp?.name}</strong> — this campaign will only use that account for outreach. Other campaigns can use different accounts.</div>
+            <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              {allHealthyAccounts.map(a => (
+                <div key={a.id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",background:"var(--card)",borderRadius:8,border:"1px solid var(--bdr)"}}>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:12,color:"var(--t1)",fontWeight:500}}>{a.name}</div>
+                    {a.email && <div style={{fontSize:10,color:"var(--t3)"}}>{a.email}</div>}
+                    <div style={{fontSize:9,color:"var(--t3)",fontFamily:"'JetBrains Mono',monospace",marginTop:2}}>{a.id}</div>
+                  </div>
+                  <button className="btn btn-p btn-s" onClick={()=>assignAccountToCampaign(a.id)} disabled={outreachLoading}>{outreachLoading?"⏳":"Assign to this campaign"}</button>
+                </div>
+              ))}
+            </div>
+            <div style={{fontSize:10,color:"var(--t3)",marginTop:10,fontStyle:"italic"}}>Don't see the account you need? Connect a new one below.</div>
+          </div>
+        )}
+
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,maxWidth:600}}>
           {/* Option A: Direct Login */}
           <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10}}>
             <div style={{fontSize:20,marginBottom:8}}>🔑</div>
-            <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:6}}>Login Directly</div>
-            <div style={{fontSize:10,color:"var(--t3)",lineHeight:1.5,marginBottom:14}}>Connect your own LinkedIn account via Unipile's secure auth.</div>
+            <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:6}}>{allHealthyAccounts.length>0?"Connect New Account":"Login Directly"}</div>
+            <div style={{fontSize:10,color:"var(--t3)",lineHeight:1.5,marginBottom:14}}>{allHealthyAccounts.length>0?"Connect another LinkedIn account for this specific campaign.":"Connect your own LinkedIn account via Unipile's secure auth."}</div>
             <button className="btn btn-p btn-s" style={{width:"100%",justifyContent:"center",marginBottom:6}} onClick={connectLinkedIn}>Connect LinkedIn</button>
             <button className="btn btn-s" style={{width:"100%",justifyContent:"center",fontSize:10}} onClick={testUnipile}>🧪 Test Unipile Connection</button>
           </div>
