@@ -405,9 +405,11 @@ export async function POST(request) {
 
       case "oauth_disconnect": {
         if (!campaignId) return NextResponse.json({ error: "campaignId required" }, { status: 400 });
+        // Clear ALL auth — both OAuth and service account fallback
         await patchCampaign(campaignId, {
           "GA OAuth Refresh Token": "",
           "GA OAuth Email": "",
+          "GA Service Account JSON": "",
         });
         return NextResponse.json({ ok: true });
       }
@@ -523,18 +525,33 @@ export async function POST(request) {
         const camp = await getCampaign(campaignId);
         const f = camp.fields || {};
         const propertyId = f["GA4 Property ID"];
-        const json = f["GA Service Account JSON"];
-        if (!propertyId || !json) return NextResponse.json({ error: "GA not configured. Set Property ID + Service Account JSON first." }, { status: 400 });
+        const hasOAuth = !!f["GA OAuth Refresh Token"];
+        const hasSA = !!f["GA Service Account JSON"];
+        if (!propertyId) return NextResponse.json({ error: "GA4 Property ID not set. Enter it on the Google Analytics tab." }, { status: 400 });
+        if (!hasOAuth && !hasSA) return NextResponse.json({ error: "Not signed in. Click 'Sign in with Google' first." }, { status: 400 });
 
-        // 1. Fetch GA data for last 7 days
-        let metricsMap;
+        // 1. Resolve auth (OAuth preferred, service account fallback)
+        let auth;
         try {
-          metricsMap = await fetchGADataByCustomCode(propertyId, json, 7);
+          auth = await resolveAuth(f);
         } catch (e) {
-          return NextResponse.json({ error: `GA fetch failed: ${e.message}` }, { status: 400 });
+          return NextResponse.json({ error: `Auth failed: ${e.message}` }, { status: 400 });
         }
 
-        // 2. Fetch leads with Custom Codes
+        // 2. Fetch GA data for last 7 days
+        let metricsMap;
+        try {
+          metricsMap = await fetchGADataByCustomCode(propertyId, auth, 7);
+        } catch (e) {
+          let hint = "";
+          const msg = e.message || String(e);
+          if (msg.includes("403") || msg.includes("Permission")) hint = " — The signed-in Google account doesn't have access to this GA4 property.";
+          else if (msg.includes("404")) hint = " — Property ID is wrong.";
+          else if (msg.includes("invalid_grant")) hint = " — OAuth token expired. Click 'Sign in with Google' again.";
+          return NextResponse.json({ error: `GA fetch failed: ${msg}${hint}` }, { status: 400 });
+        }
+
+        // 3. Fetch leads with Custom Codes
         let leads;
         try {
           leads = await atList(baseId, "Leads");
