@@ -46,6 +46,34 @@ async function patchCampaign(campaignId, fields) {
   });
 }
 
+// Auto-create missing fields on the Campaigns table (handles upgrades without re-running Setup)
+async function ensureCampaignFields(missingFieldNames) {
+  // Map field name → type
+  const TYPE_MAP = {
+    "GA4 Property ID": "singleLineText",
+    "GA Service Account JSON": "multilineText",
+    "GA Last Sync": "singleLineText",
+  };
+  try {
+    const tablesRes = await fetch(`https://api.airtable.com/v0/meta/bases/${MASTER_BASE_ID}/tables`, { headers: atHdr });
+    if (!tablesRes.ok) return false;
+    const { tables } = await tablesRes.json();
+    const campaignsTable = (tables || []).find(t => t.name === "Campaigns");
+    if (!campaignsTable) return false;
+    for (const fname of missingFieldNames) {
+      const type = TYPE_MAP[fname] || "singleLineText";
+      await fetch(`https://api.airtable.com/v0/meta/bases/${MASTER_BASE_ID}/tables/${campaignsTable.id}/fields`, {
+        method: "POST", headers: atHdr,
+        body: JSON.stringify({ name: fname, type }),
+      });
+    }
+    return true;
+  } catch (e) {
+    console.error("[ga] ensureCampaignFields failed:", e);
+    return false;
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // GA4 DATA API
 // ═══════════════════════════════════════════════════════════════
@@ -184,14 +212,36 @@ export async function POST(request) {
         const fields = {};
         if (body.propertyId !== undefined) fields["GA4 Property ID"] = String(body.propertyId).trim();
         if (body.serviceAccountJson !== undefined) {
-          // Validate JSON before saving
           if (body.serviceAccountJson.trim()) {
             try { parseServiceAccount(body.serviceAccountJson); } 
             catch (e) { return NextResponse.json({ error: e.message }, { status: 400 }); }
           }
           fields["GA Service Account JSON"] = body.serviceAccountJson.trim();
         }
-        const res = await patchCampaign(campaignId, fields);
+        let res = await patchCampaign(campaignId, fields);
+
+        // Auto-create missing fields if 422 — self-heals so user doesn't need to run Setup
+        if (res.status === 422) {
+          const errText = await res.text();
+          const unknownFields = [];
+          // Match: Unknown field name: "X" OR \"X\" OR 'X' — handles raw and escaped quotes
+          const matches = errText.matchAll(/[Uu]nknown field name:?\s*\\?["']([^"'\\]+)\\?["']/g);
+          for (const m of matches) unknownFields.push(m[1]);
+          // Fallback: also try the field names we know we're trying to write, if any are missing from response
+          if (unknownFields.length === 0) {
+            for (const fname of Object.keys(fields)) {
+              if (errText.includes(fname)) unknownFields.push(fname);
+            }
+          }
+          if (unknownFields.length > 0) {
+            const created = await ensureCampaignFields(unknownFields);
+            if (created) {
+              // Retry save
+              res = await patchCampaign(campaignId, fields);
+            }
+          }
+        }
+
         if (!res.ok) {
           const err = await res.text();
           return NextResponse.json({ error: `Save failed (${res.status}): ${err.slice(0, 300)}` }, { status: 400 });

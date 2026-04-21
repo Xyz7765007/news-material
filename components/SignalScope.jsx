@@ -1059,6 +1059,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     null,
     {id:"outreach",label:"💬 LinkedIn Automation",count:null},
     {id:"email_campaign",label:"📧 Email Campaign",count:null},
+    {id:"google_analytics",label:"📊 Google Analytics",count:null},
     {id:"hubspot",label:"🔗 HubSpot",count:null},
     {id:"post_demo",label:"🤖 Post-Demo Auto",count:null},
     ...(!clientMode ? [{id:"coming_soon",label:"🚀 Coming Soon",count:null}] : []),
@@ -1254,6 +1255,12 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     </div>)}
   </div>)}
 
+  {/* ════ GOOGLE ANALYTICS ════ */}
+  {tab==="google_analytics"&&!loading&&(<div>
+    <div className="ph"><div><div className="pt">📊 Google Analytics</div><div className="pd">Connect GA4 to enrich leads with website engagement data — sliding 7-day window</div></div></div>
+    <GoogleAnalyticsCard baseId={bid} campaign={camp} onSyncComplete={()=>at("list","Leads",{},bid).then(r=>setLeads(r.records||[]))} />
+  </div>)}
+
   {/* ════ HUBSPOT ════ */}
   {tab==="hubspot"&&!loading&&(<div>
     <div className="ph"><div><div className="pt">🔗 HubSpot Integration</div><div className="pd">Connect HubSpot, push tasks, manage enrichment</div></div></div>
@@ -1432,8 +1439,6 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         </select>}
         <label className="btn btn-s" style={{cursor:"pointer"}}><I.Upload/> Upload CSV<input type="file" accept=".csv" hidden onChange={e=>{if(e.target.files[0])handleCSVFile(e.target.files[0],"Leads",setLeads)}}/></label>
       </div></div>
-
-      <GoogleAnalyticsCard baseId={bid} campaign={camp} onSyncComplete={()=>at("list","Leads",{},bid).then(r=>setLeads(r.records||[]))} />
 
     {filteredLeads.length===0?<div className="empty"><div className="em">👤</div><p>{leads.length>0?"No leads match this campaign filter.":"Upload a CSV."}</p></div>:
     <div className="tw"><table><thead><tr>{cols.map(k=><th key={k}>{k}</th>)}<th></th></tr></thead><tbody>{filteredLeads.map(l=>{const f=l.fields||{};return(<tr key={l.id}>{cols.map(k=><td key={k} style={k==="Name"?{color:"var(--t1)",fontWeight:500}:k==="Email"?{fontSize:10}:k==="Campaign Tag"?{fontSize:10,color:"var(--acc)"}:k==="Custom Code"?{fontSize:10,fontFamily:"'JetBrains Mono',monospace",color:"var(--t3)"}:k==="GA Engagement Score"?{fontWeight:600,color:f[k]>50?"var(--grn)":f[k]>20?"var(--amb)":"var(--t3)"}:k==="GA Last Visit"?{fontSize:10,color:f[k]?"var(--blu)":"var(--t3)"}:{}}>{fmt(f[k])}</td>)}<td><button className="btn btn-d btn-s" onClick={()=>del("Leads",[l.id],setLeads)}><I.Trash/></button></td></tr>)})}</tbody></table></div>}</div>);
@@ -1926,7 +1931,7 @@ function PushToHubSpotForm({ tasks, owners, onPush, loading, rules }) {
 // GOOGLE ANALYTICS CARD (in Leads tab)
 // ═══════════════════════════════════════════════════════════════
 function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
-  const [collapsed, setCollapsed] = useState(true);
+  const [collapsed, setCollapsed] = useState(false);
   const [config, setConfig] = useState({ propertyId: "", hasServiceAccount: false, serviceAccountEmail: "", lastSync: "" });
   const [propertyDraft, setPropertyDraft] = useState("");
   const [jsonDraft, setJsonDraft] = useState("");
