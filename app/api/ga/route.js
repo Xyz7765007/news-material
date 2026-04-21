@@ -406,16 +406,36 @@ export async function POST(request) {
       case "oauth_disconnect": {
         if (!campaignId) return NextResponse.json({ error: "campaignId required" }, { status: 400 });
         // Clear ALL auth — both OAuth and service account fallback
-        // Airtable: use null to properly clear fields (empty string sometimes doesn't clear multilineText)
-        const clearRes = await patchCampaign(campaignId, {
+        // Use null to properly clear Airtable fields (empty string doesn't always clear multilineText)
+        const fieldsToClear = {
           "GA OAuth Refresh Token": null,
           "GA OAuth Email": null,
           "GA Service Account JSON": null,
-        });
+        };
+
+        let clearRes = await patchCampaign(campaignId, fieldsToClear);
+
+        // If 422 (field doesn't exist), create missing fields then retry — loop for multiple missing
+        let attempts = 0;
+        while (clearRes.status === 422 && attempts < 5) {
+          attempts++;
+          const errText = await clearRes.text();
+          const unknownFields = [];
+          const matches = errText.matchAll(/[Uu]nknown field name:?\s*\\?["']([^"'\\]+)\\?["']/g);
+          for (const m of matches) unknownFields.push(m[1]);
+          if (unknownFields.length === 0) {
+            for (const fname of Object.keys(fieldsToClear)) if (errText.includes(fname)) unknownFields.push(fname);
+          }
+          if (unknownFields.length === 0) break;
+          await ensureCampaignFields(unknownFields);
+          clearRes = await patchCampaign(campaignId, fieldsToClear);
+        }
+
         if (!clearRes.ok) {
           const err = await clearRes.text();
           return NextResponse.json({ error: `Disconnect failed: ${clearRes.status} — ${err.slice(0, 300)}` }, { status: 500 });
         }
+
         // Verify by re-reading
         const verified = await getCampaign(campaignId);
         const vf = verified.fields || {};
