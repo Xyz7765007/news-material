@@ -2020,13 +2020,18 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
     if (!confirm("Disconnect Google Analytics from this campaign?\n\nThe sign-in will be removed. Sync will stop working until you reconnect.")) return;
     setBusy(true);
     try {
-      await ga("oauth_disconnect");
-      // Optimistic reset — immediately show as disconnected without waiting for Airtable read
+      const r = await ga("oauth_disconnect");
+      if (!r.ok) { setMsg("❌ " + (r.error || "Disconnect failed")); setBusy(false); return; }
+      // Optimistic reset — immediately show as disconnected
       setConfig(c => ({ ...c, hasOAuth: false, oauthEmail: "", hasServiceAccount: false, serviceAccountEmail: "", authMode: "none" }));
       setSyncResult(null);
-      setMsg("✅ Disconnected. Sign in again to reconnect.");
-      // Background refresh to sync with Airtable truth (may be slightly delayed)
-      setTimeout(() => loadConfig(), 1500);
+      if (r.cleared === false && r.remaining) {
+        setMsg(`⚠️ Partial disconnect: some auth remained. Remaining: ${JSON.stringify(r.remaining)}. Try again or contact support.`);
+      } else {
+        setMsg("✅ Disconnected. Sign in again to reconnect.");
+      }
+      // Background refresh after 3s (Airtable propagation)
+      setTimeout(() => loadConfig(), 3000);
     } catch (e) { setMsg("❌ " + e.message); }
     setBusy(false);
   };

@@ -406,12 +406,28 @@ export async function POST(request) {
       case "oauth_disconnect": {
         if (!campaignId) return NextResponse.json({ error: "campaignId required" }, { status: 400 });
         // Clear ALL auth — both OAuth and service account fallback
-        await patchCampaign(campaignId, {
-          "GA OAuth Refresh Token": "",
-          "GA OAuth Email": "",
-          "GA Service Account JSON": "",
+        // Airtable: use null to properly clear fields (empty string sometimes doesn't clear multilineText)
+        const clearRes = await patchCampaign(campaignId, {
+          "GA OAuth Refresh Token": null,
+          "GA OAuth Email": null,
+          "GA Service Account JSON": null,
         });
-        return NextResponse.json({ ok: true });
+        if (!clearRes.ok) {
+          const err = await clearRes.text();
+          return NextResponse.json({ error: `Disconnect failed: ${clearRes.status} — ${err.slice(0, 300)}` }, { status: 500 });
+        }
+        // Verify by re-reading
+        const verified = await getCampaign(campaignId);
+        const vf = verified.fields || {};
+        const stillHasAuth = !!(vf["GA OAuth Refresh Token"] || vf["GA Service Account JSON"]);
+        return NextResponse.json({
+          ok: true,
+          cleared: !stillHasAuth,
+          remaining: stillHasAuth ? {
+            hasOAuth: !!vf["GA OAuth Refresh Token"],
+            hasSA: !!vf["GA Service Account JSON"],
+          } : null,
+        });
       }
 
       // ─── CONFIG: save/get/test GA4 setup ─────────────────────
