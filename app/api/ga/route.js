@@ -699,6 +699,146 @@ export async function POST(request) {
         });
       }
 
+      // ─── LIST ENGAGED LEADS — for display on GA tab ─────────────
+      case "list_engaged_leads": {
+        if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
+        const minScore = typeof body.minScore === "number" ? body.minScore : 1;
+        let leads;
+        try { leads = await atList(baseId, "Leads"); }
+        catch (e) { return NextResponse.json({ error: e.message }, { status: 500 }); }
+        const engaged = leads
+          .filter(l => (l.fields?.["GA Engagement Score"] || 0) >= minScore)
+          .map(l => {
+            const f = l.fields || {};
+            return {
+              id: l.id,
+              name: f.Name || "",
+              title: f.Title || "",
+              company: f.Company || "",
+              email: f.Email || "",
+              linkedinUrl: f["LinkedIn URL"] || "",
+              customCode: f["Custom Code"] || "",
+              score: f["GA Engagement Score"] || 0,
+              lastVisit: f["GA Last Visit"] || "",
+              sessions: f["GA Sessions"] || 0,
+              engagedSessions: f["GA Engaged Sessions"] || 0,
+              views: f["GA Views"] || 0,
+              viewsPerSession: f["GA Views Per Session"] || 0,
+              engagementTime: f["GA Engagement Time"] || 0,
+              avgSessionDuration: f["GA Avg Session Duration"] || 0,
+            };
+          })
+          .sort((a, b) => b.score - a.score);
+        return NextResponse.json({ ok: true, engaged, count: engaged.length });
+      }
+
+      // ─── CONVERT ENGAGED LEADS TO TASKS ─────────────────────────
+      case "convert_to_tasks": {
+        if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
+        const leadIds = body.leadIds || []; // optional — if empty, convert ALL engaged
+        const minScore = typeof body.minScore === "number" ? body.minScore : 1;
+
+        let leads;
+        try { leads = await atList(baseId, "Leads"); }
+        catch (e) { return NextResponse.json({ error: e.message }, { status: 500 }); }
+
+        const targetLeads = leads.filter(l => {
+          const score = l.fields?.["GA Engagement Score"] || 0;
+          if (score < minScore) return false;
+          if (leadIds.length > 0 && !leadIds.includes(l.id)) return false;
+          return true;
+        });
+
+        if (targetLeads.length === 0) {
+          return NextResponse.json({ error: "No engaged leads match the criteria" }, { status: 400 });
+        }
+
+        // Check existing tasks to avoid duplicates — match by lead name + engagement signal
+        let existingTasks = [];
+        try { existingTasks = await atList(baseId, "Tasks"); } catch {}
+        const existingEngagementTasks = new Set(
+          existingTasks
+            .filter(t => t.fields?.["Task Type"] === "engagement")
+            .map(t => (t.fields?.Company || "") + "::" + (t.fields?.Signal || "").slice(0, 40))
+        );
+
+        const fmtTime = (sec) => {
+          const s = Math.round(Number(sec) || 0);
+          if (s < 60) return s + "s";
+          const m = Math.floor(s / 60); const r = s % 60;
+          return m + "m" + (r > 0 ? " " + r + "s" : "");
+        };
+
+        const nowISO = new Date().toISOString();
+        const todayStr = nowISO.slice(0, 10);
+        const newTasks = [];
+        let skipped = 0;
+
+        for (const lead of targetLeads) {
+          const f = lead.fields || {};
+          const name = f.Name || "Unknown";
+          const title = f.Title || "";
+          const company = f.Company || "";
+          const score = f["GA Engagement Score"] || 0;
+          const sessions = f["GA Sessions"] || 0;
+          const engagedSessions = f["GA Engaged Sessions"] || 0;
+          const views = f["GA Views"] || 0;
+          const engTime = f["GA Engagement Time"] || 0;
+          const lastVisit = f["GA Last Visit"] || "";
+
+          // Build rich signal text with all the context
+          const tier = score >= 51 ? "🔥 Hot Lead" : score >= 21 ? "⚡ Interested" : "👀 Warm";
+          const signal = `${tier} (score ${score}) — ${name}${title ? " · " + title : ""}${company ? " @ " + company : ""}. Visited website on ${lastVisit || "recently"}: ${sessions} session${sessions!==1?"s":""} (${engagedSessions} engaged), ${views} pageview${views!==1?"s":""}, ${fmtTime(engTime)} total engagement time.`;
+
+          const dedupKey = company + "::" + signal.slice(0, 40);
+          if (existingEngagementTasks.has(dedupKey)) { skipped++; continue; }
+
+          newTasks.push({
+            fields: {
+              Company: company,
+              "Task Rule": "Website Engagement (GA)",
+              Score: score,
+              "Scan Target": name,
+              Signal: signal,
+              Source: "Google Analytics",
+              "Task Type": "engagement",
+              Date: lastVisit || todayStr,
+              Created: nowISO,
+              Phone: f.Phone || "",
+            },
+          });
+        }
+
+        if (newTasks.length === 0) {
+          return NextResponse.json({ ok: true, created: 0, skipped, message: "All engaged leads already have tasks" });
+        }
+
+        // Batch-create tasks (10 at a time)
+        let created = 0;
+        const createErrors = [];
+        for (let i = 0; i < newTasks.length; i += 10) {
+          const batch = newTasks.slice(i, i + 10);
+          const r = await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Tasks")}`, {
+            method: "POST", headers: atHdr,
+            body: JSON.stringify({ records: batch }),
+          });
+          if (r.ok) {
+            created += batch.length;
+          } else {
+            const err = await r.text();
+            createErrors.push(`Batch ${i}: ${r.status} — ${err.slice(0, 200)}`);
+          }
+        }
+
+        return NextResponse.json({
+          ok: true,
+          created,
+          skipped,
+          total: targetLeads.length,
+          errors: createErrors.length > 0 ? createErrors.slice(0, 3) : undefined,
+        });
+      }
+
       default:
         return NextResponse.json({ error: "Unknown action: " + action }, { status: 400 });
     }

@@ -1426,14 +1426,46 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
 
   {/* LEADS */}
   {tab==="leads"&&!loading&&(()=>{
-    const prefCols = ["Name","Email","Title","Company","Custom Code","GA Engagement Score","GA Last Visit","Campaign Tag"];
     const allCols = leads.length ? [...new Set(leads.flatMap(l => Object.keys(l.fields || {})))] : [];
-    // Always show preferred GA columns even if currently empty (Airtable omits empty fields from records)
-    const ALWAYS_SHOW = ["Custom Code","GA Engagement Score","GA Last Visit"];
-    const effectiveCols = [...new Set([...allCols, ...ALWAYS_SHOW])];
-    const cols = [...prefCols.filter(c => effectiveCols.includes(c)), ...effectiveCols.filter(c => !prefCols.includes(c) && c !== "Campaign Tag" && !c.startsWith("GA "))].slice(0, 9);
-    if (effectiveCols.includes("Campaign Tag") && !cols.includes("Campaign Tag")) cols.push("Campaign Tag");
-    const fmt = v => { if (v === null || v === undefined) return ""; if (typeof v === "object") return JSON.stringify(v).slice(0, 50); return String(v).slice(0, 60); };
+    const hasGAData = leads.some(l => (l.fields?.["GA Engagement Score"] || 0) > 0);
+
+    // Column order: basics → Custom Code → (GA columns only if GA has ever run) → overflow → Campaign Tag
+    const basicsCols = ["Name","Email","Title","Company"];
+    const gaCols = ["Custom Code","GA Engagement Score","GA Last Visit","GA Sessions","GA Engaged Sessions","GA Views","GA Views Per Session","GA Engagement Time","GA Avg Session Duration"];
+    const ALWAYS_SHOW_GA = ["Custom Code","GA Engagement Score","GA Last Visit","GA Sessions","GA Engaged Sessions","GA Views","GA Engagement Time"];
+    const effectiveCols = [...new Set([...allCols, ...ALWAYS_SHOW_GA])];
+
+    // Start with basics that exist
+    const cols = basicsCols.filter(c => effectiveCols.includes(c));
+    // Add GA columns (Custom Code always; rest only if GA data exists or field is present)
+    if (effectiveCols.includes("Custom Code")) cols.push("Custom Code");
+    if (hasGAData || allCols.includes("GA Engagement Score")) {
+      for (const c of ["GA Engagement Score","GA Last Visit","GA Sessions","GA Engaged Sessions","GA Views","GA Engagement Time"]) {
+        if (effectiveCols.includes(c)) cols.push(c);
+      }
+    }
+    // Campaign Tag at the end
+    if (effectiveCols.includes("Campaign Tag")) cols.push("Campaign Tag");
+
+    const fmtTime = (sec) => {
+      const s = Math.round(Number(sec) || 0);
+      if (s === 0) return "—";
+      if (s < 60) return s + "s";
+      const m = Math.floor(s / 60); const r = s % 60;
+      return m + "m " + (r > 0 ? r + "s" : "");
+    };
+    const fmtNum = (v) => { const n = Number(v); return n > 0 ? String(n) : "—"; };
+    const fmtScore = (v) => { const n = Number(v) || 0; return n > 0 ? String(n) : "—"; };
+    const fmt = (v, colName) => {
+      if (v === null || v === undefined || v === "") return colName && colName.startsWith("GA ") ? "—" : "";
+      if (colName === "GA Engagement Time" || colName === "GA Avg Session Duration") return fmtTime(v);
+      if (colName === "GA Sessions" || colName === "GA Engaged Sessions" || colName === "GA Views") return fmtNum(v);
+      if (colName === "GA Engagement Score") return fmtScore(v);
+      if (colName === "GA Views Per Session") { const n = Number(v); return n > 0 ? n.toFixed(1) : "—"; }
+      if (typeof v === "object") return JSON.stringify(v).slice(0, 50);
+      return String(v).slice(0, 60);
+    };
+
     const leadTags = [...new Set(leads.map(l => (l.fields || {})["Campaign Tag"]).filter(Boolean))].sort();
     let filteredLeads = campTagFilter === "all" ? leads : leads.filter(l => (l.fields || {})["Campaign Tag"] === campTagFilter);
     if (engagementFilter === "engaged") filteredLeads = filteredLeads.filter(l => (l.fields?.["GA Engagement Score"] || 0) > 0);
@@ -1456,7 +1488,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       </div></div>
 
     {filteredLeads.length===0?<div className="empty"><div className="em">👤</div><p>{leads.length>0?"No leads match this campaign filter.":"Upload a CSV."}</p></div>:
-    <div className="tw"><table><thead><tr>{cols.map(k=><th key={k}>{k}</th>)}<th></th></tr></thead><tbody>{filteredLeads.map(l=>{const f=l.fields||{};return(<tr key={l.id}>{cols.map(k=><td key={k} style={k==="Name"?{color:"var(--t1)",fontWeight:500}:k==="Email"?{fontSize:10}:k==="Campaign Tag"?{fontSize:10,color:"var(--acc)"}:k==="Custom Code"?{fontSize:10,fontFamily:"'JetBrains Mono',monospace",color:"var(--t3)"}:k==="GA Engagement Score"?{fontWeight:600,color:f[k]>50?"var(--grn)":f[k]>20?"var(--amb)":"var(--t3)"}:k==="GA Last Visit"?{fontSize:10,color:f[k]?"var(--blu)":"var(--t3)"}:{}}>{fmt(f[k])}</td>)}<td><button className="btn btn-d btn-s" onClick={()=>del("Leads",[l.id],setLeads)}><I.Trash/></button></td></tr>)})}</tbody></table></div>}</div>);
+    <div className="tw"><table><thead><tr>{cols.map(k=><th key={k}>{k}</th>)}<th></th></tr></thead><tbody>{filteredLeads.map(l=>{const f=l.fields||{};return(<tr key={l.id}>{cols.map(k=><td key={k} style={k==="Name"?{color:"var(--t1)",fontWeight:500}:k==="Email"?{fontSize:10}:k==="Campaign Tag"?{fontSize:10,color:"var(--acc)"}:k==="Custom Code"?{fontSize:10,fontFamily:"'JetBrains Mono',monospace",color:"var(--t3)"}:k==="GA Engagement Score"?{fontWeight:600,color:f[k]>50?"var(--grn)":f[k]>20?"var(--amb)":f[k]>0?"var(--blu)":"var(--t3)",fontSize:11}:k==="GA Last Visit"?{fontSize:10,color:f[k]?"var(--blu)":"var(--t3)"}:k==="GA Engagement Time"||k==="GA Avg Session Duration"?{fontSize:10,color:Number(f[k])>0?"var(--t1)":"var(--t3)"}:k==="GA Sessions"||k==="GA Engaged Sessions"||k==="GA Views"||k==="GA Views Per Session"?{fontSize:10,color:Number(f[k])>0?"var(--t1)":"var(--t3)",textAlign:"center"}:{}}>{fmt(f[k],k)}</td>)}<td><button className="btn btn-d btn-s" onClick={()=>del("Leads",[l.id],setLeads)}><I.Trash/></button></td></tr>)})}</tbody></table></div>}</div>);
   })()}
 
   {/* TASK RULES (unified — signal + top_x) */}
@@ -1952,6 +1984,8 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   const [syncResult, setSyncResult] = useState(null);
+  const [engagedLeads, setEngagedLeads] = useState([]);
+  const [selectedEngagedIds, setSelectedEngagedIds] = useState(new Set());
 
   const ga = async (action, data = {}) => {
     const res = await fetch("/api/ga", {
@@ -1988,6 +2022,19 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
     window.addEventListener("message", handler);
     return () => window.removeEventListener("message", handler);
   }, [campaign?.airtableId]);
+
+  const loadEngaged = async () => {
+    try {
+      const r = await ga("list_engaged_leads", { minScore: 1 });
+      if (r.ok) setEngagedLeads(r.engaged || []);
+    } catch (e) { console.error(e); }
+  };
+
+  // Load engaged leads on mount + after sync
+  useEffect(() => {
+    if (!campaign?.airtableId || !baseId) return;
+    loadEngaged();
+  }, [campaign?.airtableId, baseId]);
 
   const isAuthed = config.hasOAuth || config.hasServiceAccount;
   const hasProperty = !!config.propertyId;
@@ -2074,11 +2121,79 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
         }
         if (onSyncComplete) onSyncComplete();
         await loadConfig();
+        await loadEngaged();
       } else {
         setMsg("❌ " + (r.error || "Sync failed"));
       }
     } catch (e) { setMsg("❌ " + e.message); }
     setBusy(false);
+  };
+
+  const fmtEngTime = (sec) => {
+    const s = Math.round(Number(sec) || 0);
+    if (s === 0) return "—";
+    if (s < 60) return s + "s";
+    const m = Math.floor(s / 60); const r = s % 60;
+    return m + "m" + (r > 0 ? " " + r + "s" : "");
+  };
+  const tierFor = (score) => score >= 51 ? { label: "🔥 Hot", color: "var(--grn)" } : score >= 21 ? { label: "⚡ Interested", color: "var(--amb)" } : { label: "👀 Warm", color: "var(--blu)" };
+
+  const toggleEngagedSelection = (id) => {
+    setSelectedEngagedIds(prev => {
+      const n = new Set(prev);
+      if (n.has(id)) n.delete(id); else n.add(id);
+      return n;
+    });
+  };
+  const selectAllEngaged = () => setSelectedEngagedIds(new Set(engagedLeads.map(l => l.id)));
+  const clearEngagedSelection = () => setSelectedEngagedIds(new Set());
+
+  const convertEngagedToTasks = async () => {
+    const ids = Array.from(selectedEngagedIds);
+    const target = ids.length > 0 ? ids : engagedLeads.map(l => l.id);
+    if (target.length === 0) { setMsg("❌ No engaged leads to convert"); return; }
+    if (!confirm(`Convert ${target.length} engaged lead${target.length!==1?"s":""} to tasks?\n\nEach task will include their engagement score, last visit, sessions, and time on site — ready to review in the Tasks tab.`)) return;
+    setBusy(true); setMsg("⏳ Creating tasks...");
+    try {
+      const r = await ga("convert_to_tasks", { leadIds: target, minScore: 1 });
+      if (r.ok) {
+        setMsg(`✅ Created ${r.created} task${r.created!==1?"s":""}${r.skipped > 0 ? ` (${r.skipped} already existed, skipped)` : ""}. Open the Tasks tab to review.`);
+        clearEngagedSelection();
+      } else {
+        setMsg("❌ " + (r.error || "Convert failed"));
+      }
+    } catch (e) { setMsg("❌ " + e.message); }
+    setBusy(false);
+  };
+
+  const exportEngagedCSV = () => {
+    if (engagedLeads.length === 0) return;
+    const rows = [
+      ["Name","Title","Company","Email","LinkedIn URL","Custom Code","Score","Last Visit","Sessions","Engaged Sessions","Views","Views Per Session","Engagement Time (sec)","Avg Session Duration (sec)"].join(","),
+      ...engagedLeads.map(l => [
+        `"${(l.name||"").replace(/"/g,'""')}"`,
+        `"${(l.title||"").replace(/"/g,'""')}"`,
+        `"${(l.company||"").replace(/"/g,'""')}"`,
+        l.email||"",
+        l.linkedinUrl||"",
+        l.customCode||"",
+        l.score,
+        l.lastVisit||"",
+        l.sessions,
+        l.engagedSessions,
+        l.views,
+        l.viewsPerSession,
+        l.engagementTime,
+        l.avgSessionDuration,
+      ].join(","))
+    ].join("\n");
+    const blob = new Blob([rows], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${campaign?.name || "campaign"}-engaged-leads-${new Date().toISOString().slice(0,10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const lastSyncStr = config.lastSync
@@ -2160,6 +2275,81 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
               </div>
             </div>
           )}
+
+          {/* ENGAGED LEADS LIST */}
+          {engagedLeads.length > 0 && (
+            <div style={{marginTop:18}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                <div>
+                  <div style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>🎯 {engagedLeads.length} engaged lead{engagedLeads.length!==1?"s":""} this week</div>
+                  <div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>{selectedEngagedIds.size > 0 ? `${selectedEngagedIds.size} selected` : "Select individual leads or convert all to tasks"}</div>
+                </div>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  {selectedEngagedIds.size > 0 ? (
+                    <button className="btn btn-s" onClick={clearEngagedSelection}>Clear</button>
+                  ) : (
+                    <button className="btn btn-s" onClick={selectAllEngaged}>Select all</button>
+                  )}
+                  <button className="btn btn-s" onClick={exportEngagedCSV}>📥 Export CSV</button>
+                  <button className="btn btn-p btn-s" disabled={busy} onClick={convertEngagedToTasks}>{busy?"⏳":`✨ Convert ${selectedEngagedIds.size > 0 ? selectedEngagedIds.size : "all"} to tasks`}</button>
+                </div>
+              </div>
+
+              <div style={{border:"1px solid var(--bdr)",borderRadius:8,overflow:"hidden"}}>
+                {engagedLeads.map((l, idx) => {
+                  const tier = tierFor(l.score);
+                  const selected = selectedEngagedIds.has(l.id);
+                  return (
+                    <div key={l.id} onClick={()=>toggleEngagedSelection(l.id)} style={{
+                      display:"grid",gridTemplateColumns:"auto 1fr auto auto auto",gap:14,alignItems:"center",
+                      padding:"12px 14px",cursor:"pointer",
+                      background:selected?"var(--hover)":(idx%2===0?"transparent":"rgba(255,255,255,0.015)"),
+                      borderBottom:idx<engagedLeads.length-1?"1px solid var(--bdr)":"none",
+                      transition:"background 0.1s",
+                    }}>
+                      <input type="checkbox" checked={selected} onChange={()=>toggleEngagedSelection(l.id)} onClick={e=>e.stopPropagation()} style={{accentColor:"var(--acc)"}}/>
+                      <div style={{minWidth:0}}>
+                        <div style={{fontSize:12,fontWeight:600,color:"var(--t1)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{l.name || "Unknown"}</div>
+                        <div style={{fontSize:10,color:"var(--t3)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                          {l.title ? l.title : ""}{l.title && l.company ? " · " : ""}{l.company || ""}
+                        </div>
+                      </div>
+                      <div style={{textAlign:"right",fontSize:10,color:"var(--t3)",minWidth:180}}>
+                        <div style={{color:"var(--t2)"}}>{l.sessions} session{l.sessions!==1?"s":""} · {l.views} view{l.views!==1?"s":""}</div>
+                        <div>{fmtEngTime(l.engagementTime)} · last visit {l.lastVisit || "—"}</div>
+                      </div>
+                      <div style={{fontSize:10,fontWeight:600,color:tier.color,minWidth:90,textAlign:"center"}}>{tier.label}</div>
+                      <div style={{fontSize:20,fontWeight:700,color:tier.color,minWidth:36,textAlign:"right"}}>{l.score}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {engagedLeads.length === 0 && config.lastSync && (
+            <div style={{marginTop:18,padding:24,background:"var(--hover)",borderRadius:8,textAlign:"center"}}>
+              <div style={{fontSize:24,marginBottom:6}}>🌱</div>
+              <div style={{fontSize:12,color:"var(--t2)",fontWeight:500}}>No engaged leads this week yet</div>
+              <div style={{fontSize:10,color:"var(--t3)",marginTop:4}}>When leads visit the website via your tracked links, they'll appear here with engagement scores.</div>
+            </div>
+          )}
+
+          {/* SCORING METHODOLOGY */}
+          <div style={{marginTop:14,padding:14,background:"var(--card)",border:"1px dashed var(--bdr)",borderRadius:8}}>
+            <div style={{fontSize:11,fontWeight:600,color:"var(--t1)",marginBottom:8}}>📊 How Engagement Score works (0–100)</div>
+            <div style={{fontSize:10,color:"var(--t2)",lineHeight:1.7}}>
+              Weighted combination of 3 signals, sliding 7-day window:
+              <div style={{paddingLeft:14,marginTop:6,fontFamily:"'JetBrains Mono',monospace",fontSize:10,color:"var(--t3)"}}>
+                • <strong style={{color:"var(--t1)"}}>50%</strong> Engagement Time — 0s=0, 30s=50, 120s+=100<br/>
+                • <strong style={{color:"var(--t1)"}}>30%</strong> Engaged Sessions — 0=0, 1=50, 3+=100<br/>
+                • <strong style={{color:"var(--t1)"}}>20%</strong> Views/Session — 1=20, 3=60, 5+=100
+              </div>
+              <div style={{marginTop:8}}>
+                Score tiers: <span style={{color:"var(--blu)",fontWeight:600}}>1–20 Warm</span> · <span style={{color:"var(--amb)",fontWeight:600}}>21–50 Interested</span> · <span style={{color:"var(--grn)",fontWeight:600}}>51+ Hot Lead</span>
+              </div>
+            </div>
+          </div>
         </div>
       )}
 
