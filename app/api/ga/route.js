@@ -3,8 +3,17 @@ import { JWT } from "google-auth-library";
 
 const AIRTABLE_KEY = process.env.AIRTABLE_API_KEY;
 const MASTER_BASE_ID = process.env.AIRTABLE_BASE_ID;
+const OAUTH_CLIENT_ID = process.env.GOOGLE_OAUTH_CLIENT_ID;
+const OAUTH_CLIENT_SECRET = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
 const AT_API = "https://api.airtable.com/v0";
 const atHdr = { Authorization: `Bearer ${AIRTABLE_KEY}`, "Content-Type": "application/json" };
+
+// Helper to get the deployment's base URL for building OAuth redirect URIs
+function getBaseUrl(request) {
+  const host = request.headers.get("host");
+  const proto = request.headers.get("x-forwarded-proto") || "https";
+  return `${proto}://${host}`;
+}
 
 // ═══════════════════════════════════════════════════════════════
 // AIRTABLE HELPERS
@@ -22,15 +31,85 @@ async function atList(baseId, table) {
   return all;
 }
 
+// Auto-create missing fields on any table (handles upgrades without re-running Setup)
+async function ensureTableFields(baseId, tableName, missingFieldNames) {
+  const GA_TYPES = {
+    "Custom Code": "singleLineText",
+    "GA Sessions": { type: "number", options: { precision: 0 } },
+    "GA Engaged Sessions": { type: "number", options: { precision: 0 } },
+    "GA Views": { type: "number", options: { precision: 0 } },
+    "GA Views Per Session": { type: "number", options: { precision: 2 } },
+    "GA Engagement Time": { type: "number", options: { precision: 0 } },
+    "GA Avg Session Duration": { type: "number", options: { precision: 1 } },
+    "GA Last Visit": "singleLineText",
+    "GA Engagement Score": { type: "number", options: { precision: 0 } },
+    "GA Last Synced At": "singleLineText",
+  };
+  try {
+    const tablesRes = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables`, { headers: atHdr });
+    if (!tablesRes.ok) return false;
+    const { tables } = await tablesRes.json();
+    const targetTable = (tables || []).find(t => t.name === tableName);
+    if (!targetTable) return false;
+    for (const fname of missingFieldNames) {
+      const spec = GA_TYPES[fname];
+      const body = typeof spec === "string"
+        ? { name: fname, type: spec }
+        : { name: fname, type: spec?.type || "singleLineText", ...(spec?.options ? { options: spec.options } : {}) };
+      const r = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables/${targetTable.id}/fields`, {
+        method: "POST", headers: atHdr,
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) console.error(`[GA] Failed to create field ${fname}:`, await r.text());
+    }
+    return true;
+  } catch (e) {
+    console.error("[ga] ensureTableFields failed:", e);
+    return false;
+  }
+}
+
 async function atUpdate(baseId, table, records) {
+  let successCount = 0;
+  let failCount = 0;
+  const errors = [];
   for (let i = 0; i < records.length; i += 10) {
     const batch = records.slice(i, i + 10);
-    const res = await fetch(`${AT_API}/${baseId}/${encodeURIComponent(table)}`, {
+    let res = await fetch(`${AT_API}/${baseId}/${encodeURIComponent(table)}`, {
       method: "PATCH", headers: atHdr,
       body: JSON.stringify({ records: batch }),
     });
-    if (!res.ok) console.error("[GA] Airtable update failed:", await res.text());
+
+    // Auto-create missing fields if 422 — loop up to 5 times as Airtable reports one at a time
+    let attempts = 0;
+    while (res.status === 422 && attempts < 5) {
+      attempts++;
+      const errText = await res.text();
+      const unknownFields = [];
+      const matches = errText.matchAll(/[Uu]nknown field name:?\s*\\?["']([^"'\\]+)\\?["']/g);
+      for (const m of matches) unknownFields.push(m[1]);
+      if (unknownFields.length === 0) {
+        // Fallback — detect any field name from the batch mentioned in error
+        const allFieldNames = new Set(batch.flatMap(r => Object.keys(r.fields || {})));
+        for (const f of allFieldNames) if (errText.includes(f)) unknownFields.push(f);
+      }
+      if (unknownFields.length === 0) break;
+      await ensureTableFields(baseId, table, unknownFields);
+      res = await fetch(`${AT_API}/${baseId}/${encodeURIComponent(table)}`, {
+        method: "PATCH", headers: atHdr,
+        body: JSON.stringify({ records: batch }),
+      });
+    }
+
+    if (res.ok) {
+      successCount += batch.length;
+    } else {
+      failCount += batch.length;
+      const errText = await res.text();
+      errors.push(`Batch ${i}-${i+batch.length}: HTTP ${res.status} — ${errText.slice(0, 200)}`);
+    }
   }
+  return { successCount, failCount, errors };
 }
 
 async function getCampaign(campaignId) {
@@ -52,6 +131,8 @@ async function ensureCampaignFields(missingFieldNames) {
   const TYPE_MAP = {
     "GA4 Property ID": "singleLineText",
     "GA Service Account JSON": "multilineText",
+    "GA OAuth Refresh Token": "multilineText",
+    "GA OAuth Email": "singleLineText",
     "GA Last Sync": "singleLineText",
   };
   try {
@@ -100,11 +181,117 @@ async function getGAClient(serviceAccountJson) {
   return client;
 }
 
-// Pull last N days of GA data, broken down by Session campaign ID
-async function fetchGADataByCustomCode(propertyId, serviceAccountJson, daysBack = 7) {
-  const client = await getGAClient(serviceAccountJson);
-  const url = `https://analyticsdata.googleapis.com/v1beta/properties/${propertyId}:runReport`;
+// ═══════════════════════════════════════════════════════════════
+// OAUTH — Google Sign-In flow
+// ═══════════════════════════════════════════════════════════════
+const OAUTH_SCOPES = [
+  "https://www.googleapis.com/auth/analytics.readonly",
+  "https://www.googleapis.com/auth/userinfo.email",
+].join(" ");
 
+function buildOAuthAuthUrl(redirectUri, campaignId) {
+  const params = new URLSearchParams({
+    client_id: OAUTH_CLIENT_ID,
+    redirect_uri: redirectUri,
+    response_type: "code",
+    scope: OAUTH_SCOPES,
+    access_type: "offline", // MUST be "offline" to get refresh_token
+    prompt: "consent", // force consent so we ALWAYS get a refresh_token (Google only returns it on first consent otherwise)
+    state: campaignId, // so the callback knows which campaign to associate the token with
+  });
+  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+}
+
+// Exchange authorization code for access + refresh tokens
+async function exchangeCodeForTokens(code, redirectUri) {
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      code,
+      client_id: OAUTH_CLIENT_ID,
+      client_secret: OAUTH_CLIENT_SECRET,
+      redirect_uri: redirectUri,
+      grant_type: "authorization_code",
+    }).toString(),
+  });
+  if (!res.ok) throw new Error(`OAuth token exchange failed: ${res.status} ${(await res.text()).slice(0, 300)}`);
+  return res.json(); // { access_token, refresh_token, expires_in, id_token, ... }
+}
+
+// Swap refresh_token for a fresh access_token
+async function refreshAccessToken(refreshToken) {
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: OAUTH_CLIENT_ID,
+      client_secret: OAUTH_CLIENT_SECRET,
+      refresh_token: refreshToken,
+      grant_type: "refresh_token",
+    }).toString(),
+  });
+  if (!res.ok) throw new Error(`OAuth refresh failed: ${res.status} ${(await res.text()).slice(0, 300)}`);
+  return res.json(); // { access_token, expires_in, ... }
+}
+
+async function getUserEmail(accessToken) {
+  const res = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!res.ok) return "";
+  const d = await res.json();
+  return d.email || "";
+}
+
+// Make an authenticated GA Data API call using raw access token
+async function gaApiCall(accessToken, propertyId, requestBody) {
+  const res = await fetch(`https://analyticsdata.googleapis.com/v1beta/properties/${propertyId}:runReport`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify(requestBody),
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    const err = new Error(`GA API ${res.status}: ${errText.slice(0, 400)}`);
+    err.status = res.status;
+    err.responseText = errText;
+    throw err;
+  }
+  return res.json();
+}
+
+// Resolve auth for a campaign → returns a function (propertyId, body) => data
+// Prefers OAuth refresh token; falls back to service account JSON if configured
+async function resolveAuth(campaignFields) {
+  const refreshToken = campaignFields["GA OAuth Refresh Token"];
+  const saJson = campaignFields["GA Service Account JSON"];
+
+  if (refreshToken) {
+    // OAuth path
+    const { access_token } = await refreshAccessToken(refreshToken);
+    return { mode: "oauth", callApi: (propertyId, body) => gaApiCall(access_token, propertyId, body) };
+  }
+  if (saJson) {
+    // Service account fallback
+    const client = await getGAClient(saJson);
+    return {
+      mode: "service_account",
+      callApi: async (propertyId, body) => {
+        const r = await client.request({
+          url: `https://analyticsdata.googleapis.com/v1beta/properties/${propertyId}:runReport`,
+          method: "POST",
+          data: body,
+        });
+        return r.data;
+      },
+    };
+  }
+  throw new Error("No auth configured. Sign in with Google to connect GA.");
+}
+
+// Pull last N days of GA data, broken down by Session campaign ID
+async function fetchGADataByCustomCode(propertyId, auth, daysBack = 7) {
   const today = new Date();
   const startDate = new Date(today);
   startDate.setDate(today.getDate() - daysBack);
@@ -130,11 +317,7 @@ async function fetchGADataByCustomCode(propertyId, serviceAccountJson, daysBack 
     limit: 10000,
   };
 
-  const res = await client.request({
-    url,
-    method: "POST",
-    data: requestBody,
-  });
+  const data = await auth.callApi(propertyId, requestBody);
 
   // Also fetch last visit date per Custom Code
   const lastVisitBody = {
@@ -144,15 +327,11 @@ async function fetchGADataByCustomCode(propertyId, serviceAccountJson, daysBack 
     dimensionFilter: requestBody.dimensionFilter,
     limit: 50000,
   };
-  const lvRes = await client.request({
-    url,
-    method: "POST",
-    data: lastVisitBody,
-  });
+  const lvData = await auth.callApi(propertyId, lastVisitBody);
 
   // Parse response
-  const rows = res.data.rows || [];
-  const lvRows = lvRes.data.rows || [];
+  const rows = data.rows || [];
+  const lvRows = lvData.rows || [];
 
   // Build last-visit map: code -> latest date
   const lastVisitMap = {};
@@ -206,6 +385,33 @@ export async function POST(request) {
     const { action, campaignId, baseId } = body;
 
     switch (action) {
+      // ─── OAUTH: generate sign-in URL ─────────────────────────
+      case "oauth_start": {
+        if (!campaignId) return NextResponse.json({ error: "campaignId required" }, { status: 400 });
+        if (!OAUTH_CLIENT_ID) return NextResponse.json({ error: "GOOGLE_OAUTH_CLIENT_ID not set in Vercel env vars" }, { status: 500 });
+        const redirectUri = `${getBaseUrl(request)}/api/ga/oauth/callback`;
+        const state = encodeURIComponent(JSON.stringify({ campaignId, t: Date.now() }));
+        const url = "https://accounts.google.com/o/oauth2/v2/auth?" + new URLSearchParams({
+          client_id: OAUTH_CLIENT_ID,
+          redirect_uri: redirectUri,
+          response_type: "code",
+          scope: "https://www.googleapis.com/auth/analytics.readonly https://www.googleapis.com/auth/userinfo.email",
+          access_type: "offline",
+          prompt: "consent", // force refresh_token to be issued even on re-auth
+          state,
+        }).toString();
+        return NextResponse.json({ url, redirectUri });
+      }
+
+      case "oauth_disconnect": {
+        if (!campaignId) return NextResponse.json({ error: "campaignId required" }, { status: 400 });
+        await patchCampaign(campaignId, {
+          "GA OAuth Refresh Token": "",
+          "GA OAuth Email": "",
+        });
+        return NextResponse.json({ ok: true });
+      }
+
       // ─── CONFIG: save/get/test GA4 setup ─────────────────────
       case "save_ga_config": {
         if (!campaignId) return NextResponse.json({ error: "campaignId required" }, { status: 400 });
@@ -255,15 +461,23 @@ export async function POST(request) {
         const camp = await getCampaign(campaignId);
         const f = camp.fields || {};
         const json = f["GA Service Account JSON"] || "";
+        const refreshToken = f["GA OAuth Refresh Token"] || "";
+        const oauthEmail = f["GA OAuth Email"] || "";
         let serviceAccountEmail = "";
         if (json) {
           try { serviceAccountEmail = parseServiceAccount(json).client_email; } catch {}
         }
         return NextResponse.json({
           propertyId: f["GA4 Property ID"] || "",
+          // OAuth state
+          hasOAuth: !!refreshToken,
+          oauthEmail,
+          // Service account fallback state
           hasServiceAccount: !!json,
           serviceAccountEmail,
           lastSync: f["GA Last Sync"] || "",
+          // Which mode is primary (OAuth > SA)
+          authMode: refreshToken ? "oauth" : (json ? "service_account" : "none"),
         });
       }
 
@@ -272,37 +486,32 @@ export async function POST(request) {
         const camp = await getCampaign(campaignId);
         const f = camp.fields || {};
         const propertyId = f["GA4 Property ID"];
-        const json = f["GA Service Account JSON"];
         if (!propertyId) return NextResponse.json({ error: "GA4 Property ID not set" }, { status: 400 });
-        if (!json) return NextResponse.json({ error: "Service Account JSON not set" }, { status: 400 });
 
         try {
-          // Run a tiny test query (last 1 day, top-level metric)
-          const client = await getGAClient(json);
-          const res = await client.request({
-            url: `https://analyticsdata.googleapis.com/v1beta/properties/${propertyId}:runReport`,
-            method: "POST",
-            data: {
-              dateRanges: [{ startDate: "1daysAgo", endDate: "today" }],
-              metrics: [{ name: "sessions" }],
-              limit: 1,
-            },
+          const auth = await resolveAuth(f);
+          const data = await auth.callApi(propertyId, {
+            dateRanges: [{ startDate: "1daysAgo", endDate: "today" }],
+            metrics: [{ name: "sessions" }],
+            limit: 1,
           });
-          const sessionCount = res.data.rows?.[0]?.metricValues?.[0]?.value || "0";
+          const sessionCount = data.rows?.[0]?.metricValues?.[0]?.value || "0";
           return NextResponse.json({
             ok: true,
-            message: `✅ Connected to GA4 property ${propertyId}. Last 1 day had ${sessionCount} sessions.`,
-            serviceAccountEmail: parseServiceAccount(json).client_email,
+            message: `✅ Connected to GA4 property ${propertyId} via ${auth.mode === "oauth" ? "Google Sign-In" : "service account"}. Last 1 day had ${sessionCount} sessions.`,
+            mode: auth.mode,
           });
         } catch (e) {
           let hint = "";
           const msg = e.message || String(e);
           if (msg.includes("403") || msg.includes("Permission")) {
-            hint = "\n\n👉 Fix: In your GA4 Admin → Property Access Management → add the service account email as Viewer.";
+            hint = "\n\n👉 Fix: The signed-in Google account doesn't have access to this GA4 property. Either sign in with an account that has access, or get added as a Viewer in GA4 Admin → Property Access Management.";
           } else if (msg.includes("404") || msg.includes("not found")) {
             hint = "\n\n👉 Fix: GA4 Property ID is wrong. Check Admin → Property Settings.";
-          } else if (msg.includes("API has not been used")) {
-            hint = "\n\n👉 Fix: Enable the Google Analytics Data API in the Cloud project that owns the service account.";
+          } else if (msg.includes("API has not been used") || msg.includes("has not been enabled")) {
+            hint = "\n\n👉 Fix: Enable the Google Analytics Data API in the Cloud project that owns the OAuth client.";
+          } else if (msg.includes("invalid_grant") || msg.includes("refresh")) {
+            hint = "\n\n👉 Fix: OAuth token expired or revoked. Click 'Sign in with Google' again.";
           }
           return NextResponse.json({ error: msg + hint }, { status: 400 });
         }
@@ -378,14 +587,23 @@ export async function POST(request) {
         }
 
         // 4. Push updates to Airtable
+        let updateResult;
         try {
-          await atUpdate(baseId, "Leads", updates);
+          updateResult = await atUpdate(baseId, "Leads", updates);
         } catch (e) {
           return NextResponse.json({ error: `Airtable update failed: ${e.message}` }, { status: 500 });
         }
 
         // 5. Update campaign's last sync timestamp
         try { await patchCampaign(campaignId, { "GA Last Sync": nowISO }); } catch {}
+
+        // If ALL updates failed, return as error so UI shows it clearly
+        if (updateResult.failCount > 0 && updateResult.successCount === 0) {
+          return NextResponse.json({
+            error: `All ${updateResult.failCount} Airtable updates failed. First error: ${updateResult.errors[0] || "unknown"}`,
+            totalLeads, leadsTracked, activeThisWeek: matched, inactive: cleared,
+          }, { status: 500 });
+        }
 
         return NextResponse.json({
           ok: true,
@@ -395,6 +613,9 @@ export async function POST(request) {
           inactive: cleared,
           unmatchedCodes: Object.keys(metricsMap).filter(code => !leadsWithCodes.find(l => l.fields?.["Custom Code"] === code)).length,
           syncedAt: nowISO,
+          updatesSucceeded: updateResult.successCount,
+          updatesFailed: updateResult.failCount,
+          updateErrors: updateResult.errors.length > 0 ? updateResult.errors.slice(0, 3) : undefined,
         });
       }
 

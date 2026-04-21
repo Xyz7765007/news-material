@@ -1946,11 +1946,9 @@ function PushToHubSpotForm({ tasks, owners, onPush, loading, rules }) {
 // GOOGLE ANALYTICS CARD (in Leads tab)
 // ═══════════════════════════════════════════════════════════════
 function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
-  const [collapsed, setCollapsed] = useState(false);
-  const [config, setConfig] = useState({ propertyId: "", hasServiceAccount: false, serviceAccountEmail: "", lastSync: "" });
+  const [config, setConfig] = useState({ propertyId: "", hasOAuth: false, oauthEmail: "", hasServiceAccount: false, serviceAccountEmail: "", authMode: "none", lastSync: "" });
   const [propertyDraft, setPropertyDraft] = useState("");
-  const [jsonDraft, setJsonDraft] = useState("");
-  const [editing, setEditing] = useState(false);
+  const [propertyEditing, setPropertyEditing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   const [syncResult, setSyncResult] = useState(null);
@@ -1963,36 +1961,81 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
     return res.json();
   };
 
+  const loadConfig = async () => {
+    try {
+      const r = await ga("get_ga_config");
+      setConfig(r);
+      if (!propertyEditing) setPropertyDraft(r.propertyId || "");
+    } catch (e) { console.error(e); }
+  };
+
   // Load config on mount
   useEffect(() => {
     if (!campaign?.airtableId) return;
-    (async () => {
-      try {
-        const r = await ga("get_ga_config");
-        if (r.propertyId || r.hasServiceAccount) {
-          setConfig(r);
-          setPropertyDraft(r.propertyId || "");
-        }
-      } catch (e) { console.error(e); }
-    })();
+    loadConfig();
   }, [campaign?.airtableId]);
 
-  const isConfigured = !!config.propertyId && !!config.hasServiceAccount;
+  // Listen for popup message (OAuth callback posts back to parent)
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.data?.type === "ga_oauth_success") {
+        setMsg(`✅ Connected as ${e.data.email || "Google user"}`);
+        loadConfig();
+      } else if (e.data?.type === "ga_oauth_error") {
+        setMsg("❌ " + (e.data.message || "OAuth failed"));
+      }
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  }, [campaign?.airtableId]);
 
-  const saveConfig = async () => {
+  const isAuthed = config.hasOAuth || config.hasServiceAccount;
+  const hasProperty = !!config.propertyId;
+  const isReady = isAuthed && hasProperty;
+
+  const connectGoogle = async () => {
+    setBusy(true); setMsg("⏳ Opening Google sign-in...");
+    try {
+      const r = await ga("oauth_start");
+      if (r.url) {
+        const popup = window.open(r.url, "ga_oauth", "width=520,height=640");
+        if (!popup || popup.closed) { setMsg("❌ Popup blocked — allow popups and retry"); setBusy(false); return; }
+        setMsg("🔗 Complete sign-in in the popup window...");
+        // Poll for popup close (fallback if postMessage doesn't fire)
+        const interval = setInterval(() => {
+          if (popup.closed) {
+            clearInterval(interval);
+            setTimeout(loadConfig, 500);
+            setBusy(false);
+          }
+        }, 1000);
+      } else {
+        setMsg("❌ " + (r.error || "Couldn't start OAuth"));
+        setBusy(false);
+      }
+    } catch (e) { setMsg("❌ " + e.message); setBusy(false); }
+  };
+
+  const disconnectGoogle = async () => {
+    if (!confirm("Disconnect Google Analytics from this campaign?\n\nThe sign-in will be removed. Sync will stop working until you reconnect.")) return;
+    setBusy(true);
+    try {
+      await ga("oauth_disconnect");
+      setMsg("✅ Disconnected");
+      await loadConfig();
+    } catch (e) { setMsg("❌ " + e.message); }
+    setBusy(false);
+  };
+
+  const saveProperty = async () => {
     if (!propertyDraft.trim()) { setMsg("❌ Property ID required"); return; }
-    if (!config.hasServiceAccount && !jsonDraft.trim()) { setMsg("❌ Service Account JSON required"); return; }
     setBusy(true); setMsg("");
     try {
-      const payload = { propertyId: propertyDraft };
-      if (jsonDraft.trim()) payload.serviceAccountJson = jsonDraft.trim();
-      const r = await ga("save_ga_config", payload);
+      const r = await ga("save_ga_config", { propertyId: propertyDraft.trim() });
       if (r.ok) {
-        setMsg("✅ Saved. Click Test Connection to verify.");
-        setEditing(false);
-        setJsonDraft("");
-        const fresh = await ga("get_ga_config");
-        setConfig(fresh);
+        setMsg("✅ Property ID saved");
+        setPropertyEditing(false);
+        await loadConfig();
       } else setMsg("❌ " + (r.error || "Save failed"));
     } catch (e) { setMsg("❌ " + e.message); }
     setBusy(false);
@@ -2015,11 +2058,13 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
       const r = await ga("sync_ga_data");
       if (r.ok) {
         setSyncResult(r);
-        setMsg(`✅ Sync complete! ${r.activeThisWeek} leads active this week, ${r.inactive} inactive (zeroed out). ${r.unmatchedCodes > 0 ? `${r.unmatchedCodes} GA codes had no matching lead.` : ""}`);
+        if (r.updatesFailed > 0) {
+          setMsg(`⚠️ Sync partially failed! ${r.updatesSucceeded||0} leads updated, ${r.updatesFailed} FAILED. First error: ${r.updateErrors?.[0] || "unknown"}`);
+        } else {
+          setMsg(`✅ Sync complete! ${r.activeThisWeek} leads active this week, ${r.inactive} inactive (zeroed out). ${r.updatesSucceeded||0} leads updated.${r.unmatchedCodes > 0 ? ` ${r.unmatchedCodes} GA codes had no matching lead.` : ""}`);
+        }
         if (onSyncComplete) onSyncComplete();
-        // Refresh config to update last sync time
-        const fresh = await ga("get_ga_config");
-        setConfig(fresh);
+        await loadConfig();
       } else {
         setMsg("❌ " + (r.error || "Sync failed"));
       }
@@ -2032,82 +2077,85 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
     : "Never synced";
 
   return (
-    <div style={{marginBottom:16,padding:14,background:isConfigured?"var(--card)":"var(--amb-d)",border:"1px solid "+(isConfigured?"var(--bdr)":"rgba(212,165,89,.4)"),borderRadius:10}}>
-      <div onClick={()=>setCollapsed(!collapsed)} style={{cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+    <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginBottom:16}}>
+
+      {/* STATUS HEADER */}
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,paddingBottom:16,borderBottom:"1px solid var(--bdr)"}}>
         <div>
-          <div style={{fontSize:12,fontWeight:600,color:isConfigured?"var(--t1)":"var(--amb)"}}>{collapsed?"▸":"▾"} 📊 Google Analytics {isConfigured ? "" : "— Not configured"}</div>
-          <div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>
-            {isConfigured ? `Property: ${config.propertyId} · ${lastSyncStr}` : "Connect GA4 to enrich leads with website engagement data (last 7 days)"}
+          <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:4}}>
+            {isReady ? "✅ Ready to sync" : !isAuthed ? "🔗 Sign in to connect Google Analytics" : "⚠️ Property ID needed"}
+          </div>
+          <div style={{fontSize:11,color:"var(--t3)"}}>
+            {isReady ? `Signed in as ${config.oauthEmail || config.serviceAccountEmail} · Property ${config.propertyId} · ${lastSyncStr}` :
+             !isAuthed ? "Connect your Google account to pull website engagement data for leads" :
+             `Signed in as ${config.oauthEmail || config.serviceAccountEmail} — now enter the GA4 Property ID`}
           </div>
         </div>
-        {isConfigured && !collapsed === false && (
-          <button className="btn btn-p btn-s" disabled={busy} onClick={e=>{e.stopPropagation();syncNow();}}>{busy?"⏳":"🔄 Sync Now"}</button>
+        {isReady && (
+          <button className="btn btn-p btn-s" disabled={busy} onClick={syncNow}>{busy?"⏳":"🔄 Sync Now"}</button>
         )}
       </div>
 
-      {!collapsed && (<div style={{marginTop:14,paddingTop:14,borderTop:"1px solid var(--bdr)"}}>
+      {/* STEP 1: CONNECT GOOGLE (if not authed) */}
+      {!isAuthed && (
+        <div>
+          <div style={{padding:14,background:"var(--hover)",borderRadius:8,marginBottom:14,fontSize:11,color:"var(--t2)",lineHeight:1.6}}>
+            <div style={{fontWeight:600,marginBottom:8,color:"var(--t1)",fontSize:12}}>How this works:</div>
+            <div>1. Click "Sign in with Google" below</div>
+            <div>2. Sign in with the Google account that has access to the GA4 property</div>
+            <div>3. Grant read-only Analytics permission</div>
+            <div>4. Enter the GA4 Property ID (numeric, from GA Admin → Property Settings)</div>
+            <div>5. Click Sync — SignalScope pulls last 7 days of engagement data per lead</div>
+          </div>
+          <button className="btn btn-p" disabled={busy} onClick={connectGoogle} style={{display:"flex",alignItems:"center",gap:10,padding:"12px 20px"}}>
+            <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.6 20.1H42V20H24v8h11.3c-1.6 4.7-6.1 8-11.3 8-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 8 3l5.7-5.7C34.3 6.1 29.4 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.6-.4-3.9z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.6 15.1 18.9 12 24 12c3.1 0 5.8 1.2 8 3l5.7-5.7C34.3 6.1 29.4 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 10-2 13.6-5.2l-6.3-5.3c-2 1.6-4.6 2.5-7.3 2.5-5.2 0-9.6-3.3-11.3-8l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.1H42V20H24v8h11.3c-.8 2.3-2.3 4.3-4.1 5.7l6.3 5.3c-.4.4 6.8-5 6.8-15 0-1.3-.1-2.6-.4-3.9z"/></svg>
+            {busy ? "⏳ Opening..." : "Sign in with Google"}
+          </button>
+        </div>
+      )}
 
-        {/* SETUP / EDIT FORM */}
-        {(editing || !isConfigured) && (
-          <div>
-            <div style={{padding:12,background:"var(--hover)",borderRadius:6,fontSize:10,color:"var(--t2)",lineHeight:1.6,marginBottom:14}}>
-              <div style={{fontWeight:600,marginBottom:6,color:"var(--t1)"}}>📋 One-time setup (5 min):</div>
-              <div>1. Go to <a href="https://console.cloud.google.com/" target="_blank" rel="noopener" style={{color:"var(--blu)"}}>Google Cloud Console</a> → create project (or use existing)</div>
-              <div>2. Enable "Google Analytics Data API" in APIs & Services library</div>
-              <div>3. Create a Service Account → Add Key → JSON → download</div>
-              <div>4. In your GA4 Admin → <strong>Property Access Management</strong> → Add the service account email as <strong>Viewer</strong></div>
-              <div>5. Copy GA4 Property ID from Admin → Property Settings (numeric, like 321456789)</div>
-              <div>6. Paste both below → Save → Test Connection</div>
-            </div>
-
-            <div className="ig">
+      {/* STEP 2: PROPERTY ID (if authed but no property) */}
+      {isAuthed && (
+        <div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr auto auto",gap:10,alignItems:"end",marginBottom:12}}>
+            <div className="ig" style={{marginBottom:0}}>
               <div className="il">GA4 Property ID</div>
-              <input className="inp" value={propertyDraft} onChange={e=>setPropertyDraft(e.target.value)} placeholder="e.g. 321456789"/>
+              {hasProperty && !propertyEditing ? (
+                <div style={{padding:"8px 12px",background:"var(--hover)",borderRadius:6,fontSize:12,fontFamily:"'JetBrains Mono',monospace",color:"var(--t1)"}}>{config.propertyId}</div>
+              ) : (
+                <input className="inp" value={propertyDraft} onChange={e=>setPropertyDraft(e.target.value)} placeholder="e.g. 321456789"/>
+              )}
             </div>
-
-            <div className="ig">
-              <div className="il">Service Account JSON {config.hasServiceAccount && <span style={{fontWeight:400,textTransform:"none",color:"var(--grn)"}}>— ✓ already saved (paste new to replace, leave blank to keep)</span>}</div>
-              <textarea className="inp" value={jsonDraft} onChange={e=>setJsonDraft(e.target.value)} style={{minHeight:120,fontFamily:"'JetBrains Mono',monospace",fontSize:10}} placeholder={config.hasServiceAccount ? "(JSON saved — paste new to replace)" : '{\n  "type": "service_account",\n  "project_id": "...",\n  "client_email": "signalscope-ga-reader@...",\n  "private_key": "-----BEGIN PRIVATE KEY-----\\n..."\n}'}/>
-            </div>
-
-            <div style={{display:"flex",gap:8}}>
-              <button className="btn btn-p btn-s" disabled={busy} onClick={saveConfig}>{busy?"⏳":"💾 Save"}</button>
-              {isConfigured && <button className="btn btn-s" onClick={()=>{setEditing(false);setJsonDraft("");setMsg("");}}>Cancel</button>}
-            </div>
-          </div>
-        )}
-
-        {/* CONFIGURED STATE — show summary + actions */}
-        {isConfigured && !editing && (
-          <div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
-              <div style={{padding:10,background:"var(--hover)",borderRadius:6}}>
-                <div style={{fontSize:9,color:"var(--t3)",fontWeight:600,marginBottom:2}}>GA4 PROPERTY</div>
-                <div style={{fontSize:11,color:"var(--t1)",fontFamily:"'JetBrains Mono',monospace"}}>{config.propertyId}</div>
-              </div>
-              <div style={{padding:10,background:"var(--hover)",borderRadius:6}}>
-                <div style={{fontSize:9,color:"var(--t3)",fontWeight:600,marginBottom:2}}>SERVICE ACCOUNT</div>
-                <div style={{fontSize:10,color:"var(--t1)",wordBreak:"break-all"}}>{config.serviceAccountEmail}</div>
-              </div>
-            </div>
-
-            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-              <button className="btn btn-p btn-s" disabled={busy} onClick={syncNow}>{busy?"⏳":"🔄 Sync GA Data Now"}</button>
-              <button className="btn btn-s" disabled={busy} onClick={testConnection}>🧪 Test Connection</button>
-              <button className="btn btn-s" onClick={()=>setEditing(true)}>✏️ Change Config</button>
-            </div>
-
-            {syncResult && syncResult.ok && (
-              <div style={{marginTop:12,padding:10,background:"var(--card)",borderRadius:6}}>
-                <div style={{fontSize:10,color:"var(--t3)",fontWeight:600,marginBottom:4}}>LAST SYNC RESULT</div>
-                <div style={{fontSize:11,color:"var(--t1)"}}>{syncResult.totalLeads} total leads · {syncResult.leadsTracked} have Custom Codes · <span style={{color:"var(--grn)"}}>{syncResult.activeThisWeek} active this week</span> · <span style={{color:"var(--t3)"}}>{syncResult.inactive} inactive</span>{syncResult.unmatchedCodes > 0 && <> · <span style={{color:"var(--amb)"}}>{syncResult.unmatchedCodes} GA codes don't match any lead</span></>}</div>
-              </div>
+            {hasProperty && !propertyEditing ? (
+              <button className="btn btn-s" onClick={()=>setPropertyEditing(true)}>✏️ Edit</button>
+            ) : (
+              <button className="btn btn-p btn-s" disabled={busy} onClick={saveProperty}>{busy?"⏳":"💾 Save"}</button>
             )}
+            {propertyEditing && hasProperty && <button className="btn btn-s" onClick={()=>{setPropertyEditing(false);setPropertyDraft(config.propertyId);}}>Cancel</button>}
           </div>
-        )}
+          <div style={{fontSize:10,color:"var(--t3)",marginBottom:14,fontStyle:"italic"}}>Find this in Google Analytics → Admin → Property Settings. Numeric ID, like 321456789.</div>
 
-        {msg && <div style={{marginTop:12,padding:10,background:msg.startsWith("✅")?"var(--grn-d)":msg.startsWith("⏳")?"var(--hover)":"var(--red-d)",color:msg.startsWith("✅")?"var(--grn)":msg.startsWith("⏳")?"var(--t2)":"var(--red)",borderRadius:6,fontSize:11,whiteSpace:"pre-wrap"}}>{msg}</div>}
-      </div>)}
+          {/* ACTIONS */}
+          <div style={{display:"flex",gap:8,flexWrap:"wrap",paddingTop:12,borderTop:"1px solid var(--bdr)"}}>
+            {isReady && <button className="btn btn-s" disabled={busy} onClick={testConnection}>🧪 Test Connection</button>}
+            <button className="btn btn-s btn-d" disabled={busy} onClick={disconnectGoogle}>🔌 Disconnect Google</button>
+          </div>
+
+          {/* LAST SYNC RESULT */}
+          {syncResult && syncResult.ok && (
+            <div style={{marginTop:14,padding:12,background:"var(--hover)",borderRadius:6}}>
+              <div style={{fontSize:10,color:"var(--t3)",fontWeight:600,marginBottom:6}}>LAST SYNC RESULT</div>
+              <div style={{fontSize:11,color:"var(--t1)",lineHeight:1.6}}>
+                {syncResult.totalLeads} total leads · {syncResult.leadsTracked} have Custom Codes · <span style={{color:"var(--grn)",fontWeight:600}}>{syncResult.activeThisWeek} active this week</span> · <span style={{color:"var(--t3)"}}>{syncResult.inactive} inactive</span>
+                {syncResult.unmatchedCodes > 0 && <> · <span style={{color:"var(--amb)"}}>{syncResult.unmatchedCodes} GA codes don't match any lead</span></>}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* STATUS MESSAGE */}
+      {msg && <div style={{marginTop:14,padding:10,background:msg.startsWith("✅")?"var(--grn-d)":msg.startsWith("⏳")||msg.startsWith("🔗")?"var(--hover)":"var(--red-d)",color:msg.startsWith("✅")?"var(--grn)":msg.startsWith("⏳")||msg.startsWith("🔗")?"var(--t2)":"var(--red)",borderRadius:6,fontSize:11,whiteSpace:"pre-wrap"}}>{msg}</div>}
     </div>
   );
 }

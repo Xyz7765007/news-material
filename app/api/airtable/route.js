@@ -336,6 +336,8 @@ const SCHEMA = {
     { name: "LinkedIn Account ID", type: "singleLineText" },
     { name: "GA4 Property ID", type: "singleLineText" },
     { name: "GA Service Account JSON", type: "multilineText" },
+    { name: "GA OAuth Refresh Token", type: "multilineText" },
+    { name: "GA OAuth Email", type: "singleLineText" },
     { name: "GA Last Sync", type: "singleLineText" },
     { name: "Sender Profile", type: "multilineText" },
     { name: "Email Reference", type: "multilineText" },
