@@ -597,7 +597,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
 
   const FIELD_ALIASES = {
     Accounts: { Name:["name","company","company name","account","account name","organization","org name","business name","company_name"],Domain:["domain","website","company website","url","company url","company domain","company_website","site"],Industry:["industry","vertical","sector","category"],Size:["size","employees","employee count","company size","headcount","num employees","number of employees","# employees","employee_count","total employees"],"LinkedIn URL":["linkedin","linkedin url","linkedin company","company linkedin","linkedin link","linkedin_url","company linkedin url","company_linkedin_url","linkedinurl"],Country:["country","location","hq","headquarters","region","geography","company country","company_country"] },
-    Leads: { Name:["name","full name","contact name","contact","person","lead name","full_name","contact_name","lead_name"],Email:["email","email address","work email","business email","e-mail","mail","email_address","work_email"],Title:["title","job title","position","role","designation","current title","job_title","jobtitle"],"First Name":["first name","first_name","firstname","given name","fname"],"Last Name":["last name","last_name","lastname","surname","family name","lname"],Company:["company","organization","employer","company name","org","account name","company_name","account_name"],"LinkedIn URL":["linkedin","linkedin url","linkedin profile","profile url","li url","linkedin_url","linkedinurl","linkedin profile url"],"Company LinkedIn URL":["company linkedin url","company_linkedin_url","company linkedin"],Phone:["phone","phone number","direct phone","mobile","cell","telephone","work phone","phone_number","direct_phone","mobile phone"],Website:["website","domain","company website","company_website","company domain","site","web"],City:["city","lead city","company city"],State:["state","lead state","company state","province","region"],Country:["country","lead country","company country"],"Annual Revenue":["annual revenue","annual_revenue","revenue"],"Total Funding":["total funding","total_funding","funding"],"# Employees":["# employees","employees","employee count","headcount","company size","number of employees"] },
+    Leads: { Name:["name","full name","contact name","contact","person","lead name","full_name","contact_name","lead_name"],Email:["email","email address","work email","business email","e-mail","mail","email_address","work_email"],Title:["title","job title","position","role","designation","current title","job_title","jobtitle"],"First Name":["first name","first_name","firstname","given name","fname"],"Last Name":["last name","last_name","lastname","surname","family name","lname"],Company:["company","organization","employer","company name","org","account name","company_name","account_name"],"LinkedIn URL":["linkedin","linkedin url","linkedin profile","profile url","li url","linkedin_url","linkedinurl","linkedin profile url"],"Company LinkedIn URL":["company linkedin url","company_linkedin_url","company linkedin"],Phone:["phone","phone number","direct phone","mobile","cell","telephone","work phone","phone_number","direct_phone","mobile phone"],Website:["website","domain","company website","company_website","company domain","site","web"],City:["city","lead city","company city"],State:["state","lead state","company state","province","region"],Country:["country","lead country","company country"],"Annual Revenue":["annual revenue","annual_revenue","revenue"],"Total Funding":["total funding","total_funding","funding"],"# Employees":["# employees","employees","employee count","headcount","company size","number of employees"],"Custom Code":["custom code","customcode","custom_code","tracking code","tracking_code","trackingcode","utm code","utm_code","utm campaign","utm_campaign","session campaign id","session_campaign_id","campaign id","campaign_id","code","short code","unique code"] },
   };
 
   const autoDetect = (headers, table) => {
@@ -1417,9 +1417,9 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
 
   {/* LEADS */}
   {tab==="leads"&&!loading&&(()=>{
-    const prefCols = ["Name","Email","Title","Company","LinkedIn URL","Phone","Campaign Tag"];
+    const prefCols = ["Name","Email","Title","Company","Custom Code","GA Engagement Score","GA Last Visit","Campaign Tag"];
     const allCols = leads.length ? [...new Set(leads.flatMap(l => Object.keys(l.fields || {})))] : [];
-    const cols = [...prefCols.filter(c => allCols.includes(c)), ...allCols.filter(c => !prefCols.includes(c) && c !== "Campaign Tag")].slice(0, 8);
+    const cols = [...prefCols.filter(c => allCols.includes(c)), ...allCols.filter(c => !prefCols.includes(c) && c !== "Campaign Tag" && !c.startsWith("GA "))].slice(0, 9);
     if (allCols.includes("Campaign Tag") && !cols.includes("Campaign Tag")) cols.push("Campaign Tag");
     const fmt = v => { if (v === null || v === undefined) return ""; if (typeof v === "object") return JSON.stringify(v).slice(0, 50); return String(v).slice(0, 60); };
     const leadTags = [...new Set(leads.map(l => (l.fields || {})["Campaign Tag"]).filter(Boolean))].sort();
@@ -1432,8 +1432,11 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         </select>}
         <label className="btn btn-s" style={{cursor:"pointer"}}><I.Upload/> Upload CSV<input type="file" accept=".csv" hidden onChange={e=>{if(e.target.files[0])handleCSVFile(e.target.files[0],"Leads",setLeads)}}/></label>
       </div></div>
+
+      <GoogleAnalyticsCard baseId={bid} campaign={camp} onSyncComplete={()=>at("list","Leads",{},bid).then(r=>setLeads(r.records||[]))} />
+
     {filteredLeads.length===0?<div className="empty"><div className="em">👤</div><p>{leads.length>0?"No leads match this campaign filter.":"Upload a CSV."}</p></div>:
-    <div className="tw"><table><thead><tr>{cols.map(k=><th key={k}>{k}</th>)}<th></th></tr></thead><tbody>{filteredLeads.map(l=>{const f=l.fields||{};return(<tr key={l.id}>{cols.map(k=><td key={k} style={k==="Name"?{color:"var(--t1)",fontWeight:500}:k==="Email"?{fontSize:10}:k==="Campaign Tag"?{fontSize:10,color:"var(--acc)"}:{}}>{fmt(f[k])}</td>)}<td><button className="btn btn-d btn-s" onClick={()=>del("Leads",[l.id],setLeads)}><I.Trash/></button></td></tr>)})}</tbody></table></div>}</div>);
+    <div className="tw"><table><thead><tr>{cols.map(k=><th key={k}>{k}</th>)}<th></th></tr></thead><tbody>{filteredLeads.map(l=>{const f=l.fields||{};return(<tr key={l.id}>{cols.map(k=><td key={k} style={k==="Name"?{color:"var(--t1)",fontWeight:500}:k==="Email"?{fontSize:10}:k==="Campaign Tag"?{fontSize:10,color:"var(--acc)"}:k==="Custom Code"?{fontSize:10,fontFamily:"'JetBrains Mono',monospace",color:"var(--t3)"}:k==="GA Engagement Score"?{fontWeight:600,color:f[k]>50?"var(--grn)":f[k]>20?"var(--amb)":"var(--t3)"}:k==="GA Last Visit"?{fontSize:10,color:f[k]?"var(--blu)":"var(--t3)"}:{}}>{fmt(f[k])}</td>)}<td><button className="btn btn-d btn-s" onClick={()=>del("Leads",[l.id],setLeads)}><I.Trash/></button></td></tr>)})}</tbody></table></div>}</div>);
   })()}
 
   {/* TASK RULES (unified — signal + top_x) */}
@@ -1919,6 +1922,176 @@ function PushToHubSpotForm({ tasks, owners, onPush, loading, rules }) {
 // ═══════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════
 // MANUAL OUTREACH MODAL
+// ═══════════════════════════════════════════════════════════════
+// GOOGLE ANALYTICS CARD (in Leads tab)
+// ═══════════════════════════════════════════════════════════════
+function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
+  const [collapsed, setCollapsed] = useState(true);
+  const [config, setConfig] = useState({ propertyId: "", hasServiceAccount: false, serviceAccountEmail: "", lastSync: "" });
+  const [propertyDraft, setPropertyDraft] = useState("");
+  const [jsonDraft, setJsonDraft] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [syncResult, setSyncResult] = useState(null);
+
+  const ga = async (action, data = {}) => {
+    const res = await fetch("/api/ga", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, baseId, campaignId: campaign?.airtableId, ...data }),
+    });
+    return res.json();
+  };
+
+  // Load config on mount
+  useEffect(() => {
+    if (!campaign?.airtableId) return;
+    (async () => {
+      try {
+        const r = await ga("get_ga_config");
+        if (r.propertyId || r.hasServiceAccount) {
+          setConfig(r);
+          setPropertyDraft(r.propertyId || "");
+        }
+      } catch (e) { console.error(e); }
+    })();
+  }, [campaign?.airtableId]);
+
+  const isConfigured = !!config.propertyId && !!config.hasServiceAccount;
+
+  const saveConfig = async () => {
+    if (!propertyDraft.trim()) { setMsg("❌ Property ID required"); return; }
+    if (!config.hasServiceAccount && !jsonDraft.trim()) { setMsg("❌ Service Account JSON required"); return; }
+    setBusy(true); setMsg("");
+    try {
+      const payload = { propertyId: propertyDraft };
+      if (jsonDraft.trim()) payload.serviceAccountJson = jsonDraft.trim();
+      const r = await ga("save_ga_config", payload);
+      if (r.ok) {
+        setMsg("✅ Saved. Click Test Connection to verify.");
+        setEditing(false);
+        setJsonDraft("");
+        const fresh = await ga("get_ga_config");
+        setConfig(fresh);
+      } else setMsg("❌ " + (r.error || "Save failed"));
+    } catch (e) { setMsg("❌ " + e.message); }
+    setBusy(false);
+  };
+
+  const testConnection = async () => {
+    setBusy(true); setMsg("⏳ Testing...");
+    try {
+      const r = await ga("test_ga_connection");
+      if (r.ok) setMsg(r.message);
+      else setMsg("❌ " + (r.error || "Test failed"));
+    } catch (e) { setMsg("❌ " + e.message); }
+    setBusy(false);
+  };
+
+  const syncNow = async () => {
+    if (!confirm(`Sync GA data for last 7 days?\n\nThis fetches engagement data from your GA4 property and updates each lead's GA fields based on their Custom Code. Leads with no activity in the last 7 days will have their GA fields zeroed out.`)) return;
+    setBusy(true); setMsg("⏳ Syncing GA data... this can take 10-30 seconds for large lead lists."); setSyncResult(null);
+    try {
+      const r = await ga("sync_ga_data");
+      if (r.ok) {
+        setSyncResult(r);
+        setMsg(`✅ Sync complete! ${r.activeThisWeek} leads active this week, ${r.inactive} inactive (zeroed out). ${r.unmatchedCodes > 0 ? `${r.unmatchedCodes} GA codes had no matching lead.` : ""}`);
+        if (onSyncComplete) onSyncComplete();
+        // Refresh config to update last sync time
+        const fresh = await ga("get_ga_config");
+        setConfig(fresh);
+      } else {
+        setMsg("❌ " + (r.error || "Sync failed"));
+      }
+    } catch (e) { setMsg("❌ " + e.message); }
+    setBusy(false);
+  };
+
+  const lastSyncStr = config.lastSync
+    ? `Last synced ${Math.round((Date.now() - new Date(config.lastSync).getTime()) / 60000)} min ago`
+    : "Never synced";
+
+  return (
+    <div style={{marginBottom:16,padding:14,background:isConfigured?"var(--card)":"var(--amb-d)",border:"1px solid "+(isConfigured?"var(--bdr)":"rgba(212,165,89,.4)"),borderRadius:10}}>
+      <div onClick={()=>setCollapsed(!collapsed)} style={{cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div>
+          <div style={{fontSize:12,fontWeight:600,color:isConfigured?"var(--t1)":"var(--amb)"}}>{collapsed?"▸":"▾"} 📊 Google Analytics {isConfigured ? "" : "— Not configured"}</div>
+          <div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>
+            {isConfigured ? `Property: ${config.propertyId} · ${lastSyncStr}` : "Connect GA4 to enrich leads with website engagement data (last 7 days)"}
+          </div>
+        </div>
+        {isConfigured && !collapsed === false && (
+          <button className="btn btn-p btn-s" disabled={busy} onClick={e=>{e.stopPropagation();syncNow();}}>{busy?"⏳":"🔄 Sync Now"}</button>
+        )}
+      </div>
+
+      {!collapsed && (<div style={{marginTop:14,paddingTop:14,borderTop:"1px solid var(--bdr)"}}>
+
+        {/* SETUP / EDIT FORM */}
+        {(editing || !isConfigured) && (
+          <div>
+            <div style={{padding:12,background:"var(--hover)",borderRadius:6,fontSize:10,color:"var(--t2)",lineHeight:1.6,marginBottom:14}}>
+              <div style={{fontWeight:600,marginBottom:6,color:"var(--t1)"}}>📋 One-time setup (5 min):</div>
+              <div>1. Go to <a href="https://console.cloud.google.com/" target="_blank" rel="noopener" style={{color:"var(--blu)"}}>Google Cloud Console</a> → create project (or use existing)</div>
+              <div>2. Enable "Google Analytics Data API" in APIs & Services library</div>
+              <div>3. Create a Service Account → Add Key → JSON → download</div>
+              <div>4. In your GA4 Admin → <strong>Property Access Management</strong> → Add the service account email as <strong>Viewer</strong></div>
+              <div>5. Copy GA4 Property ID from Admin → Property Settings (numeric, like 321456789)</div>
+              <div>6. Paste both below → Save → Test Connection</div>
+            </div>
+
+            <div className="ig">
+              <div className="il">GA4 Property ID</div>
+              <input className="inp" value={propertyDraft} onChange={e=>setPropertyDraft(e.target.value)} placeholder="e.g. 321456789"/>
+            </div>
+
+            <div className="ig">
+              <div className="il">Service Account JSON {config.hasServiceAccount && <span style={{fontWeight:400,textTransform:"none",color:"var(--grn)"}}>— ✓ already saved (paste new to replace, leave blank to keep)</span>}</div>
+              <textarea className="inp" value={jsonDraft} onChange={e=>setJsonDraft(e.target.value)} style={{minHeight:120,fontFamily:"'JetBrains Mono',monospace",fontSize:10}} placeholder={config.hasServiceAccount ? "(JSON saved — paste new to replace)" : '{\n  "type": "service_account",\n  "project_id": "...",\n  "client_email": "signalscope-ga-reader@...",\n  "private_key": "-----BEGIN PRIVATE KEY-----\\n..."\n}'}/>
+            </div>
+
+            <div style={{display:"flex",gap:8}}>
+              <button className="btn btn-p btn-s" disabled={busy} onClick={saveConfig}>{busy?"⏳":"💾 Save"}</button>
+              {isConfigured && <button className="btn btn-s" onClick={()=>{setEditing(false);setJsonDraft("");setMsg("");}}>Cancel</button>}
+            </div>
+          </div>
+        )}
+
+        {/* CONFIGURED STATE — show summary + actions */}
+        {isConfigured && !editing && (
+          <div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
+              <div style={{padding:10,background:"var(--hover)",borderRadius:6}}>
+                <div style={{fontSize:9,color:"var(--t3)",fontWeight:600,marginBottom:2}}>GA4 PROPERTY</div>
+                <div style={{fontSize:11,color:"var(--t1)",fontFamily:"'JetBrains Mono',monospace"}}>{config.propertyId}</div>
+              </div>
+              <div style={{padding:10,background:"var(--hover)",borderRadius:6}}>
+                <div style={{fontSize:9,color:"var(--t3)",fontWeight:600,marginBottom:2}}>SERVICE ACCOUNT</div>
+                <div style={{fontSize:10,color:"var(--t1)",wordBreak:"break-all"}}>{config.serviceAccountEmail}</div>
+              </div>
+            </div>
+
+            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+              <button className="btn btn-p btn-s" disabled={busy} onClick={syncNow}>{busy?"⏳":"🔄 Sync GA Data Now"}</button>
+              <button className="btn btn-s" disabled={busy} onClick={testConnection}>🧪 Test Connection</button>
+              <button className="btn btn-s" onClick={()=>setEditing(true)}>✏️ Change Config</button>
+            </div>
+
+            {syncResult && syncResult.ok && (
+              <div style={{marginTop:12,padding:10,background:"var(--card)",borderRadius:6}}>
+                <div style={{fontSize:10,color:"var(--t3)",fontWeight:600,marginBottom:4}}>LAST SYNC RESULT</div>
+                <div style={{fontSize:11,color:"var(--t1)"}}>{syncResult.totalLeads} total leads · {syncResult.leadsTracked} have Custom Codes · <span style={{color:"var(--grn)"}}>{syncResult.activeThisWeek} active this week</span> · <span style={{color:"var(--t3)"}}>{syncResult.inactive} inactive</span>{syncResult.unmatchedCodes > 0 && <> · <span style={{color:"var(--amb)"}}>{syncResult.unmatchedCodes} GA codes don't match any lead</span></>}</div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {msg && <div style={{marginTop:12,padding:10,background:msg.startsWith("✅")?"var(--grn-d)":msg.startsWith("⏳")?"var(--hover)":"var(--red-d)",color:msg.startsWith("✅")?"var(--grn)":msg.startsWith("⏳")?"var(--t2)":"var(--red)",borderRadius:6,fontSize:11,whiteSpace:"pre-wrap"}}>{msg}</div>}
+      </div>)}
+    </div>
+  );
+}
+
 // ═══════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════
 // EMAIL CAMPAIGN TAB — Sender Profile + Offers Library + AI Generation

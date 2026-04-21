@@ -262,6 +262,17 @@ const SCHEMA = {
     { name: "Company", type: "singleLineText" },
     { name: "LinkedIn URL", type: "singleLineText" },
     { name: "Phone", type: "singleLineText" },
+    { name: "Campaign Tag", type: "singleLineText" },
+    { name: "Custom Code", type: "singleLineText" },
+    { name: "GA Sessions", type: "number", options: { precision: 0 } },
+    { name: "GA Engaged Sessions", type: "number", options: { precision: 0 } },
+    { name: "GA Views", type: "number", options: { precision: 0 } },
+    { name: "GA Views Per Session", type: "number", options: { precision: 2 } },
+    { name: "GA Engagement Time", type: "number", options: { precision: 0 } },
+    { name: "GA Avg Session Duration", type: "number", options: { precision: 1 } },
+    { name: "GA Last Visit", type: "singleLineText" },
+    { name: "GA Engagement Score", type: "number", options: { precision: 0 } },
+    { name: "GA Last Synced At", type: "singleLineText" },
   ],
   "Task Rules": [
     { name: "Name", type: "singleLineText" },
@@ -323,6 +334,9 @@ const SCHEMA = {
     { name: "HubSpot API Key", type: "singleLineText" },
     { name: "Smartlead API Key", type: "singleLineText" },
     { name: "LinkedIn Account ID", type: "singleLineText" },
+    { name: "GA4 Property ID", type: "singleLineText" },
+    { name: "GA Service Account JSON", type: "multilineText" },
+    { name: "GA Last Sync", type: "singleLineText" },
     { name: "Sender Profile", type: "multilineText" },
     { name: "Email Reference", type: "multilineText" },
     { name: "Email Purpose", type: "multilineText" },
@@ -934,6 +948,43 @@ export async function POST(request) {
       case "setup": {
         const results = await setupSchema(baseId);
         return NextResponse.json(results);
+      }
+
+      case "generate_custom_codes": {
+        // Backfill missing Custom Code on leads — generates 8-char alphanumeric like Y0RYQSGI
+        if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
+        try {
+          const leads = await listRecords(baseId, "Leads");
+          const CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+          const genCode = () => {
+            let s = "";
+            for (let i = 0; i < 8; i++) s += CHARS[Math.floor(Math.random() * CHARS.length)];
+            return s;
+          };
+          // Collect existing codes to avoid collisions
+          const existing = new Set(leads.map(l => l.fields?.["Custom Code"]).filter(Boolean));
+          const toUpdate = [];
+          for (const l of leads) {
+            if (l.fields?.["Custom Code"]) continue;
+            let code;
+            do { code = genCode(); } while (existing.has(code));
+            existing.add(code);
+            toUpdate.push({ id: l.id, fields: { "Custom Code": code } });
+          }
+          if (toUpdate.length === 0) {
+            return NextResponse.json({ ok: true, generated: 0, total: leads.length, message: "All leads already have Custom Codes" });
+          }
+          // Batch update 10 at a time
+          for (let i = 0; i < toUpdate.length; i += 10) {
+            await fetch(`${baseUrl(baseId)}/${encodeURIComponent("Leads")}`, {
+              method: "PATCH", headers: { ...authHdr, "Content-Type": "application/json" },
+              body: JSON.stringify({ records: toUpdate.slice(i, i + 10) }),
+            });
+          }
+          return NextResponse.json({ ok: true, generated: toUpdate.length, total: leads.length });
+        } catch (e) {
+          return NextResponse.json({ error: e.message }, { status: 500 });
+        }
       }
       case "diagnose": {
         // Verbose diagnostic: probe every step and return detailed status
