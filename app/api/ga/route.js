@@ -221,25 +221,26 @@ export async function POST(request) {
         let res = await patchCampaign(campaignId, fields);
 
         // Auto-create missing fields if 422 — self-heals so user doesn't need to run Setup
-        if (res.status === 422) {
+        // Loop up to 5 times in case multiple fields are missing (Airtable reports them one at a time)
+        let attempts = 0;
+        while (res.status === 422 && attempts < 5) {
+          attempts++;
           const errText = await res.text();
           const unknownFields = [];
           // Match: Unknown field name: "X" OR \"X\" OR 'X' — handles raw and escaped quotes
           const matches = errText.matchAll(/[Uu]nknown field name:?\s*\\?["']([^"'\\]+)\\?["']/g);
           for (const m of matches) unknownFields.push(m[1]);
-          // Fallback: also try the field names we know we're trying to write, if any are missing from response
+          // Fallback: check if any of our target fields appear in the error text
           if (unknownFields.length === 0) {
             for (const fname of Object.keys(fields)) {
               if (errText.includes(fname)) unknownFields.push(fname);
             }
           }
-          if (unknownFields.length > 0) {
-            const created = await ensureCampaignFields(unknownFields);
-            if (created) {
-              // Retry save
-              res = await patchCampaign(campaignId, fields);
-            }
-          }
+          if (unknownFields.length === 0) break; // can't extract field name, give up
+          const created = await ensureCampaignFields(unknownFields);
+          if (!created) break;
+          // Retry save
+          res = await patchCampaign(campaignId, fields);
         }
 
         if (!res.ok) {
