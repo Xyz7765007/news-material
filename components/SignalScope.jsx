@@ -154,6 +154,8 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const [enrichLoading, setEnrichLoading] = useState(false);
   const [enrichResults, setEnrichResults] = useState([]);
   const [campTagFilter, setCampTagFilter] = useState("all");
+  const [engagementFilter, setEngagementFilter] = useState("all");
+  const [sortByEngagement, setSortByEngagement] = useState(false);
   // Post-Demo
   const [pdRule, setPdRule] = useState({ name: "Post-Demo Follow-up", stageId: "", stageName: "", pipelineId: "", aiPrompt: "" });
   const [pdPipelines, setPdPipelines] = useState([]);
@@ -1426,13 +1428,26 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   {tab==="leads"&&!loading&&(()=>{
     const prefCols = ["Name","Email","Title","Company","Custom Code","GA Engagement Score","GA Last Visit","Campaign Tag"];
     const allCols = leads.length ? [...new Set(leads.flatMap(l => Object.keys(l.fields || {})))] : [];
-    const cols = [...prefCols.filter(c => allCols.includes(c)), ...allCols.filter(c => !prefCols.includes(c) && c !== "Campaign Tag" && !c.startsWith("GA "))].slice(0, 9);
-    if (allCols.includes("Campaign Tag") && !cols.includes("Campaign Tag")) cols.push("Campaign Tag");
+    // Always show preferred GA columns even if currently empty (Airtable omits empty fields from records)
+    const ALWAYS_SHOW = ["Custom Code","GA Engagement Score","GA Last Visit"];
+    const effectiveCols = [...new Set([...allCols, ...ALWAYS_SHOW])];
+    const cols = [...prefCols.filter(c => effectiveCols.includes(c)), ...effectiveCols.filter(c => !prefCols.includes(c) && c !== "Campaign Tag" && !c.startsWith("GA "))].slice(0, 9);
+    if (effectiveCols.includes("Campaign Tag") && !cols.includes("Campaign Tag")) cols.push("Campaign Tag");
     const fmt = v => { if (v === null || v === undefined) return ""; if (typeof v === "object") return JSON.stringify(v).slice(0, 50); return String(v).slice(0, 60); };
     const leadTags = [...new Set(leads.map(l => (l.fields || {})["Campaign Tag"]).filter(Boolean))].sort();
-    const filteredLeads = campTagFilter === "all" ? leads : leads.filter(l => (l.fields || {})["Campaign Tag"] === campTagFilter);
-    return (<div><div className="ph"><div><div className="pt">Leads</div><div className="pd">{filteredLeads.length}{campTagFilter!=="all"?` of ${leads.length}`:""} contacts</div></div>
-      <div style={{display:"flex",gap:8}}>
+    let filteredLeads = campTagFilter === "all" ? leads : leads.filter(l => (l.fields || {})["Campaign Tag"] === campTagFilter);
+    if (engagementFilter === "engaged") filteredLeads = filteredLeads.filter(l => (l.fields?.["GA Engagement Score"] || 0) > 0);
+    if (engagementFilter === "highly_engaged") filteredLeads = filteredLeads.filter(l => (l.fields?.["GA Engagement Score"] || 0) >= 50);
+    if (sortByEngagement) filteredLeads = [...filteredLeads].sort((a,b) => (b.fields?.["GA Engagement Score"] || 0) - (a.fields?.["GA Engagement Score"] || 0));
+    const engagedCount = leads.filter(l => (l.fields?.["GA Engagement Score"] || 0) > 0).length;
+    return (<div><div className="ph"><div><div className="pt">Leads</div><div className="pd">{filteredLeads.length}{campTagFilter!=="all"||engagementFilter!=="all"?` of ${leads.length}`:""} contacts{engagedCount>0?` · ${engagedCount} engaged this week`:""}</div></div>
+      <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+        {engagedCount > 0 && <select className="inp" style={{width:170,fontSize:10,padding:"5px 8px"}} value={engagementFilter} onChange={e=>setEngagementFilter(e.target.value)}>
+          <option value="all">All leads</option>
+          <option value="engaged">📊 Engaged ({engagedCount})</option>
+          <option value="highly_engaged">🔥 Highly engaged (50+)</option>
+        </select>}
+        {engagedCount > 0 && <button className={"btn btn-s "+(sortByEngagement?"btn-p":"")} onClick={()=>setSortByEngagement(!sortByEngagement)}>{sortByEngagement?"✓ ":""}Sort by score</button>}
         {leadTags.length > 0 && <select className="inp" style={{width:160,fontSize:10,padding:"5px 8px"}} value={campTagFilter} onChange={e=>setCampTagFilter(e.target.value)}>
           <option value="all">All Campaigns ({leads.length})</option>
           {leadTags.map(t => <option key={t} value={t}>{t} ({leads.filter(l=>(l.fields||{})["Campaign Tag"]===t).length})</option>)}
