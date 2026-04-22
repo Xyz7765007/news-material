@@ -1100,7 +1100,19 @@ export async function POST(request) {
         if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
         if (!body.leadId) return NextResponse.json({ error: "leadId required" }, { status: 400 });
         if (!body.note || !body.note.trim()) return NextResponse.json({ error: "note required" }, { status: 400 });
-        if (!accountId) return NextResponse.json({ error: "No LinkedIn account assigned to this campaign. Go to LinkedIn Automation → Assign account." }, { status: 400 });
+
+        // Resolve accountId: prefer explicit, else look up from campaign record
+        let resolvedAccountId = accountId;
+        if (!resolvedAccountId && body.campaignId) {
+          try {
+            const campRes = await fetch(`${AT_API}/${MASTER_BASE_ID}/${encodeURIComponent("Campaigns")}/${body.campaignId}`, { headers: atHdr });
+            if (campRes.ok) {
+              const campData = await campRes.json();
+              resolvedAccountId = campData?.fields?.["LinkedIn Account ID"] || "";
+            }
+          } catch (e) { console.error("Couldn't fetch campaign for accountId lookup:", e); }
+        }
+        if (!resolvedAccountId) return NextResponse.json({ error: "No LinkedIn account assigned to this campaign. Go to LinkedIn Automation → Assign account." }, { status: 400 });
 
         try {
           // Fetch lead
@@ -1120,7 +1132,7 @@ export async function POST(request) {
 
           // Resolve LinkedIn profile to get provider_id via Unipile
           const names = deriveNames(f);
-          const profileRes = await getProfile(accountId, linkedinUrl);
+          const profileRes = await getProfile(resolvedAccountId, linkedinUrl);
           if (!profileRes.ok) {
             return NextResponse.json({ error: `Couldn't resolve LinkedIn profile. Unipile said: ${profileRes.status} ${JSON.stringify(profileRes.data).slice(0, 200)}` }, { status: 400 });
           }
@@ -1130,7 +1142,7 @@ export async function POST(request) {
           }
 
           // Send invitation
-          const inviteRes = await sendInvitation(accountId, providerId, body.note.slice(0, 300));
+          const inviteRes = await sendInvitation(resolvedAccountId, providerId, body.note.slice(0, 300));
           if (!inviteRes.ok) {
             return NextResponse.json({ error: `LinkedIn rejected the connection request: ${inviteRes.status} ${JSON.stringify(inviteRes.data).slice(0, 300)}` }, { status: 400 });
           }

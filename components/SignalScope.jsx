@@ -2674,12 +2674,13 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
 // ═══════════════════════════════════════════════════════════════
 // EMAIL CAMPAIGN TAB — Sender Profile + Offers Library + AI Generation
 // ═══════════════════════════════════════════════════════════════
-function EmailCampaignTab({ baseId, campaign, leads }) {
+function EmailCampaignTab({ baseId, campaign, leads, prefilledLeadId }) {
   const [step, setStep] = useState(1); // 1=leads, 2=context, 3=generate, 4=review, 5=smartlead, 6=launch
   const [tags, setTags] = useState([]);
   const [selectedTag, setSelectedTag] = useState("");
   const [tagLeads, setTagLeads] = useState([]);
   const [selectedLeadIds, setSelectedLeadIds] = useState(new Set());
+  const [prefilledNotice, setPrefilledNotice] = useState("");
 
   // Sender Profile (one per campaign, on Campaigns master table)
   const [senderProfile, setSenderProfile] = useState("");
@@ -2763,6 +2764,26 @@ function EmailCampaignTab({ baseId, campaign, leads }) {
       } catch (e) { console.error(e); }
     })();
   }, [baseId, campaign?.airtableId]);
+
+  // Auto-select a specific lead when navigated here from "Send Email" button (GA tab)
+  useEffect(() => {
+    if (!prefilledLeadId || !leads?.length) return;
+    const lead = leads.find(l => l.id === prefilledLeadId);
+    if (!lead) {
+      setPrefilledNotice(`⚠️ Couldn't find the lead you selected — they may not have a Campaign Tag. Pick leads below.`);
+      return;
+    }
+    if (!lead.fields?.Email) {
+      setPrefilledNotice(`⚠️ ${lead.fields?.Name || "Lead"} has no email address on file.`);
+      return;
+    }
+    // Bypass tag filter, set this lead as the only lead in the pool
+    setTagLeads([lead]);
+    setSelectedLeadIds(new Set([lead.id]));
+    setSelectedTag(""); // Clear tag filter
+    setStep(1); // Ensure we're on the leads step
+    setPrefilledNotice(`✨ Prefilled from Google Analytics — sending to ${lead.fields?.Name || "lead"}. Continue with the flow below.`);
+  }, [prefilledLeadId, leads]);
 
   const loadTagLeads = async (tag) => {
     setBusy(true); setErr("");
@@ -3004,6 +3025,11 @@ function EmailCampaignTab({ baseId, campaign, leads }) {
 
     {/* ───────────────── STEP 1: PICK LEADS ───────────────── */}
     {step===1 && (<div>
+      {prefilledNotice && (
+        <div style={{padding:12,background:prefilledNotice.startsWith("✨")?"var(--acc-d)":"var(--red-d)",border:"1px solid "+(prefilledNotice.startsWith("✨")?"var(--acc)":"var(--red)"),borderRadius:8,marginBottom:14,fontSize:12,color:prefilledNotice.startsWith("✨")?"var(--acc)":"var(--red)",lineHeight:1.5}}>
+          {prefilledNotice}
+        </div>
+      )}
       <div style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,marginBottom:16}}>
         <div style={{fontSize:13,fontWeight:600,marginBottom:6}}>👋 Welcome — let's send some emails</div>
         <div style={{fontSize:11,color:"var(--t2)",lineHeight:1.6}}>This wizard takes you through 6 steps. First, pick which group of leads to email — these are your imported lead lists tagged by Campaign Tag (set when you uploaded the CSV).</div>
