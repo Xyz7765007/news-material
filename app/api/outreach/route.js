@@ -1054,6 +1054,34 @@ export async function POST(request) {
         return NextResponse.json(result);
       }
 
+      case "quick_send_connection": {
+        // One-click: enqueue this specific lead + send connection request immediately
+        // Used from the GA Engaged Leads UI
+        if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
+        if (!body.leadId) return NextResponse.json({ error: "leadId required" }, { status: 400 });
+        if (!accountId) return NextResponse.json({ error: "accountId required (assign a LinkedIn account to this campaign first)" }, { status: 400 });
+
+        // Step 1: enqueue this single lead
+        const enqueueOptions = { mode: "manual", selectedIds: [body.leadId], count: 1 };
+        const enqueueResult = await enqueueLeads(baseId, body.ruleConfig || {}, enqueueOptions);
+        if (enqueueResult.error) return NextResponse.json({ error: `Enqueue failed: ${enqueueResult.error}` }, { status: 400 });
+
+        // Find the newly created outreach record for this lead
+        const queue = await atList(baseId, "Outreach");
+        const leadRecord = await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Leads")}/${body.leadId}`, { headers: atHdr }).then(r => r.json()).catch(() => null);
+        if (!leadRecord?.fields) return NextResponse.json({ error: "Lead not found" }, { status: 404 });
+        const leadLinkedIn = (leadRecord.fields["LinkedIn URL"] || "").toLowerCase().trim();
+        const outreachItem = queue.find(q =>
+          (q.fields?.["LinkedIn URL"] || "").toLowerCase().trim() === leadLinkedIn &&
+          (q.fields?.Status || "") === "queued"
+        );
+        if (!outreachItem) return NextResponse.json({ error: "Could not find queued outreach item — might already be in a different state" }, { status: 400 });
+
+        // Step 2: send the connection immediately
+        const sendResult = await sendManualConnections(baseId, accountId, [outreachItem.id], body.ruleConfig || {});
+        return NextResponse.json({ ok: true, sent: sendResult.sent || 0, failed: sendResult.failed || 0, result: sendResult });
+      }
+
       case "list_queue": {
         if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
         const queue = await atList(baseId, "Outreach");

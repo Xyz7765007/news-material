@@ -134,6 +134,7 @@ async function ensureCampaignFields(missingFieldNames) {
     "GA OAuth Refresh Token": "multilineText",
     "GA OAuth Email": "singleLineText",
     "GA Last Sync": "singleLineText",
+    "GA Score Config": "multilineText",
   };
   try {
     const tablesRes = await fetch(`https://api.airtable.com/v0/meta/bases/${MASTER_BASE_ID}/tables`, { headers: atHdr });
@@ -364,16 +365,41 @@ async function fetchGADataByCustomCode(propertyId, auth, daysBack = 7) {
 
 // Engagement Score formula: 0-100
 // Weighted: Engagement Time (50%) + Engaged Sessions (30%) + Views/Session (20%)
-function calculateEngagementScore(m) {
+const DEFAULT_SCORE_CONFIG = {
+  weights: { time: 50, engaged: 30, views: 20 },
+  tiers: { warmMax: 20, interestedMax: 50 },
+};
+
+function parseScoreConfig(raw) {
+  if (!raw) return DEFAULT_SCORE_CONFIG;
+  try {
+    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return {
+      weights: {
+        time: Number(parsed?.weights?.time ?? DEFAULT_SCORE_CONFIG.weights.time),
+        engaged: Number(parsed?.weights?.engaged ?? DEFAULT_SCORE_CONFIG.weights.engaged),
+        views: Number(parsed?.weights?.views ?? DEFAULT_SCORE_CONFIG.weights.views),
+      },
+      tiers: {
+        warmMax: Number(parsed?.tiers?.warmMax ?? DEFAULT_SCORE_CONFIG.tiers.warmMax),
+        interestedMax: Number(parsed?.tiers?.interestedMax ?? DEFAULT_SCORE_CONFIG.tiers.interestedMax),
+      },
+    };
+  } catch { return DEFAULT_SCORE_CONFIG; }
+}
+
+function calculateEngagementScore(m, config) {
   if (!m || m.sessions === 0) return 0;
-  // Normalize each metric to 0-100, then weight
-  // Engagement time: 0s=0, 30s=50, 120s+=100
+  const cfg = config || DEFAULT_SCORE_CONFIG;
+  const w = cfg.weights;
+  // Normalize each metric to 0-100
   const timeScore = Math.min(100, (m.engagementTime / 120) * 100);
-  // Engaged sessions: 0=0, 1=50, 3+=100
   const engagedScore = Math.min(100, (m.engagedSessions / 3) * 100);
-  // Views per session: 1=20, 3=60, 5+=100
   const viewsScore = Math.min(100, ((m.viewsPerSession - 1) / 4) * 100);
-  return Math.round(timeScore * 0.5 + engagedScore * 0.3 + Math.max(0, viewsScore) * 0.2);
+  const total = (w.time / 100) + (w.engaged / 100) + (w.views / 100);
+  if (total === 0) return 0;
+  const raw = (timeScore * (w.time / 100) + engagedScore * (w.engaged / 100) + Math.max(0, viewsScore) * (w.views / 100)) / total;
+  return Math.round(raw);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -563,6 +589,7 @@ export async function POST(request) {
         const propertyId = f["GA4 Property ID"];
         const hasOAuth = !!f["GA OAuth Refresh Token"];
         const hasSA = !!f["GA Service Account JSON"];
+        const scoreConfig = parseScoreConfig(f["GA Score Config"]);
         if (!propertyId) return NextResponse.json({ error: "GA4 Property ID not set. Enter it on the Google Analytics tab." }, { status: 400 });
         if (!hasOAuth && !hasSA) return NextResponse.json({ error: "Not signed in. Click 'Sign in with Google' first." }, { status: 400 });
 
@@ -641,7 +668,7 @@ export async function POST(request) {
           if (!m) continue;
 
           // Lead has GA activity in last 7 days
-          const score = calculateEngagementScore(m);
+          const score = calculateEngagementScore(m, scoreConfig);
           const lastVisit = m.lastVisit ? `${m.lastVisit.slice(0,4)}-${m.lastVisit.slice(4,6)}-${m.lastVisit.slice(6,8)}` : "";
           const fields = {
             "GA Last Synced At": nowISO,
@@ -697,13 +724,39 @@ export async function POST(request) {
       case "list_engaged_leads": {
         if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
         const minScore = typeof body.minScore === "number" ? body.minScore : 1;
-        let leads;
-        try { leads = await atList(baseId, "Leads"); }
-        catch (e) { return NextResponse.json({ error: e.message }, { status: 500 }); }
+
+        let leads, outreach;
+        try {
+          [leads, outreach] = await Promise.all([
+            atList(baseId, "Leads"),
+            atList(baseId, "Outreach").catch(() => []),
+          ]);
+        } catch (e) { return NextResponse.json({ error: e.message }, { status: 500 }); }
+
+        // Build outreach lookup: LinkedIn URL (lowercased) → status
+        const outreachByUrl = {};
+        for (const o of outreach) {
+          const url = (o.fields?.["LinkedIn URL"] || "").toLowerCase().trim();
+          if (!url) continue;
+          // If multiple records exist for same lead, keep the most recent one
+          const existing = outreachByUrl[url];
+          const thisCreated = o.fields?.["Created At"] || "";
+          if (!existing || (thisCreated && thisCreated > (existing.created || ""))) {
+            outreachByUrl[url] = {
+              status: o.fields?.Status || "",
+              mode: o.fields?.Mode || "",
+              created: thisCreated,
+              recordId: o.id,
+            };
+          }
+        }
+
         const engaged = leads
           .filter(l => (l.fields?.["GA Engagement Score"] || 0) >= minScore)
           .map(l => {
             const f = l.fields || {};
+            const liUrl = (f["LinkedIn URL"] || "").toLowerCase().trim();
+            const outreachState = liUrl ? outreachByUrl[liUrl] : null;
             return {
               id: l.id,
               name: f.Name || "",
@@ -720,6 +773,12 @@ export async function POST(request) {
               viewsPerSession: f["GA Views Per Session"] || 0,
               engagementTime: f["GA Engagement Time"] || 0,
               avgSessionDuration: f["GA Avg Session Duration"] || 0,
+              // Outreach state — drives UI button visibility
+              outreachStatus: outreachState?.status || null,
+              outreachRecordId: outreachState?.recordId || null,
+              hasLinkedinOutreach: !!outreachState,
+              canSendConnection: !outreachState || outreachState.status === "error",
+              canSendEmail: !!(f.Email),
             };
           })
           .sort((a, b) => b.score - a.score);
@@ -830,6 +889,102 @@ export async function POST(request) {
           skipped,
           total: targetLeads.length,
           errors: createErrors.length > 0 ? createErrors.slice(0, 3) : undefined,
+        });
+      }
+
+      // ─── SCORE CONFIG — per-campaign weights & tier boundaries ───
+      case "get_score_config": {
+        if (!campaignId) return NextResponse.json({ error: "campaignId required" }, { status: 400 });
+        const camp = await getCampaign(campaignId);
+        const cfg = parseScoreConfig(camp.fields?.["GA Score Config"]);
+        return NextResponse.json({ ok: true, config: cfg, defaults: DEFAULT_SCORE_CONFIG });
+      }
+
+      case "save_score_config": {
+        if (!campaignId) return NextResponse.json({ error: "campaignId required" }, { status: 400 });
+        const { weights, tiers } = body;
+        if (!weights || !tiers) return NextResponse.json({ error: "weights and tiers required" }, { status: 400 });
+
+        // Validate weights sum to 100 (±0.1 tolerance for rounding)
+        const sum = Number(weights.time || 0) + Number(weights.engaged || 0) + Number(weights.views || 0);
+        if (Math.abs(sum - 100) > 0.1) {
+          return NextResponse.json({ error: `Weights must sum to 100. Current: ${sum.toFixed(1)}` }, { status: 400 });
+        }
+        // Validate tiers: warmMax < interestedMax, both 0-100
+        const w = Number(tiers.warmMax), i = Number(tiers.interestedMax);
+        if (!(w >= 0 && w < i && i <= 100)) {
+          return NextResponse.json({ error: "Tier boundaries invalid. Need: 0 ≤ Warm Max < Interested Max ≤ 100" }, { status: 400 });
+        }
+
+        const config = {
+          weights: { time: Number(weights.time), engaged: Number(weights.engaged), views: Number(weights.views) },
+          tiers: { warmMax: w, interestedMax: i },
+        };
+
+        let res = await patchCampaign(campaignId, { "GA Score Config": JSON.stringify(config) });
+        // Auto-create field if missing
+        let attempts = 0;
+        while (res.status === 422 && attempts < 3) {
+          attempts++;
+          const errText = await res.text();
+          if (errText.includes("GA Score Config")) {
+            await ensureCampaignFields(["GA Score Config"]);
+            res = await patchCampaign(campaignId, { "GA Score Config": JSON.stringify(config) });
+          } else break;
+        }
+        if (!res.ok) {
+          const err = await res.text();
+          return NextResponse.json({ error: `Save failed: ${res.status} — ${err.slice(0, 300)}` }, { status: 400 });
+        }
+        return NextResponse.json({ ok: true, config });
+      }
+
+      case "recalculate_scores": {
+        // Re-score all leads using stored GA data + current config
+        // No GA API call needed — just math on data we already have
+        if (!campaignId || !baseId) return NextResponse.json({ error: "campaignId and baseId required" }, { status: 400 });
+        const camp = await getCampaign(campaignId);
+        const scoreConfig = parseScoreConfig(camp.fields?.["GA Score Config"]);
+
+        let leads;
+        try { leads = await atList(baseId, "Leads"); }
+        catch (e) { return NextResponse.json({ error: e.message }, { status: 500 }); }
+
+        // Only recalc leads that have GA data (engaged sessions > 0 or engagement time > 0)
+        const leadsWithGAData = leads.filter(l => {
+          const f = l.fields || {};
+          return (f["GA Engaged Sessions"] || 0) > 0 || (f["GA Engagement Time"] || 0) > 0 || (f["GA Sessions"] || 0) > 0;
+        });
+
+        const updates = [];
+        for (const lead of leadsWithGAData) {
+          const f = lead.fields || {};
+          const m = {
+            sessions: f["GA Sessions"] || 0,
+            engagedSessions: f["GA Engaged Sessions"] || 0,
+            views: f["GA Views"] || 0,
+            viewsPerSession: f["GA Views Per Session"] || 0,
+            engagementTime: f["GA Engagement Time"] || 0,
+            avgSessionDuration: f["GA Avg Session Duration"] || 0,
+          };
+          const newScore = calculateEngagementScore(m, scoreConfig);
+          const oldScore = f["GA Engagement Score"] || 0;
+          if (newScore !== oldScore) {
+            updates.push({ id: lead.id, fields: { "GA Engagement Score": newScore } });
+          }
+        }
+
+        if (updates.length === 0) {
+          return NextResponse.json({ ok: true, recalculated: 0, leadsWithData: leadsWithGAData.length, message: "No score changes needed (formula produced same results)" });
+        }
+
+        const result = await atUpdate(baseId, "Leads", updates);
+        return NextResponse.json({
+          ok: true,
+          recalculated: result.successCount,
+          failed: result.failCount,
+          leadsWithData: leadsWithGAData.length,
+          errors: result.errors.length > 0 ? result.errors.slice(0, 3) : undefined,
         });
       }
 

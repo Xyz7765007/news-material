@@ -109,6 +109,16 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const [camp, setCamp] = useState(null); // active campaign object
   const [campaigns, setCampaigns] = useState(DEFAULT_CAMPAIGNS);
   const [tab, setTab] = useState("dashboard");
+  const [emailPrefilledLeadId, setEmailPrefilledLeadId] = useState(null);
+  // Listen for "open email for lead" event fired from GA tab
+  useEffect(() => {
+    const handler = (e) => {
+      setEmailPrefilledLeadId(e.detail?.leadId || null);
+      setTab("email_campaign");
+    };
+    window.addEventListener("signalscope:open_email_for_lead", handler);
+    return () => window.removeEventListener("signalscope:open_email_for_lead", handler);
+  }, []);
   // Client mode auth
   const [clientAuth, setClientAuth] = useState(clientMode ? "loading" : "ok"); // loading | password | ok | error
   const [clientPw, setClientPw] = useState("");
@@ -1374,7 +1384,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   </div>)}
 
   {/* ════ EMAIL CAMPAIGN ════ */}
-  {tab==="email_campaign"&&!loading&&(<EmailCampaignTab baseId={bid} campaign={camp} leads={leads} />)}
+  {tab==="email_campaign"&&!loading&&(<EmailCampaignTab baseId={bid} campaign={camp} leads={leads} prefilledLeadId={emailPrefilledLeadId} />)}
 
   {/* ════ COMING SOON ════ */}
   {tab==="coming_soon"&&(<div>
@@ -1986,6 +1996,10 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
   const [syncResult, setSyncResult] = useState(null);
   const [engagedLeads, setEngagedLeads] = useState([]);
   const [selectedEngagedIds, setSelectedEngagedIds] = useState(new Set());
+  const [scoreCfg, setScoreCfg] = useState({ weights: { time: 50, engaged: 30, views: 20 }, tiers: { warmMax: 20, interestedMax: 50 } });
+  const [scoreCfgDraft, setScoreCfgDraft] = useState({ weights: { time: 50, engaged: 30, views: 20 }, tiers: { warmMax: 20, interestedMax: 50 } });
+  const [scoreCfgEditing, setScoreCfgEditing] = useState(false);
+  const [perLeadBusy, setPerLeadBusy] = useState(null); // tracks which lead's action is in-flight
 
   const ga = async (action, data = {}) => {
     const res = await fetch("/api/ga", {
@@ -2030,10 +2044,52 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
     } catch (e) { console.error(e); }
   };
 
+  const loadScoreConfig = async () => {
+    try {
+      const r = await ga("get_score_config");
+      if (r.ok && r.config) {
+        setScoreCfg(r.config);
+        setScoreCfgDraft(r.config);
+      }
+    } catch (e) { console.error(e); }
+  };
+
+  const saveScoreConfig = async () => {
+    const sum = Number(scoreCfgDraft.weights.time) + Number(scoreCfgDraft.weights.engaged) + Number(scoreCfgDraft.weights.views);
+    if (Math.abs(sum - 100) > 0.1) {
+      setMsg(`❌ Weights must sum to 100. Current: ${sum.toFixed(1)}`);
+      return;
+    }
+    setBusy(true); setMsg("⏳ Saving config and recalculating scores...");
+    try {
+      const save = await ga("save_score_config", { weights: scoreCfgDraft.weights, tiers: scoreCfgDraft.tiers });
+      if (!save.ok) { setMsg("❌ " + (save.error || "Save failed")); setBusy(false); return; }
+
+      // Now recalc
+      const recalc = await ga("recalculate_scores");
+      if (recalc.ok) {
+        setScoreCfg(scoreCfgDraft);
+        setScoreCfgEditing(false);
+        setMsg(`✅ Config saved. Recalculated ${recalc.recalculated} lead${recalc.recalculated!==1?"s":""} (${recalc.leadsWithData} had data).`);
+        await loadEngaged();
+        if (onSyncComplete) onSyncComplete();
+      } else {
+        setMsg("⚠️ Config saved but recalc failed: " + (recalc.error || "unknown"));
+      }
+    } catch (e) { setMsg("❌ " + e.message); }
+    setBusy(false);
+  };
+
+  const resetScoreConfig = () => {
+    const defaults = { weights: { time: 50, engaged: 30, views: 20 }, tiers: { warmMax: 20, interestedMax: 50 } };
+    setScoreCfgDraft(defaults);
+  };
+
   // Load engaged leads on mount + after sync
   useEffect(() => {
     if (!campaign?.airtableId || !baseId) return;
     loadEngaged();
+    loadScoreConfig();
   }, [campaign?.airtableId, baseId]);
 
   const isAuthed = config.hasOAuth || config.hasServiceAccount;
@@ -2136,7 +2192,13 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
     const m = Math.floor(s / 60); const r = s % 60;
     return m + "m" + (r > 0 ? " " + r + "s" : "");
   };
-  const tierFor = (score) => score >= 51 ? { label: "🔥 Hot", color: "var(--grn)" } : score >= 21 ? { label: "⚡ Interested", color: "var(--amb)" } : { label: "👀 Warm", color: "var(--blu)" };
+  const tierFor = (score) => {
+    const warmMax = scoreCfg.tiers?.warmMax || 20;
+    const interestedMax = scoreCfg.tiers?.interestedMax || 50;
+    if (score > interestedMax) return { label: "🔥 Hot", color: "var(--grn)" };
+    if (score > warmMax) return { label: "⚡ Interested", color: "var(--amb)" };
+    return { label: "👀 Warm", color: "var(--blu)" };
+  };
 
   const toggleEngagedSelection = (id) => {
     setSelectedEngagedIds(prev => {
@@ -2164,6 +2226,46 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
       }
     } catch (e) { setMsg("❌ " + e.message); }
     setBusy(false);
+  };
+
+  const sendConnectionForLead = async (lead) => {
+    if (!confirm(`Send a LinkedIn connection request to ${lead.name}?\n\nThis will use AI to generate a personalized connection note referencing their website engagement, then send via the LinkedIn account assigned to this campaign.`)) return;
+    setPerLeadBusy(lead.id);
+    setMsg("⏳ Generating AI message and sending connection request...");
+    try {
+      const res = await fetch("/api/outreach", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "quick_send_connection",
+          baseId,
+          campaignId: campaign?.airtableId,
+          leadId: lead.id,
+          ruleConfig: { campaignName: campaign?.name || "" },
+        }),
+      });
+      const r = await res.json();
+      if (r.ok && r.sent > 0) {
+        setMsg(`✅ Connection request sent to ${lead.name}!`);
+        await loadEngaged();
+      } else if (r.error) {
+        setMsg("❌ " + r.error);
+      } else {
+        setMsg(`⚠️ Request completed but ${r.failed || 0} failed. ${r.result?.error || ""}`);
+        await loadEngaged();
+      }
+    } catch (e) { setMsg("❌ " + e.message); }
+    setPerLeadBusy(null);
+  };
+
+  const sendEmailForLead = (lead) => {
+    // Navigate to Email Campaign tab with this lead pre-selected
+    // The tab will pick up the hash/state and focus this lead
+    if (!lead.email) { setMsg("❌ No email address on this lead"); return; }
+    setMsg(`📧 Opening Email Campaign with ${lead.name}...`);
+    // Use window.location hash as a lightweight cross-component signal
+    window.location.hash = `email-lead-${lead.id}`;
+    // Fire a custom event the parent can listen for
+    window.dispatchEvent(new CustomEvent("signalscope:open_email_for_lead", { detail: { leadId: lead.id, leadName: lead.name } }));
   };
 
   const exportEngagedCSV = () => {
@@ -2299,27 +2401,62 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
                 {engagedLeads.map((l, idx) => {
                   const tier = tierFor(l.score);
                   const selected = selectedEngagedIds.has(l.id);
+                  const thisBusy = perLeadBusy === l.id;
+                  // Outreach status styling
+                  const statusLabel = l.outreachStatus ? (
+                    l.outreachStatus === "queued" ? { text: "⏱ Queued", color: "var(--amb)" } :
+                    l.outreachStatus === "connection_sent" ? { text: "✉ Connection sent", color: "var(--blu)" } :
+                    l.outreachStatus === "connected" ? { text: "✅ Connected", color: "var(--grn)" } :
+                    l.outreachStatus === "replied" ? { text: "💬 Replied", color: "var(--grn)" } :
+                    l.outreachStatus === "completed" ? { text: "✓ Completed", color: "var(--t3)" } :
+                    l.outreachStatus === "error" ? { text: "⚠ Error", color: "var(--red)" } :
+                    { text: l.outreachStatus, color: "var(--t3)" }
+                  ) : null;
                   return (
-                    <div key={l.id} onClick={()=>toggleEngagedSelection(l.id)} style={{
-                      display:"grid",gridTemplateColumns:"auto 1fr auto auto auto",gap:14,alignItems:"center",
-                      padding:"12px 14px",cursor:"pointer",
+                    <div key={l.id} style={{
+                      padding:"12px 14px",
                       background:selected?"var(--hover)":(idx%2===0?"transparent":"rgba(255,255,255,0.015)"),
                       borderBottom:idx<engagedLeads.length-1?"1px solid var(--bdr)":"none",
                       transition:"background 0.1s",
                     }}>
-                      <input type="checkbox" checked={selected} onChange={()=>toggleEngagedSelection(l.id)} onClick={e=>e.stopPropagation()} style={{accentColor:"var(--acc)"}}/>
-                      <div style={{minWidth:0}}>
-                        <div style={{fontSize:12,fontWeight:600,color:"var(--t1)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{l.name || "Unknown"}</div>
-                        <div style={{fontSize:10,color:"var(--t3)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                          {l.title ? l.title : ""}{l.title && l.company ? " · " : ""}{l.company || ""}
+                      {/* Main row */}
+                      <div onClick={()=>toggleEngagedSelection(l.id)} style={{display:"grid",gridTemplateColumns:"auto 1fr auto auto auto",gap:14,alignItems:"center",cursor:"pointer"}}>
+                        <input type="checkbox" checked={selected} onChange={()=>toggleEngagedSelection(l.id)} onClick={e=>e.stopPropagation()} style={{accentColor:"var(--acc)"}}/>
+                        <div style={{minWidth:0}}>
+                          <div style={{fontSize:12,fontWeight:600,color:"var(--t1)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{l.name || "Unknown"}</div>
+                          <div style={{fontSize:10,color:"var(--t3)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                            {l.title ? l.title : ""}{l.title && l.company ? " · " : ""}{l.company || ""}
+                          </div>
                         </div>
+                        <div style={{textAlign:"right",fontSize:10,color:"var(--t3)",minWidth:180}}>
+                          <div style={{color:"var(--t2)"}}>{l.sessions} session{l.sessions!==1?"s":""} · {l.views} view{l.views!==1?"s":""}</div>
+                          <div>{fmtEngTime(l.engagementTime)} · last visit {l.lastVisit || "—"}</div>
+                        </div>
+                        <div style={{fontSize:10,fontWeight:600,color:tier.color,minWidth:90,textAlign:"center"}}>{tier.label}</div>
+                        <div style={{fontSize:20,fontWeight:700,color:tier.color,minWidth:36,textAlign:"right"}}>{l.score}</div>
                       </div>
-                      <div style={{textAlign:"right",fontSize:10,color:"var(--t3)",minWidth:180}}>
-                        <div style={{color:"var(--t2)"}}>{l.sessions} session{l.sessions!==1?"s":""} · {l.views} view{l.views!==1?"s":""}</div>
-                        <div>{fmtEngTime(l.engagementTime)} · last visit {l.lastVisit || "—"}</div>
+
+                      {/* Action buttons row */}
+                      <div style={{display:"flex",gap:6,alignItems:"center",marginTop:10,paddingTop:10,borderTop:"1px solid var(--bdr)",flexWrap:"wrap"}}>
+                        {l.canSendConnection && l.linkedinUrl ? (
+                          <button className="btn btn-s" disabled={thisBusy} onClick={e=>{e.stopPropagation();sendConnectionForLead(l);}} style={{fontSize:10}}>
+                            {thisBusy ? "⏳ Sending..." : "🔗 Send Connection"}
+                          </button>
+                        ) : statusLabel ? (
+                          <div style={{fontSize:10,color:statusLabel.color,fontWeight:600,padding:"4px 10px",background:"var(--hover)",borderRadius:4}}>{statusLabel.text}</div>
+                        ) : !l.linkedinUrl ? (
+                          <div style={{fontSize:10,color:"var(--t3)",fontStyle:"italic"}}>No LinkedIn URL</div>
+                        ) : null}
+
+                        {l.canSendEmail && (
+                          <button className="btn btn-s" disabled={thisBusy} onClick={e=>{e.stopPropagation();sendEmailForLead(l);}} style={{fontSize:10}}>
+                            📧 Send Email
+                          </button>
+                        )}
+                        {!l.canSendEmail && l.canSendConnection && (
+                          <div style={{fontSize:10,color:"var(--t3)",fontStyle:"italic"}}>No email on file</div>
+                        )}
                       </div>
-                      <div style={{fontSize:10,fontWeight:600,color:tier.color,minWidth:90,textAlign:"center"}}>{tier.label}</div>
-                      <div style={{fontSize:20,fontWeight:700,color:tier.color,minWidth:36,textAlign:"right"}}>{l.score}</div>
                     </div>
                   );
                 })}
@@ -2335,20 +2472,80 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
             </div>
           )}
 
-          {/* SCORING METHODOLOGY */}
+          {/* SCORING CONFIG — editable weights + tiers */}
           <div style={{marginTop:14,padding:14,background:"var(--card)",border:"1px dashed var(--bdr)",borderRadius:8}}>
-            <div style={{fontSize:11,fontWeight:600,color:"var(--t1)",marginBottom:8}}>📊 How Engagement Score works (0–100)</div>
-            <div style={{fontSize:10,color:"var(--t2)",lineHeight:1.7}}>
-              Weighted combination of 3 signals, sliding 7-day window:
-              <div style={{paddingLeft:14,marginTop:6,fontFamily:"'JetBrains Mono',monospace",fontSize:10,color:"var(--t3)"}}>
-                • <strong style={{color:"var(--t1)"}}>50%</strong> Engagement Time — 0s=0, 30s=50, 120s+=100<br/>
-                • <strong style={{color:"var(--t1)"}}>30%</strong> Engaged Sessions — 0=0, 1=50, 3+=100<br/>
-                • <strong style={{color:"var(--t1)"}}>20%</strong> Views/Session — 1=20, 3=60, 5+=100
-              </div>
-              <div style={{marginTop:8}}>
-                Score tiers: <span style={{color:"var(--blu)",fontWeight:600}}>1–20 Warm</span> · <span style={{color:"var(--amb)",fontWeight:600}}>21–50 Interested</span> · <span style={{color:"var(--grn)",fontWeight:600}}>51+ Hot Lead</span>
-              </div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <div style={{fontSize:11,fontWeight:600,color:"var(--t1)"}}>📊 Engagement Score Formula (0–100)</div>
+              {!scoreCfgEditing ? (
+                <button className="btn btn-s" onClick={()=>{setScoreCfgDraft(scoreCfg);setScoreCfgEditing(true);}}>✏️ Edit</button>
+              ) : (
+                <div style={{display:"flex",gap:6}}>
+                  <button className="btn btn-s" onClick={resetScoreConfig}>🔄 Defaults</button>
+                  <button className="btn btn-s" onClick={()=>{setScoreCfgEditing(false);setScoreCfgDraft(scoreCfg);setMsg("");}}>Cancel</button>
+                  <button className="btn btn-p btn-s" disabled={busy} onClick={saveScoreConfig}>{busy?"⏳":`💾 Save & Recalculate`}</button>
+                </div>
+              )}
             </div>
+
+            {/* Weights */}
+            <div style={{fontSize:10,color:"var(--t3)",marginBottom:8}}>Weight (must sum to 100):</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:"8px 10px",alignItems:"center",fontSize:11,marginBottom:10}}>
+              <div style={{color:"var(--t2)"}}>⏱️ Engagement Time</div>
+              {scoreCfgEditing ? (
+                <input type="number" min={0} max={100} value={scoreCfgDraft.weights.time} onChange={e=>setScoreCfgDraft(d=>({...d,weights:{...d.weights,time:Number(e.target.value)}}))} style={{width:60,padding:"4px 6px",background:"var(--hover)",border:"1px solid var(--bdr)",borderRadius:4,color:"var(--t1)",fontSize:11,textAlign:"right"}}/>
+              ) : (
+                <div style={{fontWeight:600,color:"var(--t1)",textAlign:"right",minWidth:40}}>{scoreCfg.weights.time}%</div>
+              )}
+              <div style={{color:"var(--t2)"}}>🎯 Engaged Sessions</div>
+              {scoreCfgEditing ? (
+                <input type="number" min={0} max={100} value={scoreCfgDraft.weights.engaged} onChange={e=>setScoreCfgDraft(d=>({...d,weights:{...d.weights,engaged:Number(e.target.value)}}))} style={{width:60,padding:"4px 6px",background:"var(--hover)",border:"1px solid var(--bdr)",borderRadius:4,color:"var(--t1)",fontSize:11,textAlign:"right"}}/>
+              ) : (
+                <div style={{fontWeight:600,color:"var(--t1)",textAlign:"right",minWidth:40}}>{scoreCfg.weights.engaged}%</div>
+              )}
+              <div style={{color:"var(--t2)"}}>📄 Views per Session</div>
+              {scoreCfgEditing ? (
+                <input type="number" min={0} max={100} value={scoreCfgDraft.weights.views} onChange={e=>setScoreCfgDraft(d=>({...d,weights:{...d.weights,views:Number(e.target.value)}}))} style={{width:60,padding:"4px 6px",background:"var(--hover)",border:"1px solid var(--bdr)",borderRadius:4,color:"var(--t1)",fontSize:11,textAlign:"right"}}/>
+              ) : (
+                <div style={{fontWeight:600,color:"var(--t1)",textAlign:"right",minWidth:40}}>{scoreCfg.weights.views}%</div>
+              )}
+              {scoreCfgEditing && (() => {
+                const sum = Number(scoreCfgDraft.weights.time) + Number(scoreCfgDraft.weights.engaged) + Number(scoreCfgDraft.weights.views);
+                const ok = Math.abs(sum - 100) < 0.1;
+                return (<>
+                  <div style={{fontSize:10,color:"var(--t3)",fontStyle:"italic",paddingTop:4,borderTop:"1px solid var(--bdr)"}}>Total</div>
+                  <div style={{fontWeight:700,textAlign:"right",color:ok?"var(--grn)":"var(--red)",fontSize:11,paddingTop:4,borderTop:"1px solid var(--bdr)"}}>{sum.toFixed(0)}% {ok?"✓":"✗"}</div>
+                </>);
+              })()}
+            </div>
+
+            {/* Tier Boundaries */}
+            <div style={{fontSize:10,color:"var(--t3)",marginBottom:8,marginTop:14,paddingTop:10,borderTop:"1px solid var(--bdr)"}}>Score tier boundaries:</div>
+            <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",fontSize:11}}>
+              <span style={{color:"var(--blu)",fontWeight:600}}>👀 Warm:</span>
+              <span style={{color:"var(--t2)"}}>1 –</span>
+              {scoreCfgEditing ? (
+                <input type="number" min={1} max={99} value={scoreCfgDraft.tiers.warmMax} onChange={e=>setScoreCfgDraft(d=>({...d,tiers:{...d.tiers,warmMax:Number(e.target.value)}}))} style={{width:50,padding:"3px 6px",background:"var(--hover)",border:"1px solid var(--bdr)",borderRadius:4,color:"var(--t1)",fontSize:11,textAlign:"center"}}/>
+              ) : (
+                <span style={{color:"var(--t1)",fontWeight:600}}>{scoreCfg.tiers.warmMax}</span>
+              )}
+              <span style={{color:"var(--t3)",margin:"0 4px"}}>·</span>
+              <span style={{color:"var(--amb)",fontWeight:600}}>⚡ Interested:</span>
+              <span style={{color:"var(--t2)"}}>{scoreCfgEditing ? Number(scoreCfgDraft.tiers.warmMax) + 1 : scoreCfg.tiers.warmMax + 1} –</span>
+              {scoreCfgEditing ? (
+                <input type="number" min={2} max={100} value={scoreCfgDraft.tiers.interestedMax} onChange={e=>setScoreCfgDraft(d=>({...d,tiers:{...d.tiers,interestedMax:Number(e.target.value)}}))} style={{width:50,padding:"3px 6px",background:"var(--hover)",border:"1px solid var(--bdr)",borderRadius:4,color:"var(--t1)",fontSize:11,textAlign:"center"}}/>
+              ) : (
+                <span style={{color:"var(--t1)",fontWeight:600}}>{scoreCfg.tiers.interestedMax}</span>
+              )}
+              <span style={{color:"var(--t3)",margin:"0 4px"}}>·</span>
+              <span style={{color:"var(--grn)",fontWeight:600}}>🔥 Hot Lead:</span>
+              <span style={{color:"var(--t1)",fontWeight:600}}>{(scoreCfgEditing ? Number(scoreCfgDraft.tiers.interestedMax) : scoreCfg.tiers.interestedMax) + 1}+</span>
+            </div>
+
+            {scoreCfgEditing && (
+              <div style={{marginTop:10,padding:8,background:"var(--hover)",borderRadius:4,fontSize:10,color:"var(--t3)",lineHeight:1.5}}>
+                💡 Saving will recalculate scores for all leads that have GA data using the new formula. No GA API calls needed — just math on stored data. Takes a few seconds.
+              </div>
+            )}
           </div>
         </div>
       )}
