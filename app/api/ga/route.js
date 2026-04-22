@@ -895,15 +895,22 @@ export async function POST(request) {
           const errText = await r.text();
           console.error(`[convert_to_tasks] Batch attempt ${attempt} FAILED:`, r.status, errText);
 
-          // Try to parse INVALID_VALUE_FOR_COLUMN errors and handle the bad field
-          if (attempt < 5 && (errText.includes("INVALID_VALUE_FOR_COLUMN") || errText.includes("UNKNOWN_FIELD_NAME"))) {
-            const match = errText.match(/Field\s+\\?"([^"\\]+)\\?"/);
-            if (match && match[1]) {
-              const badField = match[1];
+          // Try to parse various Airtable field errors and handle the bad field
+          if (attempt < 10 && (errText.includes("INVALID_VALUE_FOR_COLUMN") || errText.includes("UNKNOWN_FIELD_NAME"))) {
+            // Match either:
+            //   Field "FieldName" cannot accept...    (INVALID_VALUE_FOR_COLUMN)
+            //   Unknown field name: "FieldName"       (UNKNOWN_FIELD_NAME)
+            let badField = null;
+            const m1 = errText.match(/Field\s+\\?"([^"\\]+)\\?"/);
+            const m2 = errText.match(/[Uu]nknown field name:?\s+\\?"([^"\\]+)\\?"/);
+            if (m1 && m1[1]) badField = m1[1];
+            else if (m2 && m2[1]) badField = m2[1];
 
+            if (badField) {
               // Special handling for Score: try as string first before stripping entirely
-              if (badField === "Score" && attempt === 0) {
+              if (badField === "Score" && !strippedFields.has("_score_string_tried")) {
                 console.log(`[convert_to_tasks] Score rejected as number, retrying as string`);
+                strippedFields.add("_score_string_tried"); // marker so we don't loop
                 const stringScoreBatch = batch.map(rec => ({
                   fields: { ...rec.fields, Score: String(rec.fields.Score || 0) },
                 }));
@@ -918,6 +925,8 @@ export async function POST(request) {
                 return { fields: newFields };
               });
               return tryBatch(strippedBatch, attempt + 1);
+            } else {
+              console.error(`[convert_to_tasks] Couldn't parse bad field from error: ${errText.slice(0, 300)}`);
             }
           }
           return { ok: false, error: `${r.status} — ${errText.slice(0, 250)}` };

@@ -2174,7 +2174,7 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
         if (r.updatesFailed > 0) {
           setMsg(`⚠️ Sync partially failed! ${r.updatesSucceeded||0} leads updated, ${r.updatesFailed} FAILED. First error: ${r.updateErrors?.[0] || "unknown"}`);
         } else {
-          setMsg(`✅ Sync complete! ${r.activeThisWeek} lead${r.activeThisWeek!==1?"s":""} engaged this week.${r.unmatchedCodes > 0 ? ` ${r.unmatchedCodes} GA codes had no matching lead.` : ""}`);
+          setMsg(`✅ Sync complete! ${r.activeThisWeek} lead${r.activeThisWeek!==1?"s":""} visited this week. Engaged leads (score ≥ 1) will appear below.${r.unmatchedCodes > 0 ? ` ${r.unmatchedCodes} GA codes had no matching lead.` : ""}`);
         }
         if (onSyncComplete) onSyncComplete();
         await loadConfig();
@@ -2435,7 +2435,7 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
             <div style={{marginTop:14,padding:12,background:"var(--hover)",borderRadius:6}}>
               <div style={{fontSize:10,color:"var(--t3)",fontWeight:600,marginBottom:6}}>LAST SYNC RESULT</div>
               <div style={{fontSize:11,color:"var(--t1)",lineHeight:1.6}}>
-                {syncResult.totalLeads} total leads · {syncResult.leadsTracked} have Custom Codes · <span style={{color:"var(--grn)",fontWeight:600}}>{syncResult.activeThisWeek} engaged this week</span>
+                {syncResult.totalLeads} total leads · {syncResult.leadsTracked} have Custom Codes · <span style={{color:"var(--grn)",fontWeight:600}}>{syncResult.activeThisWeek} visited this week</span> <span style={{color:"var(--t3)"}}>(engaged leads with score ≥ 1 shown below)</span>
                 {syncResult.unmatchedCodes > 0 && <> · <span style={{color:"var(--amb)"}}>{syncResult.unmatchedCodes} GA codes don't match any lead</span></>}
               </div>
             </div>
