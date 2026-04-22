@@ -863,7 +863,14 @@ export async function POST(request) {
         }
 
         if (newTasks.length === 0) {
-          return NextResponse.json({ ok: true, created: 0, skipped, message: "All engaged leads already have tasks" });
+          console.log("[convert_to_tasks] All tasks already exist. Skipped:", skipped, "Total targeted:", targetLeads.length);
+          return NextResponse.json({
+            ok: true,
+            created: 0,
+            skipped,
+            total: targetLeads.length,
+            message: `All ${skipped} engaged lead${skipped!==1?"s":""} already have tasks (deduplicated). To re-create, delete the existing tasks from the Tasks tab first.`,
+          });
         }
 
         // Batch-create tasks (10 at a time)
@@ -879,10 +886,21 @@ export async function POST(request) {
             created += batch.length;
           } else {
             const err = await r.text();
-            createErrors.push(`Batch ${i}: ${r.status} — ${err.slice(0, 200)}`);
+            console.error(`[convert_to_tasks] Batch ${i} FAILED:`, r.status, err);
+            createErrors.push(`Batch ${i}: ${r.status} — ${err.slice(0, 250)}`);
           }
         }
 
+        // If ALL batches failed, return as error
+        if (created === 0 && createErrors.length > 0) {
+          return NextResponse.json({
+            ok: false,
+            error: `Task creation failed for all ${newTasks.length} leads. First error: ${createErrors[0]}`,
+            errors: createErrors.slice(0, 3),
+          }, { status: 500 });
+        }
+
+        console.log("[convert_to_tasks] Success:", created, "created,", skipped, "skipped,", createErrors.length, "errors");
         return NextResponse.json({
           ok: true,
           created,

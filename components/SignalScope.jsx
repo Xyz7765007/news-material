@@ -2211,21 +2211,31 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
   const selectAllEngaged = () => setSelectedEngagedIds(new Set(engagedLeads.map(l => l.id)));
   const clearEngagedSelection = () => setSelectedEngagedIds(new Set());
 
+  const [convertMsg, setConvertMsg] = useState(""); // inline feedback near the button
   const convertEngagedToTasks = async () => {
     const ids = Array.from(selectedEngagedIds);
     const target = ids.length > 0 ? ids : engagedLeads.map(l => l.id);
-    if (target.length === 0) { setMsg("❌ No engaged leads to convert"); return; }
-    if (!confirm(`Convert ${target.length} engaged lead${target.length!==1?"s":""} to tasks?\n\nEach task will include their engagement score, last visit, sessions, and time on site — ready to review in the Tasks tab.`)) return;
-    setBusy(true); setMsg("⏳ Creating tasks...");
+    if (target.length === 0) { setConvertMsg("❌ No engaged leads to convert"); return; }
+    setBusy(true); setConvertMsg("⏳ Creating tasks...");
     try {
       const r = await ga("convert_to_tasks", { leadIds: target, minScore: 1 });
+      console.log("[convert_to_tasks] response:", r);
       if (r.ok) {
-        setMsg(`✅ Created ${r.created} task${r.created!==1?"s":""}${r.skipped > 0 ? ` (${r.skipped} already existed, skipped)` : ""}. Open the Tasks tab to review.`);
+        if (r.created > 0) {
+          setConvertMsg(`✅ Created ${r.created} task${r.created!==1?"s":""}${r.skipped > 0 ? ` (${r.skipped} already existed)` : ""} — check the Tasks tab`);
+        } else if (r.skipped > 0 || r.message) {
+          setConvertMsg(`ℹ️ ${r.message || "All engaged leads already have tasks (skipped " + r.skipped + ")"}`);
+        } else {
+          setConvertMsg(`⚠️ Response was OK but no tasks created. Check console for details.`);
+        }
         clearEngagedSelection();
       } else {
-        setMsg("❌ " + (r.error || "Convert failed"));
+        setConvertMsg("❌ " + (r.error || "Convert failed — check browser console for details"));
       }
-    } catch (e) { setMsg("❌ " + e.message); }
+    } catch (e) {
+      console.error("[convert_to_tasks] exception:", e);
+      setConvertMsg("❌ " + e.message);
+    }
     setBusy(false);
   };
 
@@ -2447,6 +2457,15 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
                   <button className="btn btn-p btn-s" disabled={busy} onClick={convertEngagedToTasks}>{busy?"⏳":`✨ Convert ${selectedEngagedIds.size > 0 ? selectedEngagedIds.size : "all"} to tasks`}</button>
                 </div>
               </div>
+
+              {/* Inline feedback for convert action — rendered right next to the button so it's always visible */}
+              {convertMsg && (
+                <div style={{
+                  padding:"10px 12px",marginBottom:10,borderRadius:6,fontSize:11,lineHeight:1.5,
+                  background:convertMsg.startsWith("✅")?"var(--grn-d)":convertMsg.startsWith("⏳")?"var(--hover)":convertMsg.startsWith("ℹ")?"var(--hover)":"var(--red-d)",
+                  color:convertMsg.startsWith("✅")?"var(--grn)":convertMsg.startsWith("⏳")?"var(--t2)":convertMsg.startsWith("ℹ")?"var(--t2)":"var(--red)",
+                }}>{convertMsg}</div>
+              )}
 
               <div style={{border:"1px solid var(--bdr)",borderRadius:8,overflow:"hidden"}}>
                 {engagedLeads.map((l, idx) => {
