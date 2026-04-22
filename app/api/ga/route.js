@@ -635,36 +635,30 @@ export async function POST(request) {
         for (const lead of leadsWithCodes) {
           const code = lead.fields?.["Custom Code"];
           const m = metricsMap[code];
-          const fields = { "GA Last Synced At": nowISO };
 
-          if (m) {
-            // Lead has GA activity in last 7 days
-            const score = calculateEngagementScore(m);
-            // Format YYYYMMDD -> YYYY-MM-DD
-            const lastVisit = m.lastVisit ? `${m.lastVisit.slice(0,4)}-${m.lastVisit.slice(4,6)}-${m.lastVisit.slice(6,8)}` : "";
-            fields["GA Sessions"] = m.sessions;
-            fields["GA Engaged Sessions"] = m.engagedSessions;
-            fields["GA Views"] = m.views;
-            fields["GA Views Per Session"] = Math.round(m.viewsPerSession * 100) / 100;
-            fields["GA Engagement Time"] = m.engagementTime;
-            fields["GA Avg Session Duration"] = Math.round(m.avgSessionDuration * 10) / 10;
-            fields["GA Last Visit"] = lastVisit;
-            fields["GA Engagement Score"] = score;
-            matched++;
-          } else {
-            // No activity in last 7 days — zero out (sliding window per spec)
-            fields["GA Sessions"] = 0;
-            fields["GA Engaged Sessions"] = 0;
-            fields["GA Views"] = 0;
-            fields["GA Views Per Session"] = 0;
-            fields["GA Engagement Time"] = 0;
-            fields["GA Avg Session Duration"] = 0;
-            fields["GA Engagement Score"] = 0;
-            // Note: don't clear GA Last Visit — keep historical record so user knows when they LAST saw activity
-            cleared++;
-          }
+          // Skip leads with no GA activity — don't waste writes on them
+          // Their existing GA fields (if any from a past sync) stay untouched
+          if (!m) continue;
+
+          // Lead has GA activity in last 7 days
+          const score = calculateEngagementScore(m);
+          const lastVisit = m.lastVisit ? `${m.lastVisit.slice(0,4)}-${m.lastVisit.slice(4,6)}-${m.lastVisit.slice(6,8)}` : "";
+          const fields = {
+            "GA Last Synced At": nowISO,
+            "GA Sessions": m.sessions,
+            "GA Engaged Sessions": m.engagedSessions,
+            "GA Views": m.views,
+            "GA Views Per Session": Math.round(m.viewsPerSession * 100) / 100,
+            "GA Engagement Time": m.engagementTime,
+            "GA Avg Session Duration": Math.round(m.avgSessionDuration * 10) / 10,
+            "GA Last Visit": lastVisit,
+            "GA Engagement Score": score,
+          };
+          matched++;
           updates.push({ id: lead.id, fields });
         }
+        // Count inactive as "leads we know exist but aren't in GA's active set this week"
+        cleared = leadsWithCodes.length - matched;
 
         // 4. Push updates to Airtable
         let updateResult;
