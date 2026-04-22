@@ -1130,21 +1130,23 @@ export async function POST(request) {
             return NextResponse.json({ error: `Outreach already exists for this lead (status: ${existing.fields?.Status || "unknown"}). To resend, first clear or retry the existing record.` }, { status: 400 });
           }
 
-          // Resolve LinkedIn profile to get provider_id via Unipile
-          const names = deriveNames(f);
-          const profileRes = await getProfile(resolvedAccountId, linkedinUrl);
-          if (!profileRes.ok) {
-            return NextResponse.json({ error: `Couldn't resolve LinkedIn profile. Unipile said: ${profileRes.status} ${JSON.stringify(profileRes.data).slice(0, 200)}` }, { status: 400 });
-          }
-          const providerId = profileRes.data?.provider_id || profileRes.data?.public_identifier || "";
-          if (!providerId) {
-            return NextResponse.json({ error: "Couldn't extract provider_id from LinkedIn profile" }, { status: 400 });
-          }
-
-          // Send invitation
-          const inviteRes = await sendInvitation(resolvedAccountId, providerId, body.note.slice(0, 300));
+          // Send invitation — sendInvitation handles profile resolution internally,
+          // same as manual mode. Pass LinkedIn URL directly.
+          const inviteRes = await sendInvitation(resolvedAccountId, linkedinUrl, body.note.slice(0, 300));
           if (!inviteRes.ok) {
-            return NextResponse.json({ error: `LinkedIn rejected the connection request: ${inviteRes.status} ${JSON.stringify(inviteRes.data).slice(0, 300)}` }, { status: 400 });
+            // Build a user-friendly error message based on Unipile's response
+            const detailStr = JSON.stringify(inviteRes.data || {});
+            let friendlyError = `LinkedIn rejected the request (${inviteRes.status})`;
+            if (detailStr.includes("invalid_recipient") || detailStr.includes("cannot be reached")) {
+              friendlyError = `LinkedIn won't let this connection go through. Common reasons:\n\n• The person has strict connection settings (requires email to connect)\n• You're a 3rd-degree or out-of-network connection and LinkedIn needs extra verification\n• Daily connection limit hit on this LinkedIn account\n• The profile is locked/deactivated\n• The LinkedIn URL on this lead may be outdated\n\nTry connecting directly on LinkedIn, or use Send Email instead if available.`;
+            } else if (detailStr.includes("rate_limit") || detailStr.includes("too_many")) {
+              friendlyError = `LinkedIn rate limit hit. Wait a few hours and try again, or reduce your connection volume.`;
+            } else if (detailStr.includes("already_connected") || detailStr.includes("already_invited")) {
+              friendlyError = `You've already connected with or invited this person previously.`;
+            } else {
+              friendlyError += `: ${detailStr.slice(0, 250)}`;
+            }
+            return NextResponse.json({ error: friendlyError, raw: inviteRes.data }, { status: 400 });
           }
 
           // Record in Outreach table
