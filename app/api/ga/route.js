@@ -832,16 +832,21 @@ export async function POST(request) {
           const name = f.Name || "Unknown";
           const title = f.Title || "";
           const company = f.Company || "";
-          const score = f["GA Engagement Score"] || 0;
+          const engagementScore = f["GA Engagement Score"] || 0;
           const sessions = f["GA Sessions"] || 0;
           const engagedSessions = f["GA Engaged Sessions"] || 0;
           const views = f["GA Views"] || 0;
           const engTime = f["GA Engagement Time"] || 0;
           const lastVisit = f["GA Last Visit"] || "";
 
-          // Build rich signal text with all the context
-          const tier = score >= 51 ? "🔥 Hot Lead" : score >= 21 ? "⚡ Interested" : "👀 Warm";
-          const signal = `${tier} (score ${score}) — ${name}${title ? " · " + title : ""}${company ? " @ " + company : ""}. Visited website on ${lastVisit || "recently"}: ${sessions} session${sessions!==1?"s":""} (${engagedSessions} engaged), ${views} pageview${views!==1?"s":""}, ${fmtTime(engTime)} total engagement time.`;
+          // Boost task Score: website engagement = strong buying signal (intent from their side),
+          // should always rank above typical news/job-signal tasks. Floor at 90, scale up to 100.
+          // Formula: 90 + (engagementScore / 100 * 10), clamped to [90, 100]
+          const boostedScore = Math.min(100, Math.round(90 + engagementScore / 10));
+
+          // Build rich signal text — no "(score X)" since Score column shows it
+          const tier = engagementScore >= 51 ? "🔥 Hot Lead" : engagementScore >= 21 ? "⚡ Interested" : "👀 Warm";
+          const signal = `${tier} — ${name}${title ? " · " + title : ""}${company ? " @ " + company : ""}. Visited website on ${lastVisit || "recently"}: ${sessions} session${sessions!==1?"s":""} (${engagedSessions} engaged), ${views} pageview${views!==1?"s":""}, ${fmtTime(engTime)} total engagement time.`;
 
           const dedupKey = company + "::" + signal.slice(0, 40);
           if (existingEngagementTasks.has(dedupKey)) { skipped++; continue; }
@@ -850,12 +855,12 @@ export async function POST(request) {
             fields: {
               Company: company,
               "Task Rule": "Website Engagement (GA)",
-              Score: score,
+              Score: boostedScore,
               "Scan Target": name,
               Signal: signal,
               Source: "Google Analytics",
               "Task Type": "engagement",
-              Date: lastVisit || todayStr,
+              Date: todayStr,
               Created: nowISO,
               Phone: f.Phone || "",
             },
@@ -890,12 +895,21 @@ export async function POST(request) {
           const errText = await r.text();
           console.error(`[convert_to_tasks] Batch attempt ${attempt} FAILED:`, r.status, errText);
 
-          // Try to parse INVALID_VALUE_FOR_COLUMN errors and strip bad field
+          // Try to parse INVALID_VALUE_FOR_COLUMN errors and handle the bad field
           if (attempt < 5 && (errText.includes("INVALID_VALUE_FOR_COLUMN") || errText.includes("UNKNOWN_FIELD_NAME"))) {
-            // Extract the field name from error message: Field "FieldName" cannot accept...
             const match = errText.match(/Field\s+\\?"([^"\\]+)\\?"/);
             if (match && match[1]) {
               const badField = match[1];
+
+              // Special handling for Score: try as string first before stripping entirely
+              if (badField === "Score" && attempt === 0) {
+                console.log(`[convert_to_tasks] Score rejected as number, retrying as string`);
+                const stringScoreBatch = batch.map(rec => ({
+                  fields: { ...rec.fields, Score: String(rec.fields.Score || 0) },
+                }));
+                return tryBatch(stringScoreBatch, attempt + 1);
+              }
+
               console.log(`[convert_to_tasks] Stripping bad field: ${badField} and retrying`);
               strippedFields.add(badField);
               const strippedBatch = batch.map(rec => {
