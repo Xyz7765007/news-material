@@ -2222,7 +2222,9 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
       console.log("[convert_to_tasks] response:", r);
       if (r.ok) {
         if (r.created > 0) {
-          setConvertMsg(`✅ Created ${r.created} task${r.created!==1?"s":""}${r.skipped > 0 ? ` (${r.skipped} already existed)` : ""} — check the Tasks tab`);
+          let m = `✅ Created ${r.created} task${r.created!==1?"s":""}${r.skipped > 0 ? ` (${r.skipped} already existed)` : ""} — check the Tasks tab`;
+          if (r.strippedFields?.length) m += ` · Note: Airtable rejected field${r.strippedFields.length>1?"s":""} ${r.strippedFields.join(", ")} (type mismatch) — tasks were created without ${r.strippedFields.length>1?"them":"it"}`;
+          setConvertMsg(m);
         } else if (r.skipped > 0 || r.message) {
           setConvertMsg(`ℹ️ ${r.message || "All engaged leads already have tasks (skipped " + r.skipped + ")"}`);
         } else {

@@ -873,21 +873,49 @@ export async function POST(request) {
           });
         }
 
-        // Batch-create tasks (10 at a time)
+        // Batch-create tasks with auto-retry on field rejection
+        // If Airtable rejects a specific field (e.g. existing Score column has different type),
+        // strip that field from all records and retry — up to 3 times for different bad fields
         let created = 0;
         const createErrors = [];
-        for (let i = 0; i < newTasks.length; i += 10) {
-          const batch = newTasks.slice(i, i + 10);
+        const strippedFields = new Set(); // track fields we had to remove
+
+        const tryBatch = async (batch, attempt = 0) => {
           const r = await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Tasks")}`, {
             method: "POST", headers: atHdr,
             body: JSON.stringify({ records: batch }),
           });
-          if (r.ok) {
-            created += batch.length;
+          if (r.ok) return { ok: true, count: batch.length };
+
+          const errText = await r.text();
+          console.error(`[convert_to_tasks] Batch attempt ${attempt} FAILED:`, r.status, errText);
+
+          // Try to parse INVALID_VALUE_FOR_COLUMN errors and strip bad field
+          if (attempt < 5 && (errText.includes("INVALID_VALUE_FOR_COLUMN") || errText.includes("UNKNOWN_FIELD_NAME"))) {
+            // Extract the field name from error message: Field "FieldName" cannot accept...
+            const match = errText.match(/Field\s+\\?"([^"\\]+)\\?"/);
+            if (match && match[1]) {
+              const badField = match[1];
+              console.log(`[convert_to_tasks] Stripping bad field: ${badField} and retrying`);
+              strippedFields.add(badField);
+              const strippedBatch = batch.map(rec => {
+                const newFields = { ...rec.fields };
+                delete newFields[badField];
+                return { fields: newFields };
+              });
+              return tryBatch(strippedBatch, attempt + 1);
+            }
+          }
+          return { ok: false, error: `${r.status} — ${errText.slice(0, 250)}` };
+        };
+
+        for (let i = 0; i < newTasks.length; i += 10) {
+          const batch = newTasks.slice(i, i + 10);
+          const result = await tryBatch(batch);
+          if (result.ok) {
+            created += result.count;
           } else {
-            const err = await r.text();
-            console.error(`[convert_to_tasks] Batch ${i} FAILED:`, r.status, err);
-            createErrors.push(`Batch ${i}: ${r.status} — ${err.slice(0, 250)}`);
+            createErrors.push(`Batch ${i}: ${result.error}`);
           }
         }
 
@@ -906,6 +934,7 @@ export async function POST(request) {
           created,
           skipped,
           total: targetLeads.length,
+          strippedFields: strippedFields.size > 0 ? [...strippedFields] : undefined,
           errors: createErrors.length > 0 ? createErrors.slice(0, 3) : undefined,
         });
       }
