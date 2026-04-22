@@ -2000,6 +2000,7 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
   const [scoreCfgDraft, setScoreCfgDraft] = useState({ weights: { time: 50, engaged: 30, views: 20 }, tiers: { warmMax: 20, interestedMax: 50 } });
   const [scoreCfgEditing, setScoreCfgEditing] = useState(false);
   const [perLeadBusy, setPerLeadBusy] = useState(null); // tracks which lead's action is in-flight
+  const [connectionModal, setConnectionModal] = useState(null); // { lead, note, charCount, loading, sending, error }
 
   const ga = async (action, data = {}) => {
     const res = await fetch("/api/ga", {
@@ -2228,34 +2229,84 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
     setBusy(false);
   };
 
-  const sendConnectionForLead = async (lead) => {
-    if (!confirm(`Send a LinkedIn connection request to ${lead.name}?\n\nThis will use AI to generate a personalized connection note referencing their website engagement, then send via the LinkedIn account assigned to this campaign.`)) return;
-    setPerLeadBusy(lead.id);
-    setMsg("⏳ Generating AI message and sending connection request...");
+  const openConnectionPreview = async (lead) => {
+    if (!lead.linkedinUrl) { setMsg("❌ Lead has no LinkedIn URL"); return; }
+    setConnectionModal({ lead, note: "", charCount: 0, loading: true, sending: false, error: "" });
     try {
       const res = await fetch("/api/outreach", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          action: "quick_send_connection",
+          action: "preview_connection_note",
           baseId,
           campaignId: campaign?.airtableId,
           leadId: lead.id,
-          ruleConfig: { campaignName: campaign?.name || "" },
+        }),
+      });
+      const r = await res.json();
+      if (r.ok) {
+        setConnectionModal({ lead, note: r.note || "", charCount: (r.note || "").length, loading: false, sending: false, error: "", signal: r.lead?.signal || "" });
+      } else {
+        setConnectionModal({ lead, note: "", charCount: 0, loading: false, sending: false, error: r.error || "Couldn't generate note" });
+      }
+    } catch (e) {
+      setConnectionModal({ lead, note: "", charCount: 0, loading: false, sending: false, error: e.message });
+    }
+  };
+
+  const regenerateConnectionNote = async () => {
+    if (!connectionModal?.lead) return;
+    setConnectionModal(m => ({ ...m, loading: true, error: "" }));
+    try {
+      const res = await fetch("/api/outreach", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "preview_connection_note",
+          baseId,
+          campaignId: campaign?.airtableId,
+          leadId: connectionModal.lead.id,
+        }),
+      });
+      const r = await res.json();
+      if (r.ok) {
+        setConnectionModal(m => ({ ...m, note: r.note || "", charCount: (r.note || "").length, loading: false, error: "" }));
+      } else {
+        setConnectionModal(m => ({ ...m, loading: false, error: r.error || "Regenerate failed" }));
+      }
+    } catch (e) {
+      setConnectionModal(m => ({ ...m, loading: false, error: e.message }));
+    }
+  };
+
+  const sendConnectionNow = async () => {
+    if (!connectionModal?.lead || !connectionModal.note.trim()) return;
+    setConnectionModal(m => ({ ...m, sending: true, error: "" }));
+    try {
+      const res = await fetch("/api/outreach", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "send_connection_with_note",
+          baseId,
+          campaignId: campaign?.airtableId,
+          leadId: connectionModal.lead.id,
+          note: connectionModal.note,
+          signal: connectionModal.signal || "",
+          campaignName: campaign?.name || "",
         }),
       });
       const r = await res.json();
       if (r.ok && r.sent > 0) {
-        setMsg(`✅ Connection request sent to ${lead.name}!`);
+        setMsg(`✅ Connection request sent to ${connectionModal.lead.name}!`);
+        setConnectionModal(null);
         await loadEngaged();
-      } else if (r.error) {
-        setMsg("❌ " + r.error);
       } else {
-        setMsg(`⚠️ Request completed but ${r.failed || 0} failed. ${r.result?.error || ""}`);
-        await loadEngaged();
+        setConnectionModal(m => ({ ...m, sending: false, error: r.error || "Send failed" }));
       }
-    } catch (e) { setMsg("❌ " + e.message); }
-    setPerLeadBusy(null);
+    } catch (e) {
+      setConnectionModal(m => ({ ...m, sending: false, error: e.message }));
+    }
   };
+
+  const sendConnectionForLead = (lead) => openConnectionPreview(lead);
 
   const sendEmailForLead = (lead) => {
     // Navigate to Email Campaign tab with this lead pre-selected
@@ -2546,6 +2597,69 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
                 💡 Saving will recalculate scores for all leads that have GA data using the new formula. No GA API calls needed — just math on stored data. Takes a few seconds.
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* CONNECTION PREVIEW MODAL */}
+      {connectionModal && (
+        <div onClick={e=>{if(e.target===e.currentTarget)setConnectionModal(null);}} style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.75)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+          <div style={{background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:12,padding:24,width:"100%",maxWidth:560,maxHeight:"90vh",overflow:"auto"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:14}}>
+              <div>
+                <div style={{fontSize:15,fontWeight:600,color:"var(--t1)"}}>🔗 Send Connection Request</div>
+                <div style={{fontSize:11,color:"var(--t3)",marginTop:4}}>To <strong style={{color:"var(--t1)"}}>{connectionModal.lead.name}</strong>{connectionModal.lead.title ? ` · ${connectionModal.lead.title}` : ""}{connectionModal.lead.company ? ` @ ${connectionModal.lead.company}` : ""}</div>
+              </div>
+              <button onClick={()=>setConnectionModal(null)} style={{background:"transparent",border:"none",color:"var(--t3)",cursor:"pointer",fontSize:20,padding:0,lineHeight:1}}>×</button>
+            </div>
+
+            {/* Engagement context */}
+            {connectionModal.signal && (
+              <div style={{padding:10,background:"var(--hover)",borderRadius:6,fontSize:10,color:"var(--t2)",marginBottom:14,lineHeight:1.5}}>
+                <div style={{fontSize:9,color:"var(--t3)",fontWeight:600,marginBottom:3}}>ENGAGEMENT CONTEXT</div>
+                {connectionModal.signal}
+              </div>
+            )}
+
+            {/* Note editor */}
+            <div className="ig">
+              <div className="il" style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span>Connection Note</span>
+                <span style={{fontWeight:400,textTransform:"none",fontSize:10,color:connectionModal.charCount > 300 ? "var(--red)" : "var(--t3)"}}>{connectionModal.charCount} / 300 chars</span>
+              </div>
+              {connectionModal.loading ? (
+                <div style={{padding:"24px 16px",background:"var(--hover)",borderRadius:6,textAlign:"center",color:"var(--t3)",fontSize:11}}>⏳ Generating personalized note...</div>
+              ) : (
+                <textarea
+                  className="inp"
+                  value={connectionModal.note}
+                  onChange={e=>{
+                    const newNote = e.target.value;
+                    setConnectionModal(m=>({...m,note:newNote,charCount:newNote.length}));
+                  }}
+                  style={{minHeight:120,fontSize:12,lineHeight:1.5}}
+                  placeholder="Enter your connection note..."
+                />
+              )}
+            </div>
+
+            <div style={{fontSize:10,color:"var(--t3)",marginBottom:14,fontStyle:"italic"}}>
+              💡 LinkedIn limits connection notes to 300 characters. Keep it personal and short — referencing their engagement usually helps.
+            </div>
+
+            {/* Error */}
+            {connectionModal.error && (
+              <div style={{padding:10,background:"var(--red-d)",color:"var(--red)",borderRadius:6,fontSize:11,marginBottom:14,whiteSpace:"pre-wrap"}}>❌ {connectionModal.error}</div>
+            )}
+
+            {/* Actions */}
+            <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+              <button className="btn btn-s" onClick={()=>setConnectionModal(null)} disabled={connectionModal.sending}>Cancel</button>
+              <button className="btn btn-s" onClick={regenerateConnectionNote} disabled={connectionModal.loading || connectionModal.sending}>✨ Regenerate</button>
+              <button className="btn btn-p btn-s" onClick={sendConnectionNow} disabled={connectionModal.loading || connectionModal.sending || !connectionModal.note.trim() || connectionModal.charCount > 300}>
+                {connectionModal.sending ? "⏳ Sending..." : "🚀 Send Connection Request"}
+              </button>
+            </div>
           </div>
         </div>
       )}

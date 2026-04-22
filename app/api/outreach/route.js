@@ -1054,6 +1054,124 @@ export async function POST(request) {
         return NextResponse.json(result);
       }
 
+      case "preview_connection_note": {
+        // Generate AI-personalized connection note for preview (doesn't send)
+        if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
+        if (!body.leadId) return NextResponse.json({ error: "leadId required" }, { status: 400 });
+        try {
+          const leadRes = await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Leads")}/${body.leadId}`, { headers: atHdr });
+          if (!leadRes.ok) return NextResponse.json({ error: `Lead not found (${leadRes.status})` }, { status: 404 });
+          const leadRecord = await leadRes.json();
+          const f = leadRecord.fields || {};
+
+          // Build a rich signal string if GA context is available
+          let signal = body.signal || "";
+          if (!signal && (f["GA Engagement Score"] || 0) > 0) {
+            const fmtT = (s) => { const n = Math.round(Number(s) || 0); if (n < 60) return n + "s"; return Math.floor(n/60) + "m"; };
+            signal = `Visited our website ${f["GA Last Visit"] ? "on " + f["GA Last Visit"] : "recently"}: ${f["GA Sessions"] || 0} session${(f["GA Sessions"]||0)!==1?"s":""}, ${f["GA Views"] || 0} pageview${(f["GA Views"]||0)!==1?"s":""}, ${fmtT(f["GA Engagement Time"])} engagement.`;
+          }
+
+          // Default template if ruleConfig doesn't provide one
+          const template = body.template || `Hi {first_name}, noticed you've been exploring our site — figured it's worth connecting. Happy to share what we've been working on if useful.`;
+
+          const note = await aiPersonalizeMessage(template, leadRecord, signal, f.Company || "");
+
+          return NextResponse.json({
+            ok: true,
+            note,
+            charCount: note.length,
+            maxChars: 300, // LinkedIn's typical limit
+            lead: {
+              name: f.Name || "",
+              firstName: (f.Name || "").split(" ")[0] || "",
+              title: f.Title || "",
+              company: f.Company || "",
+              linkedinUrl: f["LinkedIn URL"] || "",
+              signal,
+            },
+          });
+        } catch (e) {
+          return NextResponse.json({ error: e.message }, { status: 500 });
+        }
+      }
+
+      case "send_connection_with_note": {
+        // Send a connection request with the exact note provided (from preview modal)
+        if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
+        if (!body.leadId) return NextResponse.json({ error: "leadId required" }, { status: 400 });
+        if (!body.note || !body.note.trim()) return NextResponse.json({ error: "note required" }, { status: 400 });
+        if (!accountId) return NextResponse.json({ error: "No LinkedIn account assigned to this campaign. Go to LinkedIn Automation → Assign account." }, { status: 400 });
+
+        try {
+          // Fetch lead
+          const leadRes = await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Leads")}/${body.leadId}`, { headers: atHdr });
+          if (!leadRes.ok) return NextResponse.json({ error: `Lead not found (${leadRes.status})` }, { status: 404 });
+          const leadRecord = await leadRes.json();
+          const f = leadRecord.fields || {};
+          const linkedinUrl = f["LinkedIn URL"] || "";
+          if (!linkedinUrl) return NextResponse.json({ error: "Lead has no LinkedIn URL" }, { status: 400 });
+
+          // Check for existing outreach record for this lead
+          const queue = await atList(baseId, "Outreach");
+          const existing = queue.find(q => (q.fields?.["LinkedIn URL"] || "").toLowerCase().trim() === linkedinUrl.toLowerCase().trim());
+          if (existing && !["error"].includes(existing.fields?.Status)) {
+            return NextResponse.json({ error: `Outreach already exists for this lead (status: ${existing.fields?.Status || "unknown"}). To resend, first clear or retry the existing record.` }, { status: 400 });
+          }
+
+          // Resolve LinkedIn profile to get provider_id via Unipile
+          const names = deriveNames(f);
+          const profileRes = await getProfile(accountId, linkedinUrl);
+          if (!profileRes.ok) {
+            return NextResponse.json({ error: `Couldn't resolve LinkedIn profile. Unipile said: ${profileRes.status} ${JSON.stringify(profileRes.data).slice(0, 200)}` }, { status: 400 });
+          }
+          const providerId = profileRes.data?.provider_id || profileRes.data?.public_identifier || "";
+          if (!providerId) {
+            return NextResponse.json({ error: "Couldn't extract provider_id from LinkedIn profile" }, { status: 400 });
+          }
+
+          // Send invitation
+          const inviteRes = await sendInvitation(accountId, providerId, body.note.slice(0, 300));
+          if (!inviteRes.ok) {
+            return NextResponse.json({ error: `LinkedIn rejected the connection request: ${inviteRes.status} ${JSON.stringify(inviteRes.data).slice(0, 300)}` }, { status: 400 });
+          }
+
+          // Record in Outreach table
+          const nowISO = new Date().toISOString();
+          const outreachFields = {
+            "Lead Name": f.Name || "",
+            "LinkedIn URL": linkedinUrl,
+            Campaign: body.campaignName || "",
+            Mode: "quick_send_ga",
+            Status: "connection_sent",
+            Company: f.Company || "",
+            Title: f.Title || "",
+            Email: f.Email || "",
+            Signal: body.signal || "",
+            "DM Step": 0,
+            "Created At": nowISO,
+            "Connection Sent At": nowISO,
+            Notes: "Sent via GA engaged leads quick-send. Note: " + body.note.slice(0, 200),
+          };
+          if (existing) {
+            // Update existing (was in error state)
+            await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Outreach")}/${existing.id}`, {
+              method: "PATCH", headers: atHdr,
+              body: JSON.stringify({ fields: outreachFields }),
+            });
+          } else {
+            await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Outreach")}`, {
+              method: "POST", headers: atHdr,
+              body: JSON.stringify({ records: [{ fields: outreachFields }] }),
+            });
+          }
+
+          return NextResponse.json({ ok: true, sent: 1, leadName: f.Name || "" });
+        } catch (e) {
+          console.error("[outreach] send_connection_with_note error:", e);
+          return NextResponse.json({ error: e.message }, { status: 500 });
+        }
+      }
+
       case "quick_send_connection": {
         // One-click: enqueue this specific lead + send connection request immediately
         // Used from the GA Engaged Leads UI
