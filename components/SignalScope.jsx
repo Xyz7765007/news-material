@@ -2051,7 +2051,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   </div>)}
 
   {/* ════ LINKEDIN POSTS SCANNER ════ */}
-  {tab==="linkedin_posts"&&!loading&&(<LinkedInPostsTab baseId={bid} campaign={camp} leads={leads}/>)}
+  {tab==="linkedin_posts"&&!loading&&(<LinkedInPostsTab baseId={bid} campaign={camp} leads={leads} onCampaignProvisioned={(newCamp)=>{setCamp(newCamp);setCampaigns(p=>p.map(c=>c.id===newCamp.id?newCamp:c));}}/>)}
 
   {/* ════ LINKEDIN AUTOMATION ════ */}
   {tab==="outreach"&&!loading&&(<div>
@@ -3516,7 +3516,7 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
 // ═══════════════════════════════════════════════════════════════
 // LINKEDIN POSTS TAB — Fetch + Score + Create tasks from lead posts
 // ═══════════════════════════════════════════════════════════════
-function LinkedInPostsTab({ baseId, campaign, leads }) {
+function LinkedInPostsTab({ baseId, campaign, leads, onCampaignProvisioned }) {
   const [selectedLeadIds, setSelectedLeadIds] = useState(new Set());
   const [selectedCompanies, setSelectedCompanies] = useState(new Set());
   const [selectedCampaignTags, setSelectedCampaignTags] = useState(new Set());
@@ -3668,7 +3668,38 @@ function LinkedInPostsTab({ baseId, campaign, leads }) {
 
   const startScan = async (resume = false) => {
     setErr("");
-    if (!campaign?.airtableId) { setErr("Campaign not configured — can't persist progress"); return; }
+    if (!campaign) { setErr("No campaign selected"); return; }
+
+    // Auto-provision campaign record in Airtable if it's a built-in default with no airtableId.
+    // Scan progress persistence needs a Campaigns row to write into.
+    let activeCampaign = campaign;
+    if (!activeCampaign.airtableId) {
+      setErr(""); // Clear previous err
+      try {
+        const res = await fetch("/api/airtable", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "create_campaign", baseId,
+            fields: {
+              Name: activeCampaign.name,
+              "Base ID": baseId,
+              Features: (activeCampaign.features || []).join(","),
+              Description: activeCampaign.desc || "",
+              Emoji: activeCampaign.emoji || "📊",
+              Tables: activeCampaign.tables || "",
+            },
+          }),
+        });
+        const d = await res.json();
+        const newId = d.records?.[0]?.id;
+        if (!newId) { setErr("Couldn't provision campaign in Airtable: " + (d.error || "no record returned")); return; }
+        activeCampaign = { ...activeCampaign, airtableId: newId };
+        onCampaignProvisioned?.(activeCampaign);
+      } catch (e) {
+        setErr("Couldn't provision campaign in Airtable: " + e.message);
+        return;
+      }
+    }
 
     // Resolve leadIds based on selection mode
     let leadIds = null;
@@ -3689,14 +3720,13 @@ function LinkedInPostsTab({ baseId, campaign, leads }) {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "scan", baseId,
-          campaignAirtableId: campaign.airtableId,
+          campaignAirtableId: activeCampaign.airtableId,
           leadIds,
           scoreThreshold,
           daysBack,
           taskRuleName,
           systemPromptOverride: systemPromptOverride.trim() || null,
           resume,
-          // Don't auto-cleanup on resume (we want the already-created tasks preserved)
           autoCleanupDays: !resume && autoCleanup ? autoCleanupDays : null,
           autoCleanupExcludePushed: autoCleanupExcludePushed,
         }),
