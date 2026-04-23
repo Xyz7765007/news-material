@@ -261,9 +261,24 @@ function buildTaskBody(task) {
   if (task.Score) parts.push(`Score: ${task.Score}/100`);
   if (task.Signal) parts.push(`Details: ${task.Signal}`);
   if (task.URL) parts.push(`Source: ${task.URL}`);
-  if (task.Phone) parts.push(`Phone: ${task.Phone}`);
+
+  // ─── Lead contact block (so SDR can act without leaving the task) ───
   if (task["Lead Name"]) parts.push(`Lead: ${task["Lead Name"]}`);
   if (task["Lead Title"]) parts.push(`Title: ${task["Lead Title"]}`);
+  if (task.Phone) parts.push(`Phone: ${task.Phone}`);
+  if (task.Email) parts.push(`Email: ${task.Email}`);
+  // LinkedIn URL — accept multiple casings since this field comes from various sources
+  let liUrl = task.LinkedinUrl || task.linkedinUrl || task["LinkedIn URL"] || task["Linkedin URL"] || "";
+  if (liUrl) {
+    liUrl = String(liUrl).trim();
+    // Normalize: ensure clickable URL in HubSpot (auto-linker needs https://)
+    if (liUrl && !/^https?:\/\//i.test(liUrl)) {
+      // Strip any leading slashes/whitespace, then prefix https://
+      liUrl = "https://" + liUrl.replace(/^\/+/, "");
+    }
+    parts.push(`LinkedIn: ${liUrl}`);
+  }
+
   if (task.Date) parts.push(`Date: ${task.Date}`);
   parts.push(`\nCreated by SignalScope`);
   return parts.join("\n");

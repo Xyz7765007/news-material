@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, Fragment } from "react";
 
 // ─── Airtable helper — passes baseId with every request ─────
 async function at(action, table, data = {}, baseId) {
@@ -563,7 +563,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const pushToHubSpot = async (tasksToPush, config) => {
     setHsLoading(true); setHsMsg("⏳ Looking up contact info for association...");
     try {
-      // Build a quick lookup map from leads: Name → {email, linkedin}
+      // Build a quick lookup map from leads: Name → {email, linkedin, title, ...}
       const leadLookup = {};
       (leads || []).forEach(l => {
         const f = l.fields || {};
@@ -571,6 +571,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         if (name) leadLookup[name] = {
           email: f.Email || "",
           linkedinUrl: f["LinkedIn URL"] || "",
+          title: f.Title || "",
           firstName: (f.Name || "").split(" ")[0] || "",
           lastName: (f.Name || "").split(" ").slice(1).join(" ") || "",
         };
@@ -590,10 +591,11 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
           URL: f.URL,
           Date: f.Date,
           "Lead Name": f["Lead Name"] || f["Scan Target"] || "",
+          "Lead Title": f["Lead Title"] || leadInfo.title || "",
           "Scan Target": f["Scan Target"] || "",
           Phone: f.Phone || "",
-          Email: leadInfo.email || "",
-          LinkedinUrl: leadInfo.linkedinUrl || "",
+          Email: f.Email || leadInfo.email || "",
+          LinkedinUrl: f["LinkedIn URL"] || leadInfo.linkedinUrl || "",
           FirstName: leadInfo.firstName || "",
           LastName: leadInfo.lastName || "",
         };
@@ -603,9 +605,11 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       const withHubspotId = mapped.filter(m => m.hubspotTaskId).length;
       const willCreate = mapped.length - withHubspotId;
       const withEmail = mapped.filter(m => m.Email).length;
-      setHsMsg(`⏳ Pushing ${mapped.length} tasks: ${willCreate} new + ${withHubspotId} updates (${withEmail} will be contact-linked)...`);
+      const withLinkedIn = mapped.filter(m => m.LinkedinUrl).length;
+      const withPhone = mapped.filter(m => m.Phone).length;
+      setHsMsg(`⏳ Pushing ${mapped.length} tasks: ${willCreate} new + ${withHubspotId} updates · 📧 ${withEmail} email · 🔗 ${withLinkedIn} LinkedIn · 📞 ${withPhone} phone...`);
 
-      console.log("[pushToHubSpot] sending", mapped.length, "tasks,", willCreate, "new /", withHubspotId, "updates,", withEmail, "emails");
+      console.log("[pushToHubSpot] sending", mapped.length, "tasks |", willCreate, "new /", withHubspotId, "updates |", withEmail, "emails /", withLinkedIn, "LinkedIn /", withPhone, "phone");
       const d = await hsAPI("push_tasks", { tasks: mapped, config, baseId: bid });
       console.log("[pushToHubSpot] response:", d);
       let toast = "";
@@ -1313,9 +1317,10 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       const month = todayMs - 30 * 86400000;
 
       // Tasks
-      const tasksToday = tasks.filter(t => { const d = (t.fields?.Date || t.fields?.Created || ""); return d && new Date(d).getTime() >= todayMs; });
-      const tasksWeek = tasks.filter(t => { const d = (t.fields?.Date || t.fields?.Created || ""); return d && new Date(d).getTime() >= week; });
-      const tasksMonth = tasks.filter(t => { const d = (t.fields?.Date || t.fields?.Created || ""); return d && new Date(d).getTime() >= month; });
+      const parseDate = (s) => { if (!s) return NaN; const t = new Date(s).getTime(); return isNaN(t) ? NaN : t; };
+      const tasksToday = tasks.filter(t => { const d = parseDate(t.fields?.Date || t.fields?.Created); return !isNaN(d) && d >= todayMs; });
+      const tasksWeek = tasks.filter(t => { const d = parseDate(t.fields?.Date || t.fields?.Created); return !isNaN(d) && d >= week; });
+      const tasksMonth = tasks.filter(t => { const d = parseDate(t.fields?.Date || t.fields?.Created); return !isNaN(d) && d >= month; });
       const tasksByType = tasks.reduce((acc, t) => { const k = t.fields?.["Task Type"] || "other"; acc[k] = (acc[k] || 0) + 1; return acc; }, {});
       const tasksHubspot = tasks.filter(t => t.fields?.["HubSpot Task ID"]);
       const tasksWithPhone = tasks.filter(t => t.fields?.Phone);
@@ -1332,7 +1337,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       const gaHot = gaLeads.filter(l => (l.fields?.["GA Engagement Score"] || 0) >= 51);
       const gaWarm = gaLeads.filter(l => { const s = l.fields?.["GA Engagement Score"] || 0; return s >= 21 && s <= 50; });
       const gaCool = gaLeads.filter(l => { const s = l.fields?.["GA Engagement Score"] || 0; return s >= 1 && s <= 20; });
-      const gaThisWeek = leads.filter(l => { const lv = l.fields?.["GA Last Visit"]; return lv && new Date(lv).getTime() >= week; });
+      const gaThisWeek = leads.filter(l => { const d = parseDate(l.fields?.["GA Last Visit"]); return !isNaN(d) && d >= week; });
       const gaTotalSessions = gaLeads.reduce((s, l) => s + (l.fields?.["GA Sessions"] || 0), 0);
       const topGaLeads = [...gaLeads].sort((a, b) => (b.fields?.["GA Engagement Score"] || 0) - (a.fields?.["GA Engagement Score"] || 0)).slice(0, 5);
 
@@ -1475,7 +1480,6 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
             if (repliedItems.length === 0) return null;
             const byIntent = repliedItems.reduce((acc, q) => { const i = q.fields?.["Reply Intent"] || "unclassified"; acc[i] = (acc[i] || 0) + 1; return acc; }, {});
             const interested = repliedItems.filter(q => q.fields?.["Reply Intent"] === "interested");
-            const objections = repliedItems.filter(q => q.fields?.["Reply Intent"] === "objection");
             const intentMeta = {
               interested: { emoji: "🔥", label: "Interested", color: "var(--grn)" },
               objection: { emoji: "⚖️", label: "Objection", color: "var(--amb)" },
@@ -1548,8 +1552,8 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
           <SectionHeader title="📋 Tasks by Source" sub="Where your tasks are coming from" />
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))",gap:10}}>
             {Object.entries(tasksByType).sort((a,b)=>b[1]-a[1]).map(([type, count]) => {
-              const emojiMap = { news: "📰", job_post: "💼", top_x: "🎯", linkedin_engagement: "🔗", website_engagement: "📈", post_demo: "🤖", other: "📋" };
-              const labelMap = { news: "News signals", job_post: "Job posts", top_x: "Top X scoring", linkedin_engagement: "LinkedIn", website_engagement: "Website (GA)", post_demo: "Post-demo", other: "Other" };
+              const emojiMap = { news: "📰", job_post: "💼", top_x: "🎯", linkedin_engagement: "🔗", linkedin_outreach: "🔗", engagement: "📈", website_engagement: "📈", post_demo: "🤖", other: "📋" };
+              const labelMap = { news: "News signals", job_post: "Job posts", top_x: "Top X scoring", linkedin_engagement: "LinkedIn", linkedin_outreach: "LinkedIn outreach", engagement: "Website (GA)", website_engagement: "Website (GA)", post_demo: "Post-demo", other: "Other" };
               const pct = tasks.length > 0 ? Math.round(count / tasks.length * 100) : 0;
               return (
                 <div key={type} onClick={()=>setTab("tasks")} style={{padding:"12px 14px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,cursor:"pointer"}}>
@@ -2240,8 +2244,8 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         const rowBg = isReplied
           ? (intent === "interested" ? "rgba(93,168,122,.08)" : intent === "not_interested" ? "rgba(239,68,68,.06)" : intent === "objection" ? "rgba(245,158,11,.06)" : "var(--grn-d)")
           : null;
-        return (<>
-          <tr key={q.id} style={rowBg ? {background: rowBg} : {}}>
+        return (<Fragment key={q.id}>
+          <tr style={rowBg ? {background: rowBg} : {}}>
             <td style={{color:"var(--t1)",fontWeight:500}}>{f["Lead Name"]}</td>
             <td>{f.Company}</td>
             <td style={{fontSize:10}}>{f.Campaign}</td>
@@ -2258,14 +2262,14 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
             <td style={{fontSize:10}}>{status==="replied"?"—":(f["Next Action Date"]||"—")}</td>
           </tr>
           {isReplied && (summary || action) && (
-            <tr key={q.id+"-detail"} style={{background:rowBg}}>
+            <tr style={{background:rowBg}}>
               <td colSpan={7} style={{padding:"4px 14px 10px 14px",fontSize:10,color:"var(--t2)",borderTop:"none"}}>
                 {summary && <div style={{marginBottom:3}}><strong style={{color:"var(--t3)"}}>Summary:</strong> {summary}</div>}
                 {action && <div><strong style={{color:"var(--t3)"}}>Next:</strong> <span style={{color:urgency==="high"?"var(--red)":"var(--t2)"}}>{action}</span> {confidence != null && <span style={{color:"var(--t3)",marginLeft:4}}>· {confidence}% confidence</span>}</div>}
               </td>
             </tr>
           )}
-        </>);
+        </Fragment>);
       })}</tbody></table></div>
     </div>)}
 
@@ -2967,7 +2971,7 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
 
   const openConnectionPreview = async (lead) => {
     if (!lead.linkedinUrl) { setMsg("❌ Lead has no LinkedIn URL"); return; }
-    setConnectionModal({ lead, note: "", charCount: 0, loading: true, sending: false, error: "" });
+    setConnectionModal({ lead, note: "", charCount: 0, loading: true, sending: false, error: "", method: null, methodError: null, signal: "", gaScore: 0, gaSessions: 0, gaViews: 0 });
     try {
       const res = await fetch("/api/outreach", {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -2980,7 +2984,20 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
       });
       const r = await res.json();
       if (r.ok) {
-        setConnectionModal({ lead, note: r.note || "", charCount: (r.note || "").length, loading: false, sending: false, error: "", signal: r.lead?.signal || "" });
+        setConnectionModal({
+          lead,
+          note: r.note || "",
+          charCount: (r.note || "").length,
+          loading: false,
+          sending: false,
+          error: "",
+          signal: r.lead?.signal || "",
+          method: r.method || null,
+          methodError: r.error || null,
+          gaScore: r.lead?.gaScore || 0,
+          gaSessions: r.lead?.gaSessions || 0,
+          gaViews: r.lead?.gaViews || 0,
+        });
       } else {
         setConnectionModal({ lead, note: "", charCount: 0, loading: false, sending: false, error: r.error || "Couldn't generate note" });
       }
@@ -3004,7 +3021,15 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
       });
       const r = await res.json();
       if (r.ok) {
-        setConnectionModal(m => ({ ...m, note: r.note || "", charCount: (r.note || "").length, loading: false, error: "" }));
+        setConnectionModal(m => ({
+          ...m,
+          note: r.note || "",
+          charCount: (r.note || "").length,
+          loading: false,
+          error: "",
+          method: r.method || null,
+          methodError: r.error || null,
+        }));
       } else {
         setConnectionModal(m => ({ ...m, loading: false, error: r.error || "Regenerate failed" }));
       }
@@ -3363,8 +3388,35 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
               <div style={{padding:10,background:"var(--hover)",borderRadius:6,fontSize:10,color:"var(--t2)",marginBottom:14,lineHeight:1.5}}>
                 <div style={{fontSize:9,color:"var(--t3)",fontWeight:600,marginBottom:3}}>ENGAGEMENT CONTEXT</div>
                 {connectionModal.signal}
+                {(connectionModal.gaSessions > 0 || connectionModal.gaViews > 0) && (
+                  <div style={{marginTop:6,fontSize:9,color:"var(--t3)",display:"flex",gap:10}}>
+                    {connectionModal.gaScore > 0 && <span>Score: <strong style={{color:connectionModal.gaScore>=51?"var(--red)":connectionModal.gaScore>=21?"var(--amb)":"var(--t2)"}}>{connectionModal.gaScore}/100</strong></span>}
+                    {connectionModal.gaSessions > 0 && <span>Sessions: <strong style={{color:"var(--t1)"}}>{connectionModal.gaSessions}</strong></span>}
+                    {connectionModal.gaViews > 0 && <span>Views: <strong style={{color:"var(--t1)"}}>{connectionModal.gaViews}</strong></span>}
+                  </div>
+                )}
               </div>
             )}
+
+            {/* Method indicator — visible diagnostic so you can see if AI ran or fell back */}
+            {connectionModal.method && !connectionModal.loading && (() => {
+              const m = connectionModal.method;
+              const meta = {
+                "ai_with_ga": { color: "var(--grn)", bg: "var(--grn-d)", label: "🤖 AI-personalized using GA data", desc: "Note generated from scratch using engagement metrics" },
+                "ai_no_ga": { color: "var(--blu)", bg: "rgba(96,165,250,.1)", label: "🤖 AI-personalized (no GA data)", desc: "Generic personalization — no website engagement data found for this lead" },
+                "deterministic_no_key": { color: "var(--red)", bg: "var(--red-d)", label: "⚠️ AI disabled — OPENAI_API_KEY missing", desc: "Set OPENAI_API_KEY in Vercel env to enable AI personalization" },
+                "deterministic_empty_ai": { color: "var(--amb)", bg: "rgba(245,158,11,.1)", label: "⚠️ AI returned empty — using template fallback", desc: "OpenAI API call succeeded but returned no content" },
+                "deterministic_validation_failed": { color: "var(--amb)", bg: "rgba(245,158,11,.1)", label: "⚠️ AI output had unresolved {fields} — using template", desc: "AI didn't fill all merge fields, fell back to deterministic merge" },
+                "deterministic_too_long": { color: "var(--amb)", bg: "rgba(245,158,11,.1)", label: "⚠️ AI output > 295 chars — using template", desc: "Generated note exceeded LinkedIn's 300-char cap, fell back" },
+                "deterministic_error": { color: "var(--red)", bg: "var(--red-d)", label: "❌ AI call failed — using template", desc: connectionModal.methodError || "OpenAI API call threw an exception" },
+              }[m] || { color: "var(--t3)", bg: "var(--hover)", label: `Method: ${m}`, desc: "" };
+              return (
+                <div style={{padding:"6px 10px",background:meta.bg,color:meta.color,borderRadius:4,fontSize:10,marginBottom:10,display:"flex",alignItems:"center",gap:8}}>
+                  <span style={{fontWeight:600}}>{meta.label}</span>
+                  {meta.desc && <span style={{opacity:.75,fontSize:9}}>· {meta.desc}</span>}
+                </div>
+              );
+            })()}
 
             {/* Note editor */}
             <div className="ig">

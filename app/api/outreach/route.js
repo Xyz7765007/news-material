@@ -313,11 +313,14 @@ async function aiSelectLeads(leads, prompt, count) {
   }
 }
 
-async function aiPersonalizeMessage(template, lead, signal, companyName) {
+async function aiPersonalizeMessageWithMeta(template, lead, signal, companyName) {
   // Always do deterministic merge first — this is our safety net
   const deterministic = fillMergeFields(template, lead, signal, companyName);
 
-  if (!OPENAI_KEY) return deterministic;
+  if (!OPENAI_KEY) {
+    console.warn("[MERGE] OPENAI_API_KEY not set — returning deterministic merge");
+    return { text: deterministic, method: "deterministic_no_key" };
+  }
 
   const f = lead.fields || lead;
   const names = deriveNames(f);
@@ -328,47 +331,52 @@ async function aiPersonalizeMessage(template, lead, signal, companyName) {
   const gaViews = Number(f["GA Views"] || 0);
   const gaLastVisit = f["GA Last Visit"] || "";
   const gaEngagementTime = Number(f["GA Engagement Time"] || 0);
-  const hasGAContext = gaScore > 0 || gaSessions > 0 || signal;
+  const hasGAContext = gaScore > 0 || gaSessions > 0;
+  const hasSignal = !!(signal && signal.trim());
 
   const openai = new OpenAI({ apiKey: OPENAI_KEY });
   try {
-    // Different prompting strategy depending on context richness
-    const systemPrompt = hasGAContext ? `You are personalizing a LinkedIn connection request.
+    let systemPrompt, userPrompt;
 
-IMPORTANT — when the lead has visited our website (engagement signal present):
-- The opener MUST reference their specific behavior (e.g., "saw you've been digging into [topic]", "noticed you spent time on our [page]")
-- DO NOT use the generic template opener if the engagement data tells a more specific story
-- Be specific, not vague: "5 sessions exploring our pricing page" beats "you've been looking around"
-- Sound human, not creepy — frame it as helpful follow-up, not surveillance
+    if (hasGAContext) {
+      // GA path — write a FRESH message from scratch using engagement data
+      // This produces genuinely personalized output (not template-with-name-filled-in)
+      systemPrompt = `You write LinkedIn connection request notes for B2B sales. The lead has ALREADY VISITED OUR WEBSITE — this is warm outreach.
 
-Rules:
-1. Treat the template as a STARTING POINT — adapt it to fit the engagement signal naturally
-2. Replace ALL merge fields like {first_name}, {company}, {title}
-3. NO curly braces in output
-4. If a field is empty, rewrite naturally (don't say "at " or "in your role as ")
-5. Keep under 280 characters (LinkedIn limit is 300)
-6. Return ONLY the message text — no preamble, quotes, or markdown` : `Personalize this LinkedIn message for the specific lead.
+YOUR JOB: Write a fresh, personal opening that references their actual website behavior. Don't use a template — actually write something specific to this lead's engagement pattern.
 
-Rules:
-1. Keep the same structure and intent as the template
-2. Replace ALL merge fields like {first_name}, {company}, {title}
-3. NO curly braces in output
-4. If a field is empty, rewrite naturally
-5. Make it natural and conversational
-6. Return ONLY the message text — no preamble, quotes, or markdown`;
+RULES:
+1. UNDER 280 characters total (LinkedIn cap is 300; leave headroom)
+2. Open with their behavior — not a generic "noticed you've been exploring our site"
+3. Be specific: if they had 6 sessions, mention that. If they spent 8 minutes, mention that. Use the actual numbers when meaningful.
+4. Sound like a human SDR who genuinely noticed them — not a creepy stalker, not a marketing bot
+5. Lowercase, casual tone is fine. Use first name only.
+6. NO subject line — this is a connection note, not an email.
+7. End with a soft, low-friction ask (e.g., "happy to share what we've been working on if useful" or "open to chatting if it's relevant")
+8. Vary sentence structure — every lead should get a meaningfully different opener even if the engagement data is similar
+9. NEVER use placeholder syntax like {first_name} — write actual values
+10. Return ONLY the message text — no preamble, quotes, or markdown
 
-    // Build a richer context block
-    const ctxLines = [
-      `Name: ${names.full || "Unknown"}`,
-      `First name: ${names.first || "(unknown)"}`,
-      `Title: ${f.Title || "(unknown)"}`,
-      `Company: ${f.Company || companyName || "(unknown)"}`,
-    ];
-    if (signal) ctxLines.push(`Signal/context: ${signal}`);
-    if (hasGAContext && gaScore > 0) {
-      const tier = gaScore >= 51 ? "🔥 Hot" : gaScore >= 21 ? "⚡ Interested" : "👀 Warm";
-      ctxLines.push(`\n— Website Engagement Data —`);
-      ctxLines.push(`Engagement tier: ${tier} (score ${gaScore}/100)`);
+GOOD opener examples (do NOT copy these — generate your own based on the lead's actual data):
+- "hey [name] — saw your team at [company] dropped in 6 times last week, mostly digging through our pricing pages."
+- "hi [name], noticed you've been spending real time on our site (8m+ across 4 sessions). usually means there's something specific you're trying to solve."
+- "[name] — your visits to our site this week caught my eye. rather than guess at what you're after, easier to ask: what brought you in?"
+
+BAD opener examples (DO NOT do this):
+- "Hi [name], noticed you've been exploring our site — figured it's worth connecting." (too generic, ignores actual data)
+- "Hi {first_name}..." (placeholder leaked)
+- "Dear [Full Name], I hope this message finds you well." (formal/cold opener)`;
+
+      const ctxLines = [
+        `=== LEAD ===`,
+        `Name: ${names.full || "Unknown"}`,
+        `First name (use this in the message): ${names.first || "(unknown)"}`,
+        `Title: ${f.Title || "(unknown)"}`,
+        `Company: ${f.Company || companyName || "(unknown)"}`,
+        ``,
+        `=== WEBSITE ENGAGEMENT (use this to personalize the opener) ===`,
+        `Engagement tier: ${gaScore >= 51 ? "🔥 Hot" : gaScore >= 21 ? "⚡ Interested" : "👀 Warm"} (score ${gaScore}/100)`,
+      ];
       if (gaSessions > 0) ctxLines.push(`Sessions: ${gaSessions}`);
       if (gaViews > 0) ctxLines.push(`Pageviews: ${gaViews}`);
       if (gaEngagementTime > 0) {
@@ -376,33 +384,79 @@ Rules:
         ctxLines.push(`Time on site: ${t}`);
       }
       if (gaLastVisit) ctxLines.push(`Last visit: ${gaLastVisit}`);
+      ctxLines.push(``);
+      ctxLines.push(`=== STYLE REFERENCE (optional — what we'd say if no engagement data) ===`);
+      ctxLines.push(template);
+      ctxLines.push(``);
+      ctxLines.push(`Now write a fresh connection note for this lead using their engagement data. Under 280 characters.`);
+
+      userPrompt = ctxLines.join("\n");
+    } else {
+      // No GA — just personalize the template with lead's basic info
+      systemPrompt = `Personalize this LinkedIn connection note for the specific lead.
+
+RULES:
+1. Keep the same structure and intent as the template
+2. Replace ALL merge fields like {first_name}, {company}, {title}
+3. NO curly braces in output
+4. If a field is empty, rewrite naturally (don't say "at " or "in your role as ")
+5. UNDER 280 characters total
+6. Make it natural and conversational
+7. Return ONLY the message text — no preamble, quotes, or markdown`;
+
+      userPrompt = `Template:\n${template}\n\nLead data:\nName: ${names.full || "Unknown"}\nFirst name: ${names.first || "(unknown)"}\nTitle: ${f.Title || "(unknown)"}\nCompany: ${f.Company || companyName || "(unknown)"}${hasSignal ? `\nSignal: ${signal}` : ""}`;
     }
+
+    console.log(`[MERGE] Calling AI for ${names.first || "(unknown)"} @ ${f.Company || "?"}. hasGAContext=${hasGAContext}, gaScore=${gaScore}, sessions=${gaSessions}, views=${gaViews}`);
 
     const c = await openai.chat.completions.create({
-      model: "gpt-5.4-mini", temperature: 0.6, max_tokens: 300,
+      model: "gpt-5.4-mini",
+      temperature: hasGAContext ? 0.85 : 0.5, // higher creativity when writing from scratch with engagement data
+      max_tokens: 300,
       messages: [
         { role: "system", content: systemPrompt },
-        { role: "user", content: `Template:\n${template}\n\nLead data:\n${ctxLines.join("\n")}` },
+        { role: "user", content: userPrompt },
       ],
     });
-    const aiMsg = c.choices[0]?.message?.content?.trim();
-    if (!aiMsg) return deterministic;
+
+    const aiMsg = c.choices?.[0]?.message?.content?.trim();
+    if (!aiMsg) {
+      console.warn(`[MERGE] AI returned empty content. Falling back. Raw response:`, JSON.stringify(c).slice(0, 300));
+      return { text: deterministic, method: "deterministic_empty_ai" };
+    }
+
+    // Strip any leaked quotes around the whole message
+    const cleaned = aiMsg.replace(/^["'`]+|["'`]+$/g, "").trim();
 
     // CRITICAL SAFETY CHECK: if AI left any merge fields unresolved, don't trust it
-    const v = validateMessage(aiMsg, "ai_output");
+    const v = validateMessage(cleaned, "ai_output");
     if (!v.ok) {
-      console.warn("[MERGE] AI returned message with unresolved fields, falling back:", v.error, "AI output:", aiMsg.slice(0, 100));
-      return deterministic;
+      console.warn("[MERGE] AI returned message with unresolved fields, falling back:", v.error, "AI output:", cleaned.slice(0, 100));
+      return { text: deterministic, method: "deterministic_validation_failed" };
     }
-    // Length safety: if AI exceeded the LinkedIn limit, fall back
-    if (aiMsg.length > 295) {
-      console.warn(`[MERGE] AI message too long (${aiMsg.length} chars), falling back to deterministic`);
-      return deterministic;
+
+    // Length safety
+    if (cleaned.length > 295) {
+      console.warn(`[MERGE] AI message too long (${cleaned.length} chars). Falling back to deterministic.`);
+      return { text: deterministic, method: "deterministic_too_long", aiAttempt: cleaned.slice(0, 100) };
     }
-    return aiMsg;
+
+    console.log(`[MERGE] ✅ AI message generated for ${names.first || "lead"} (${cleaned.length} chars, ${hasGAContext ? "with GA" : "no GA"})`);
+    return { text: cleaned, method: hasGAContext ? "ai_with_ga" : "ai_no_ga" };
   } catch (e) {
-    console.error("[MERGE] AI personalization failed:", e.message);
-    return deterministic;
+    console.error("[MERGE] AI personalization threw:", e.message, e.stack?.slice(0, 200));
+    return { text: deterministic, method: "deterministic_error", error: e.message };
+  }
+}
+
+// Backward-compat wrapper: returns just the string (most callers use this)
+async function aiPersonalizeMessage(template, lead, signal, companyName) {
+  try {
+    const result = await aiPersonalizeMessageWithMeta(template, lead, signal, companyName);
+    return result?.text || fillMergeFields(template, lead, signal, companyName);
+  } catch (e) {
+    console.error("[MERGE] aiPersonalizeMessage wrapper threw:", e.message);
+    return fillMergeFields(template, lead, signal, companyName);
   }
 }
 
@@ -506,7 +560,7 @@ Return JSON: {
       urgency: parsed.urgency,
       summary: String(parsed.summary || "").slice(0, 200),
       suggested_action: String(parsed.suggested_action || "").slice(0, 200),
-      confidence: Math.max(0, Math.min(100, Number(parsed.confidence) || 50)),
+      confidence: Math.round(Math.max(0, Math.min(100, Number(parsed.confidence) || 50))),
       key_quote: parsed.key_quote ? String(parsed.key_quote).slice(0, 150) : null,
       method: "ai",
     };
@@ -1238,13 +1292,15 @@ export async function POST(request) {
           // Default template if ruleConfig doesn't provide one
           const template = body.template || `Hi {first_name}, noticed you've been exploring our site — figured it's worth connecting. Happy to share what we've been working on if useful.`;
 
-          const note = await aiPersonalizeMessage(template, leadRecord, signal, f.Company || "");
+          const result = await aiPersonalizeMessageWithMeta(template, leadRecord, signal, f.Company || "");
 
           return NextResponse.json({
             ok: true,
-            note,
-            charCount: note.length,
-            maxChars: 300, // LinkedIn's typical limit
+            note: result.text,
+            charCount: result.text.length,
+            maxChars: 300,
+            method: result.method, // ai_with_ga | ai_no_ga | deterministic_* — visible in UI for debugging
+            error: result.error || null,
             lead: {
               name: f.Name || "",
               firstName: (f.Name || "").split(" ")[0] || "",
@@ -1252,6 +1308,10 @@ export async function POST(request) {
               company: f.Company || "",
               linkedinUrl: f["LinkedIn URL"] || "",
               signal,
+              gaScore: f["GA Engagement Score"] || 0,
+              gaSessions: f["GA Sessions"] || 0,
+              gaViews: f["GA Views"] || 0,
+              gaLastVisit: f["GA Last Visit"] || "",
             },
           });
         } catch (e) {
@@ -1487,42 +1547,63 @@ export async function POST(request) {
           }
 
           // Auto-create missing fields on first 422
+          // We do the fetch directly here (not via atUpdate helper) so we can read error text
           const tryUpdate = async (attempt = 0) => {
-            try {
-              await atUpdate(baseId, "Outreach", [{ id: item.id, fields: updateFields }]);
-              return true;
-            } catch (e) {
-              if (attempt < 3 && e.message && (e.message.includes("UNKNOWN_FIELD_NAME") || e.message.includes("INVALID_VALUE_FOR_COLUMN"))) {
-                const m = e.message.match(/[Uu]nknown field name:?\s+\\?"([^"\\]+)\\?"/) || e.message.match(/Field\s+\\?"([^"\\]+)\\?"/);
-                const badField = m ? m[1] : null;
-                if (badField) {
-                  console.log(`[check_replies] Auto-creating field "${badField}"`);
-                  try {
-                    const tablesRes = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables`, { headers: atHdr });
-                    if (tablesRes.ok) {
-                      const { tables } = await tablesRes.json();
-                      const t = tables.find(t => t.name === "Outreach");
-                      if (t) {
-                        const fieldType = badField === "Reply Confidence" ? "number" : "singleLineText";
-                        const opts = fieldType === "number" ? { precision: 0 } : undefined;
-                        const createBody = { name: badField, type: fieldType };
-                        if (opts) createBody.options = opts;
-                        await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables/${t.id}/fields`, {
-                          method: "POST", headers: atHdr, body: JSON.stringify(createBody),
-                        });
-                        await new Promise(r => setTimeout(r, 1500));
-                        return tryUpdate(attempt + 1);
-                      }
-                    }
-                  } catch (createErr) { console.error("[check_replies] Field create failed:", createErr.message); }
-                  // Field create failed — strip it and retry
-                  delete updateFields[badField];
-                  return tryUpdate(attempt + 1);
-                }
-              }
-              console.error("[check_replies] Airtable update failed:", e.message);
+            if (attempt > 6) {
+              console.error("[check_replies] Max retries exceeded");
               return false;
             }
+            const r = await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Outreach")}`, {
+              method: "PATCH", headers: atHdr,
+              body: JSON.stringify({ records: [{ id: item.id, fields: updateFields }] }),
+            });
+            if (r.ok) return true;
+            const errText = await r.text();
+            if (errText.includes("UNKNOWN_FIELD_NAME") || errText.includes("INVALID_VALUE_FOR_COLUMN")) {
+              const m = errText.match(/[Uu]nknown field name:?\s+\\?"([^"\\]+)\\?"/) || errText.match(/Field\s+\\?"([^"\\]+)\\?"/);
+              const badField = m ? m[1] : null;
+              if (badField) {
+                console.log(`[check_replies] Missing field "${badField}", attempting auto-create...`);
+                let fieldCreated = false;
+                try {
+                  const tablesRes = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables`, { headers: atHdr });
+                  if (tablesRes.ok) {
+                    const { tables } = await tablesRes.json();
+                    const t = tables.find(t => t.name === "Outreach");
+                    if (t) {
+                      const fieldType = badField === "Reply Confidence" ? "number" : "singleLineText";
+                      const createBody = { name: badField, type: fieldType };
+                      if (fieldType === "number") createBody.options = { precision: 0 };
+                      const cr = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables/${t.id}/fields`, {
+                        method: "POST", headers: atHdr, body: JSON.stringify(createBody),
+                      });
+                      if (cr.ok) {
+                        console.log(`[check_replies] Created field "${badField}". Waiting 1.5s for propagation...`);
+                        fieldCreated = true;
+                        await new Promise(r => setTimeout(r, 1500));
+                      } else {
+                        const cre = await cr.text();
+                        console.warn(`[check_replies] Field create returned ${cr.status}: ${cre.slice(0, 150)}`);
+                      }
+                    } else {
+                      console.warn(`[check_replies] Outreach table not found in base meta`);
+                    }
+                  } else {
+                    console.warn(`[check_replies] Couldn't fetch base tables: ${tablesRes.status}`);
+                  }
+                } catch (createErr) {
+                  console.error("[check_replies] Field create exception:", createErr.message);
+                }
+                if (!fieldCreated) {
+                  // Strip the bad field and retry without it (preserves the rest of the data)
+                  console.log(`[check_replies] Stripping field "${badField}" from update`);
+                  delete updateFields[badField];
+                }
+                return tryUpdate(attempt + 1);
+              }
+            }
+            console.error(`[check_replies] Airtable update failed (status ${r.status}):`, errText.slice(0, 200));
+            return false;
           };
           await tryUpdate();
 

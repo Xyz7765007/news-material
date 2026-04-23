@@ -857,12 +857,16 @@ export async function POST(request) {
               "Task Rule": "Website Engagement (GA)",
               Score: boostedScore,
               "Scan Target": name,
+              "Lead Name": name,
+              "Lead Title": title,
               Signal: signal,
               Source: "Google Analytics",
               "Task Type": "engagement",
               Date: todayStr,
               Created: nowISO,
               Phone: f.Phone || "",
+              Email: f.Email || "",
+              "LinkedIn URL": f["LinkedIn URL"] || "",
             },
           });
         }
@@ -915,6 +919,46 @@ export async function POST(request) {
                   fields: { ...rec.fields, Score: String(rec.fields.Score || 0) },
                 }));
                 return tryBatch(stringScoreBatch, attempt + 1);
+              }
+
+              // For useful contact fields (Email/LinkedIn URL/Lead Title/Lead Name/Phone/etc.):
+              // try AUTO-CREATING the field on the Tasks table first, before stripping.
+              // This preserves the data for the SDR's downstream HubSpot push.
+              const autoCreatable = new Set([
+                "Email", "LinkedIn URL", "Lead Title", "Lead Name", "Phone",
+                "Score", "Scan Target", "Source", "Task Type", "Date", "Created",
+                "Signal", "Task Rule", "Company", "URL",
+              ]);
+              if (autoCreatable.has(badField) && !strippedFields.has("_tried_create_" + badField)) {
+                strippedFields.add("_tried_create_" + badField); // don't loop
+                console.log(`[convert_to_tasks] Field "${badField}" missing — attempting to auto-create on Tasks table`);
+                try {
+                  const tablesRes = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables`, { headers: atHdr });
+                  if (tablesRes.ok) {
+                    const { tables } = await tablesRes.json();
+                    const tasksTable = tables.find(t => t.name === "Tasks");
+                    if (tasksTable) {
+                      const fieldType = badField === "Score" ? "number" : badField === "Created" || badField === "Date" ? "date" : "singleLineText";
+                      const createBody = { name: badField, type: fieldType };
+                      if (fieldType === "number") createBody.options = { precision: 0 };
+                      if (fieldType === "date") createBody.options = { dateFormat: { name: "iso" } };
+                      const cr = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables/${tasksTable.id}/fields`, {
+                        method: "POST", headers: atHdr, body: JSON.stringify(createBody),
+                      });
+                      if (cr.ok) {
+                        console.log(`[convert_to_tasks] Created field "${badField}" (${fieldType}). Waiting 1.5s for propagation...`);
+                        await new Promise(r => setTimeout(r, 1500));
+                        return tryBatch(batch, attempt + 1); // retry SAME batch with field now present
+                      } else {
+                        const cre = await cr.text();
+                        console.warn(`[convert_to_tasks] Auto-create field "${badField}" failed: ${cr.status} ${cre.slice(0, 150)}. Will strip instead.`);
+                      }
+                    }
+                  }
+                } catch (createErr) {
+                  console.error(`[convert_to_tasks] Field create exception:`, createErr.message);
+                }
+                // Field creation failed — fall through to strip
               }
 
               console.log(`[convert_to_tasks] Stripping bad field: ${badField} and retrying`);
