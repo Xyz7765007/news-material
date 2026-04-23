@@ -1015,20 +1015,52 @@ async function repairOrphanedTasks(apiKey, pairs, baseId) {
         id: p.airtableTaskId,
         fields: { "HubSpot Task ID": String(p.taskId), "HubSpot Last Synced": nowISO },
       }));
+
+      // Attempt update with auto-heal for missing fields (up to 3 attempts per batch)
+      const attemptUpdate = async (batch, attempt = 0) => {
+        const r = await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Tasks")}`, {
+          method: "PATCH", headers: atHdr,
+          body: JSON.stringify({ records: batch }),
+        });
+        if (r.ok) return true;
+        const errText = await r.text();
+        if (attempt < 3 && (errText.includes("INVALID_VALUE_FOR_COLUMN") || errText.includes("UNKNOWN_FIELD_NAME"))) {
+          const m1 = errText.match(/Field\s+\\?"([^"\\]+)\\?"/);
+          const m2 = errText.match(/[Uu]nknown field name:?\s+\\?"([^"\\]+)\\?"/);
+          const badField = (m1 && m1[1]) || (m2 && m2[1]);
+          if (badField) {
+            log(`Auto-creating missing Airtable field: ${badField}`);
+            try {
+              const tablesRes = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables`, { headers: atHdr });
+              if (tablesRes.ok) {
+                const { tables } = await tablesRes.json();
+                const tasksTable = tables.find(t => t.name === "Tasks");
+                if (tasksTable) {
+                  const createRes = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables/${tasksTable.id}/fields`, {
+                    method: "POST", headers: atHdr,
+                    body: JSON.stringify({ name: badField, type: "singleLineText" }),
+                  });
+                  if (createRes.ok) {
+                    log(`Field "${badField}" created. Waiting 1.5s for propagation before retry...`);
+                    await new Promise(r => setTimeout(r, 1500));
+                    return attemptUpdate(batch, attempt + 1);
+                  } else {
+                    const createErr = await createRes.text();
+                    logErr(`Field creation failed for "${badField}":`, createErr.slice(0, 200));
+                  }
+                }
+              }
+            } catch (e) { logErr("Field create exception:", e.message); }
+          }
+        }
+        logErr(`Airtable sync batch failed (attempt ${attempt}):`, errText.slice(0, 200));
+        return false;
+      };
+
       let synced = 0;
       for (let i = 0; i < updates.length; i += 10) {
         const batch = updates.slice(i, i + 10);
-        try {
-          const r = await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Tasks")}`, {
-            method: "PATCH", headers: atHdr,
-            body: JSON.stringify({ records: batch }),
-          });
-          if (r.ok) synced += batch.length;
-          else {
-            const err = await r.text();
-            logErr(`Airtable sync batch ${i / 10} failed:`, err.slice(0, 200));
-          }
-        } catch (e) { logErr("Airtable sync exception:", e.message); }
+        if (await attemptUpdate(batch)) synced += batch.length;
       }
       result.airtableSynced = synced;
       log(`Airtable sync done: ${synced}/${updates.length}`);
@@ -1036,6 +1068,280 @@ async function repairOrphanedTasks(apiKey, pairs, baseId) {
   }
 
   log(`REPAIR COMPLETE: ${result.repaired} repaired, ${result.failed} failed`);
+  return result;
+}
+
+// ─── BACKFILL: find HubSpot tasks and write their IDs back to matching Airtable tasks ───
+// Use case: fix cases where pushes succeeded in HubSpot but Airtable sync failed
+// (e.g., HubSpot Task ID field didn't exist at the time).
+// This does NOT create or modify any HubSpot associations.
+async function backfillHubspotIds(apiKey, baseId, opts = {}) {
+  const { dateFrom, dateTo, subjectContains } = opts;
+  const runId = Math.random().toString(36).slice(2, 10);
+  const log = (msg, ...args) => console.log(`[backfill:${runId}] ${msg}`, ...args);
+  const logErr = (msg, ...args) => console.error(`[backfill:${runId}] ${msg}`, ...args);
+
+  const result = {
+    runId,
+    totalHubspotTasks: 0,
+    alreadyTracked: 0,
+    newlyMatched: 0,
+    ambiguous: 0,
+    unmatched: 0,
+    airtableSynced: 0,
+    airtableSyncFailed: 0,
+    matches: [], // [{ hubspotTaskId, airtableTaskId, company, leadName, via }]
+    unmatched_details: [],
+  };
+
+  log(`Starting backfill. dateFrom=${dateFrom}, dateTo=${dateTo}`);
+
+  // Reuse findOrphanedTasks infrastructure — but we want ALL tasks, not just orphans
+  // Quick approach: duplicate the matcher logic here but skip association check entirely
+
+  // Load Airtable
+  let leads = [];
+  let airtableTasks = [];
+  try {
+    const fetchAllPages = async (table) => {
+      const out = [];
+      let offset;
+      do {
+        const url = `${AT_API}/${baseId}/${encodeURIComponent(table)}?pageSize=100${offset ? `&offset=${offset}` : ""}`;
+        const r = await fetch(url, { headers: atHdr });
+        if (!r.ok) throw new Error(`${table}: ${r.status}`);
+        const data = await r.json();
+        out.push(...(data.records || []));
+        offset = data.offset;
+      } while (offset);
+      return out;
+    };
+    [leads, airtableTasks] = await Promise.all([fetchAllPages("Leads"), fetchAllPages("Tasks")]);
+  } catch (e) {
+    return { error: `Airtable fetch failed: ${e.message}`, runId };
+  }
+  log(`Loaded ${leads.length} leads, ${airtableTasks.length} tasks`);
+
+  // Build lead name → email + company lookup
+  const leadLookup = {};
+  leads.forEach(l => {
+    const f = l.fields || {};
+    const name = (f.Name || "").trim().toLowerCase();
+    if (!name) return;
+    const email = (f.Email || "").toLowerCase().trim();
+    if (leadLookup[name] && leadLookup[name].email !== email) {
+      leadLookup[name].ambiguous = true;
+    } else if (!leadLookup[name]) {
+      leadLookup[name] = { email, company: (f.Company || "").trim() };
+    }
+  });
+
+  // Build (company|leadName) → airtable task info
+  const airtableTaskMap = {};
+  airtableTasks.forEach(t => {
+    const f = t.fields || {};
+    const company = (f.Company || "").trim();
+    const scanTarget = (f["Scan Target"] || f["Lead Name"] || "").trim();
+    const scanTargetLower = scanTarget.toLowerCase();
+    if (!scanTargetLower) return;
+    const leadInfo = leadLookup[scanTargetLower];
+    if (!leadInfo || !leadInfo.email || leadInfo.ambiguous) return;
+    const key = `${company.toLowerCase()}|${scanTargetLower}`;
+    const alreadyHasId = !!(f["HubSpot Task ID"] || "").trim();
+    if (airtableTaskMap[key]) {
+      airtableTaskMap[key].ambiguous = true;
+    } else {
+      airtableTaskMap[key] = {
+        airtableTaskId: t.id,
+        email: leadInfo.email,
+        leadName: scanTarget,
+        company,
+        taskRule: f["Task Rule"] || "",
+        alreadyHasId,
+      };
+    }
+  });
+
+  // Fetch HubSpot tasks
+  const fromIso = dateFrom || new Date(Date.now() - 30 * 86400000).toISOString();
+  const toIso = dateTo || new Date().toISOString();
+  const hubspotTasks = [];
+  let after = undefined;
+  let pageCount = 0;
+  while (pageCount < 50) {
+    const searchBody = {
+      filterGroups: [{ filters: [
+        { propertyName: "hs_createdate", operator: "GTE", value: fromIso },
+        { propertyName: "hs_createdate", operator: "LTE", value: toIso },
+      ]}],
+      properties: ["hs_task_subject", "hs_task_body", "hs_createdate"],
+      limit: 100,
+      sorts: [{ propertyName: "hs_createdate", direction: "DESCENDING" }],
+    };
+    if (after) searchBody.after = after;
+    if (subjectContains) {
+      searchBody.filterGroups[0].filters.push({ propertyName: "hs_task_subject", operator: "CONTAINS_TOKEN", value: subjectContains });
+    }
+    const res = await fetch(`${HS_API}/crm/v3/objects/tasks/search`, { method: "POST", headers: hsHdr(apiKey), body: JSON.stringify(searchBody) });
+    if (res.status === 429) { await new Promise(r => setTimeout(r, 11000)); continue; }
+    if (!res.ok) return { error: `HubSpot search failed: ${res.status}`, runId };
+    const data = await res.json();
+    hubspotTasks.push(...(data.results || []));
+    pageCount++;
+    after = data.paging?.next?.after;
+    if (!after) break;
+    await new Promise(r => setTimeout(r, 150));
+  }
+  result.totalHubspotTasks = hubspotTasks.length;
+  log(`Fetched ${hubspotTasks.length} HubSpot tasks`);
+
+  // Match each HubSpot task to exactly one Airtable task (same logic as findOrphanedTasks)
+  const updatesToPush = []; // [{ airtableId, hubspotTaskId, via, ... }]
+  const seenAirtableIds = new Set();
+
+  for (const ht of hubspotTasks) {
+    const subject = (ht.properties?.hs_task_subject || "").trim();
+    const body = (ht.properties?.hs_task_body || "").trim();
+    const subjectLower = subject.toLowerCase();
+    const combinedLower = (subject + " " + body).toLowerCase();
+    const leadLineMatch = body.match(/^Lead:\s*(.+?)$/mi);
+    const leadNameFromBody = leadLineMatch ? leadLineMatch[1].trim().toLowerCase() : null;
+
+    const exactCandidates = [];
+    const fuzzyCandidates = [];
+    for (const [key, info] of Object.entries(airtableTaskMap)) {
+      if (info.ambiguous) continue;
+      const company = info.company.toLowerCase();
+      const leadName = info.leadName.toLowerCase();
+      if (leadName.length < 4) continue;
+      const expected = `${company} — ${(info.taskRule || "Task").toLowerCase()}`.trim();
+      if (subjectLower === expected) {
+        exactCandidates.push({ key, info });
+      } else {
+        const leadRegex = new RegExp(`\\b${leadName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+        if (company.length >= 3 && subjectLower.includes(company) && leadRegex.test(combinedLower)) {
+          fuzzyCandidates.push({ key, info });
+        }
+      }
+    }
+
+    let matched = null;
+    let via = null;
+
+    if (exactCandidates.length === 1) {
+      matched = exactCandidates[0];
+      via = "exact";
+    } else if (exactCandidates.length > 1) {
+      // Disambiguate by body content
+      if (leadNameFromBody) {
+        const byLine = exactCandidates.filter(m => m.info.leadName.toLowerCase() === leadNameFromBody);
+        if (byLine.length === 1) { matched = byLine[0]; via = "lead_line"; }
+      }
+      if (!matched) {
+        const byName = exactCandidates.filter(m => {
+          const ln = m.info.leadName.toLowerCase();
+          if (ln.length < 4) return false;
+          return new RegExp(`\\b${ln.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(combinedLower);
+        });
+        if (byName.length === 1) { matched = byName[0]; via = "name_in_body"; }
+        else if (byName.length > 1) {
+          const uEmails = [...new Set(byName.map(m => m.info.email))];
+          if (uEmails.length === 1) { matched = byName[0]; via = "name_in_body_unique"; }
+        }
+      }
+      if (!matched) {
+        const uEmails = [...new Set(exactCandidates.map(m => m.info.email))];
+        if (uEmails.length === 1) { matched = exactCandidates[0]; via = "all_same_email"; }
+      }
+    } else if (fuzzyCandidates.length === 1) {
+      matched = fuzzyCandidates[0];
+      via = "fuzzy";
+    } else if (fuzzyCandidates.length > 1) {
+      const uEmails = [...new Set(fuzzyCandidates.map(m => m.info.email))];
+      if (uEmails.length === 1) { matched = fuzzyCandidates[0]; via = "fuzzy_unique"; }
+    }
+
+    if (!matched) {
+      result.unmatched++;
+      result.unmatched_details.push({ hubspotTaskId: ht.id, subject, reason: exactCandidates.length > 1 ? `${exactCandidates.length} candidates, no disambiguation` : "no candidates" });
+      if (exactCandidates.length > 1 || fuzzyCandidates.length > 1) result.ambiguous++;
+      continue;
+    }
+
+    // Avoid writing same Airtable task twice (if two HubSpot tasks matched to same Airtable task — rare but possible)
+    if (seenAirtableIds.has(matched.info.airtableTaskId)) {
+      result.unmatched_details.push({ hubspotTaskId: ht.id, subject, reason: `Airtable task ${matched.info.airtableTaskId} already matched to a different HubSpot task in this run` });
+      continue;
+    }
+    seenAirtableIds.add(matched.info.airtableTaskId);
+
+    if (matched.info.alreadyHasId) {
+      result.alreadyTracked++;
+    } else {
+      result.newlyMatched++;
+    }
+    result.matches.push({
+      hubspotTaskId: ht.id,
+      airtableTaskId: matched.info.airtableTaskId,
+      company: matched.info.company,
+      leadName: matched.info.leadName,
+      email: matched.info.email,
+      via,
+    });
+    updatesToPush.push({
+      id: matched.info.airtableTaskId,
+      fields: { "HubSpot Task ID": String(ht.id), "HubSpot Last Synced": new Date().toISOString() },
+    });
+  }
+
+  log(`Matches: ${result.matches.length} (${result.newlyMatched} new, ${result.alreadyTracked} already tracked). Unmatched: ${result.unmatched}, ambiguous: ${result.ambiguous}`);
+
+  // Write all matches back to Airtable (with auto-field-create fallback)
+  if (updatesToPush.length > 0) {
+    const attemptUpdate = async (batch, attempt = 0) => {
+      const r = await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Tasks")}`, {
+        method: "PATCH", headers: atHdr,
+        body: JSON.stringify({ records: batch }),
+      });
+      if (r.ok) return true;
+      const errText = await r.text();
+      if (attempt < 3 && (errText.includes("INVALID_VALUE_FOR_COLUMN") || errText.includes("UNKNOWN_FIELD_NAME"))) {
+        const m1 = errText.match(/Field\s+\\?"([^"\\]+)\\?"/);
+        const m2 = errText.match(/[Uu]nknown field name:?\s+\\?"([^"\\]+)\\?"/);
+        const badField = (m1 && m1[1]) || (m2 && m2[1]);
+        if (badField) {
+          log(`Auto-creating field "${badField}"`);
+          try {
+            const tablesRes = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables`, { headers: atHdr });
+            if (tablesRes.ok) {
+              const { tables } = await tablesRes.json();
+              const tasksTable = tables.find(t => t.name === "Tasks");
+              if (tasksTable) {
+                const createRes = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables/${tasksTable.id}/fields`, {
+                  method: "POST", headers: atHdr,
+                  body: JSON.stringify({ name: badField, type: "singleLineText" }),
+                });
+                if (createRes.ok) {
+                  await new Promise(r => setTimeout(r, 1500));
+                  return attemptUpdate(batch, attempt + 1);
+                }
+              }
+            }
+          } catch (e) { logErr("Field create exception:", e.message); }
+        }
+      }
+      logErr("Airtable sync batch failed:", errText.slice(0, 200));
+      return false;
+    };
+
+    for (let i = 0; i < updatesToPush.length; i += 10) {
+      const batch = updatesToPush.slice(i, i + 10);
+      if (await attemptUpdate(batch)) result.airtableSynced += batch.length;
+      else result.airtableSyncFailed += batch.length;
+    }
+  }
+
+  log(`BACKFILL COMPLETE: ${result.airtableSynced} IDs written to Airtable, ${result.airtableSyncFailed} failed`);
   return result;
 }
 
@@ -1188,6 +1494,17 @@ export async function POST(request) {
         }
 
         const result = await repairOrphanedTasks(apiKey, taskContactPairs, baseId);
+        return NextResponse.json(result);
+      }
+
+      case "backfill_hubspot_ids": {
+        // Sync-only operation: match HubSpot tasks to Airtable tasks and write HubSpot Task ID back.
+        // Does NOT touch any HubSpot associations or content. Safe to run multiple times.
+        const apiKey = body.apiKey || await getStoredKey(campaignId);
+        if (!apiKey) return NextResponse.json({ error: "No API key" }, { status: 400 });
+        const { baseId, dateFrom, dateTo, subjectContains } = body;
+        if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
+        const result = await backfillHubspotIds(apiKey, baseId, { dateFrom, dateTo, subjectContains });
         return NextResponse.json(result);
       }
 

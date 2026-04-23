@@ -160,6 +160,8 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const [hsLoading, setHsLoading] = useState(false);
   const [hsMsg, setHsMsg] = useState("");
   const [repairModal, setRepairModal] = useState(null); // { step: "config" | "preview" | "running" | "done", ... }
+  const [backfillRunning, setBackfillRunning] = useState(false);
+  const [backfillMsg, setBackfillMsg] = useState("");
   // Enrichment
   const [enrichModal, setEnrichModal] = useState(null); // { mode: "enrich" | "push", tasks: [] }
   const [enrichLoading, setEnrichLoading] = useState(false);
@@ -692,6 +694,38 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     } catch (e) {
       setRepairModal(m => ({ ...m, running: false, error: e.message, step: "preview" }));
     }
+  };
+
+  const runBackfillIds = async () => {
+    if (!confirm("This will scan HubSpot tasks from the last 60 days, match them to your Airtable tasks, and write their HubSpot IDs back.\n\nSafe operation — does NOT modify any HubSpot data. Only updates Airtable.\n\nProceed?")) return;
+    setBackfillRunning(true);
+    setBackfillMsg("⏳ Scanning HubSpot tasks and matching to Airtable...");
+    try {
+      const d = await hsAPI("backfill_hubspot_ids", {
+        baseId: bid,
+        dateFrom: new Date(Date.now() - 60 * 86400000).toISOString(),
+        dateTo: new Date().toISOString(),
+      });
+      console.log("[backfill] response:", d);
+      if (d.error) {
+        setBackfillMsg("❌ " + d.error);
+      } else {
+        const parts = [];
+        parts.push(`Scanned ${d.totalHubspotTasks} HubSpot tasks`);
+        if (d.newlyMatched > 0) parts.push(`💾 ${d.newlyMatched} IDs newly written to Airtable`);
+        if (d.alreadyTracked > 0) parts.push(`✓ ${d.alreadyTracked} already tracked`);
+        if (d.airtableSynced > 0) parts.push(`✅ ${d.airtableSynced} synced`);
+        if (d.airtableSyncFailed > 0) parts.push(`⚠️ ${d.airtableSyncFailed} Airtable writes failed`);
+        if (d.ambiguous > 0) parts.push(`⚠️ ${d.ambiguous} ambiguous (skipped)`);
+        if (d.unmatched > 0) parts.push(`❓ ${d.unmatched} unmatched`);
+        const icon = d.airtableSynced > 0 ? "✅" : (d.unmatched > 0 || d.ambiguous > 0 ? "⚠️" : "ℹ️");
+        setBackfillMsg(`${icon} ${parts.join(" · ")}\n\nRun ID: ${d.runId} — search Vercel logs by [backfill:${d.runId}]`);
+      }
+      await loadTasks();
+    } catch (e) {
+      setBackfillMsg("❌ " + e.message);
+    }
+    setBackfillRunning(false);
   };
   // ─── Enrichment helpers ────────────────────────────────────
   const enrichTasks = async (tasksToEnrich) => {
@@ -1442,9 +1476,18 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
 
     {/* Repair Orphaned Tasks */}
     <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10}}>
-      <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:8}}>🔧 Repair Orphaned Tasks</div>
-      <div style={{fontSize:11,color:"var(--t3)",marginBottom:12,lineHeight:1.5}}>Find previously-pushed HubSpot tasks that have no contact association and retroactively link them to the right contacts. Safe — only ADDS associations, doesn't modify task content.</div>
-      <button className="btn btn-s" onClick={openRepairModal} disabled={hsLoading}><I.Sparkle/> Find Orphaned Tasks</button>
+      <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:8}}>🔧 HubSpot Repair Tools</div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:12,lineHeight:1.5}}>
+        <strong style={{color:"var(--t2)"}}>Repair Orphans</strong>: Find HubSpot tasks with no contact linked and retroactively link them. Creates associations.<br/>
+        <strong style={{color:"var(--t2)"}}>Backfill IDs</strong>: Match existing HubSpot tasks to your Airtable tasks and save their IDs. No HubSpot changes — just syncs IDs so future pushes update instead of duplicating.
+      </div>
+      <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+        <button className="btn btn-s" onClick={openRepairModal} disabled={hsLoading}><I.Sparkle/> Find Orphaned Tasks</button>
+        <button className="btn btn-s" onClick={runBackfillIds} disabled={hsLoading || backfillRunning} style={{color:"var(--t2)"}}>
+          {backfillRunning ? "⏳ Backfilling..." : "💾 Backfill HubSpot IDs"}
+        </button>
+      </div>
+      {backfillMsg && <div style={{marginTop:12,padding:10,background:backfillMsg.startsWith("✅")?"var(--grn-d)":backfillMsg.startsWith("⏳")?"var(--hover)":"var(--red-d)",color:backfillMsg.startsWith("✅")?"var(--grn)":backfillMsg.startsWith("⏳")?"var(--t2)":"var(--red)",borderRadius:6,fontSize:11,lineHeight:1.5,whiteSpace:"pre-wrap"}}>{backfillMsg}</div>}
     </div>
     </>)}
   </div>)}
