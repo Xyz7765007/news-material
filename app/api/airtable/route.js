@@ -303,6 +303,8 @@ const SCHEMA = {
     { name: "Date", type: "singleLineText" },
     { name: "Created", type: "singleLineText" },
     { name: "Phone", type: "singleLineText" },
+    { name: "HubSpot Task ID", type: "singleLineText" },
+    { name: "HubSpot Last Synced", type: "singleLineText" },
   ],
   "Outreach": [
     { name: "Lead Name", type: "singleLineText" },

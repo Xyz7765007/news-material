@@ -159,6 +159,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const [hsOwners, setHsOwners] = useState([]);
   const [hsLoading, setHsLoading] = useState(false);
   const [hsMsg, setHsMsg] = useState("");
+  const [repairModal, setRepairModal] = useState(null); // { step: "config" | "preview" | "running" | "done", ... }
   // Enrichment
   const [enrichModal, setEnrichModal] = useState(null); // { mode: "enrich" | "push", tasks: [] }
   const [enrichLoading, setEnrichLoading] = useState(false);
@@ -558,11 +559,78 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   };
   const loadHsOwners = async () => { try { const d = await hsAPI("fetch_owners"); setHsOwners(d.owners || []); } catch {} };
   const pushToHubSpot = async (tasksToPush, config) => {
-    setHsLoading(true); setHsMsg("");
+    setHsLoading(true); setHsMsg("⏳ Looking up contact info for association...");
     try {
-      const mapped = tasksToPush.map(t => { const f = t.fields || t; return { Company: f.Company, "Task Rule": f["Task Rule"], Score: f.Score, Signal: f.Signal, URL: f.URL, Date: f.Date, "Lead Name": f["Lead Name"], Phone: f.Phone || "" }; });
-      const d = await hsAPI("push_tasks", { tasks: mapped, config });
-      setHsMsg(d.created > 0 ? `✅ ${d.created} tasks pushed` : "❌ " + (d.errors?.[0] || "Failed"));
+      // Build a quick lookup map from leads: Name → {email, linkedin}
+      const leadLookup = {};
+      (leads || []).forEach(l => {
+        const f = l.fields || {};
+        const name = (f.Name || "").trim().toLowerCase();
+        if (name) leadLookup[name] = {
+          email: f.Email || "",
+          linkedinUrl: f["LinkedIn URL"] || "",
+          firstName: (f.Name || "").split(" ")[0] || "",
+          lastName: (f.Name || "").split(" ").slice(1).join(" ") || "",
+        };
+      });
+
+      const mapped = tasksToPush.map(t => {
+        const f = t.fields || t;
+        const leadName = (f["Scan Target"] || f["Lead Name"] || "").trim().toLowerCase();
+        const leadInfo = leadLookup[leadName] || {};
+        return {
+          airtableId: t.id, // so backend can save HubSpot ID back
+          hubspotTaskId: f["HubSpot Task ID"] || "", // existing task? update instead of create
+          Company: f.Company,
+          "Task Rule": f["Task Rule"],
+          Score: f.Score,
+          Signal: f.Signal,
+          URL: f.URL,
+          Date: f.Date,
+          "Lead Name": f["Lead Name"] || f["Scan Target"] || "",
+          "Scan Target": f["Scan Target"] || "",
+          Phone: f.Phone || "",
+          Email: leadInfo.email || "",
+          LinkedinUrl: leadInfo.linkedinUrl || "",
+          FirstName: leadInfo.firstName || "",
+          LastName: leadInfo.lastName || "",
+        };
+      });
+
+      // Pre-flight breakdown
+      const withHubspotId = mapped.filter(m => m.hubspotTaskId).length;
+      const willCreate = mapped.length - withHubspotId;
+      const withEmail = mapped.filter(m => m.Email).length;
+      setHsMsg(`⏳ Pushing ${mapped.length} tasks: ${willCreate} new + ${withHubspotId} updates (${withEmail} will be contact-linked)...`);
+
+      console.log("[pushToHubSpot] sending", mapped.length, "tasks,", willCreate, "new /", withHubspotId, "updates,", withEmail, "emails");
+      const d = await hsAPI("push_tasks", { tasks: mapped, config, baseId: bid });
+      console.log("[pushToHubSpot] response:", d);
+      let toast = "";
+      if (d.created > 0 || d.updated > 0) {
+        const parts = [];
+        if (d.created > 0) parts.push(`✅ ${d.created} created`);
+        if (d.updated > 0) parts.push(`🔄 ${d.updated} updated`);
+        if (d.skipped > 0) parts.push(`⏭️ ${d.skipped} skipped`);
+        if (typeof d.associated === "number" && d.associated > 0) parts.push(`🔗 ${d.associated} linked to contacts`);
+        if (typeof d.notAssociated === "number" && d.notAssociated > 0) parts.push(`⚠️ ${d.notAssociated} unlinked (contact not in HubSpot)`);
+        if (d.airtableSynced) parts.push(`💾 ${d.airtableSynced} IDs saved to Airtable`);
+        if (d.errors?.length) parts.push(`❌ ${d.errors.length} errors`);
+        toast = parts.join(" · ");
+      } else if (d.skipped > 0) {
+        toast = `⏭️ All ${d.skipped} tasks were already pushed — skipped (use 'Force recreate' to override)`;
+      } else if (d.errors?.length) {
+        toast = `❌ Push failed: ${d.errors[0]}`;
+      } else if (d.error) {
+        toast = `❌ ${d.error}`;
+      } else {
+        toast = `⚠️ Response: ${JSON.stringify(d).slice(0, 200)}`;
+      }
+      setHsMsg(toast);
+      setTimeout(() => setHsMsg(""), 20000);
+
+      // Refresh tasks so UI reflects the new HubSpot Task IDs
+      if (d.airtableSynced > 0) { try { await loadTasks(); } catch {} }
     } catch (e) { setHsMsg("❌ " + e.message); } setHsLoading(false);
   };
   const pushLeadsToHS = async (leadsToPush, config) => {
@@ -577,6 +645,53 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       if (d.errors?.length) parts.push(`${d.errors.length} errors`);
       setHsMsg(parts.length ? (d.created > 0 ? "✅ " : "ℹ️ ") + parts.join(", ") : "❌ No leads pushed");
     } catch (e) { setHsMsg("❌ " + e.message); } setHsLoading(false);
+  };
+
+  // ─── Orphaned task repair ─────────────────────────────────
+  const openRepairModal = () => {
+    const now = new Date();
+    const weekAgo = new Date(now.getTime() - 7 * 86400000);
+    setRepairModal({
+      step: "config",
+      dateFrom: weekAgo.toISOString().slice(0, 10),
+      dateTo: now.toISOString().slice(0, 10),
+      subjectContains: "",
+      preview: null,
+      running: false,
+      result: null,
+      error: "",
+    });
+  };
+  const runRepairPreview = async () => {
+    setRepairModal(m => ({ ...m, running: true, error: "" }));
+    try {
+      const d = await hsAPI("find_orphaned_tasks", {
+        baseId: bid,
+        dateFrom: repairModal.dateFrom ? new Date(repairModal.dateFrom).toISOString() : undefined,
+        dateTo: repairModal.dateTo ? new Date(new Date(repairModal.dateTo).getTime() + 86400000).toISOString() : undefined, // include full "to" day
+        subjectContains: repairModal.subjectContains || undefined,
+      });
+      if (d.error) {
+        setRepairModal(m => ({ ...m, running: false, error: d.error }));
+      } else {
+        setRepairModal(m => ({ ...m, running: false, step: "preview", preview: d }));
+      }
+    } catch (e) {
+      setRepairModal(m => ({ ...m, running: false, error: e.message }));
+    }
+  };
+  const executeRepair = async () => {
+    if (!repairModal?.preview?.pairs?.length) return;
+    setRepairModal(m => ({ ...m, running: true, step: "running", error: "" }));
+    try {
+      const d = await hsAPI("repair_orphaned_tasks", {
+        taskContactPairs: repairModal.preview.pairs,
+        baseId: bid,
+      });
+      setRepairModal(m => ({ ...m, running: false, step: "done", result: d }));
+    } catch (e) {
+      setRepairModal(m => ({ ...m, running: false, error: e.message, step: "preview" }));
+    }
   };
   // ─── Enrichment helpers ────────────────────────────────────
   const enrichTasks = async (tasksToEnrich) => {
@@ -1317,12 +1432,19 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     </div>
 
     {/* Upload Leads to HubSpot */}
-    <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10}}>
+    <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginBottom:16}}>
       <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:8}}>👤 Upload Leads to HubSpot</div>
       <div style={{fontSize:11,color:"var(--t3)",marginBottom:12,lineHeight:1.5}}>Push your SignalScope leads directly to HubSpot as contacts. Existing contacts (matched by email) will be updated, new ones created.</div>
       {leads.length === 0 ? <div style={{fontSize:11,color:"var(--t3)"}}>No leads loaded. Upload leads on the Leads tab first.</div> : (
         <LeadsToHubSpotForm leads={leads} owners={hsOwners} onPush={pushLeadsToHS} loading={hsLoading}/>
       )}
+    </div>
+
+    {/* Repair Orphaned Tasks */}
+    <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10}}>
+      <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:8}}>🔧 Repair Orphaned Tasks</div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:12,lineHeight:1.5}}>Find previously-pushed HubSpot tasks that have no contact association and retroactively link them to the right contacts. Safe — only ADDS associations, doesn't modify task content.</div>
+      <button className="btn btn-s" onClick={openRepairModal} disabled={hsLoading}><I.Sparkle/> Find Orphaned Tasks</button>
     </div>
     </>)}
   </div>)}
@@ -1821,6 +1943,241 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   {enrichModal&&<EnrichModal mode={enrichModal.mode} tasks={tasks} rules={rules} fTasks={fTasks} selectedTasks={selectedTasks} onEnrich={enrichTasks} onPush={pushToHubSpot} enrichResults={enrichResults} enrichLoading={enrichLoading} hsConnected={hsConnected} hsOwners={hsOwners} hsLoading={hsLoading} onClose={()=>{setEnrichModal(null);setEnrichResults([])}}/>}
   {manualModal&&<ManualOutreachModal leads={leads} rules={rules} linkedinAccount={linkedinAccount} outreachAPI={outreachAPI} onClose={()=>setManualModal(null)} baseId={bid}/>}
 
+  {/* ORPHAN REPAIR MODAL */}
+  {repairModal && (
+    <div className="modal-o" onClick={e=>e.target===e.currentTarget&&setRepairModal(null)}>
+      <div className="modal" style={{maxWidth:720}}>
+        <div className="modal-h">
+          <span style={{fontWeight:600}}>🔧 Repair Orphaned HubSpot Tasks</span>
+          <button className="btn btn-s" onClick={()=>setRepairModal(null)}>✕</button>
+        </div>
+        <div style={{padding:20}}>
+
+          {/* STEP 1: CONFIG */}
+          {repairModal.step === "config" && (<div>
+            <div style={{fontSize:11,color:"var(--t2)",marginBottom:14,lineHeight:1.6}}>
+              This will scan HubSpot for tasks created by SignalScope that have no contact association, match them to your Airtable leads by subject/name, and create the missing associations. Safe operation — it only ADDS associations.
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
+              <div className="ig" style={{marginBottom:0}}>
+                <div className="il">Date From</div>
+                <input type="date" className="inp" value={repairModal.dateFrom} onChange={e=>setRepairModal(m=>({...m,dateFrom:e.target.value}))}/>
+              </div>
+              <div className="ig" style={{marginBottom:0}}>
+                <div className="il">Date To</div>
+                <input type="date" className="inp" value={repairModal.dateTo} onChange={e=>setRepairModal(m=>({...m,dateTo:e.target.value}))}/>
+              </div>
+            </div>
+            <div className="ig">
+              <div className="il">Subject contains <span style={{fontWeight:400,color:"var(--t3)",textTransform:"none",marginLeft:4}}>(optional — narrow the scan)</span></div>
+              <input type="text" className="inp" placeholder="e.g. Website Engagement" value={repairModal.subjectContains} onChange={e=>setRepairModal(m=>({...m,subjectContains:e.target.value}))}/>
+            </div>
+            {repairModal.error && <div style={{padding:10,background:"var(--red-d)",color:"var(--red)",borderRadius:6,fontSize:11,marginTop:10}}>❌ {repairModal.error}</div>}
+          </div>)}
+
+          {/* STEP 2: PREVIEW */}
+          {repairModal.step === "preview" && repairModal.preview && (<div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:10,marginBottom:14}}>
+              <div style={{padding:14,background:"var(--hover)",borderRadius:8,textAlign:"center"}}>
+                <div style={{fontSize:22,fontWeight:700,color:"var(--t1)"}}>{repairModal.preview.totalHubspotTasks}</div>
+                <div style={{fontSize:10,color:"var(--t3)",marginTop:4}}>HubSpot tasks scanned</div>
+              </div>
+              <div style={{padding:14,background:"rgba(245,158,11,0.1)",borderRadius:8,textAlign:"center"}}>
+                <div style={{fontSize:22,fontWeight:700,color:"var(--amb)"}}>{repairModal.preview.orphanedTasks}</div>
+                <div style={{fontSize:10,color:"var(--t3)",marginTop:4}}>Orphaned</div>
+              </div>
+              <div style={{padding:14,background:"var(--grn-d)",borderRadius:8,textAlign:"center"}}>
+                <div style={{fontSize:22,fontWeight:700,color:"var(--grn)"}}>{repairModal.preview.matchable}</div>
+                <div style={{fontSize:10,color:"var(--t3)",marginTop:4}}>Safe to link</div>
+              </div>
+              <div style={{padding:14,background:"rgba(239,68,68,0.1)",borderRadius:8,textAlign:"center"}}>
+                <div style={{fontSize:22,fontWeight:700,color:"var(--red)"}}>{repairModal.preview.unmatchable}</div>
+                <div style={{fontSize:10,color:"var(--t3)",marginTop:4}}>Skipped</div>
+              </div>
+            </div>
+
+            {/* Run ID for log correlation */}
+            {repairModal.preview.runId && (
+              <div style={{fontSize:9,color:"var(--t3)",marginBottom:10,fontFamily:"monospace"}}>
+                Run ID: <strong>{repairModal.preview.runId}</strong> — search Vercel logs by <code style={{background:"var(--hover)",padding:"1px 4px",borderRadius:3}}>[orphan:{repairModal.preview.runId}]</code> for detailed trace
+              </div>
+            )}
+
+            {/* Match quality preview (sample pairs) */}
+            {repairModal.preview.pairs?.length > 0 && (
+              <details style={{marginBottom:12,padding:10,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:6}}>
+                <summary style={{fontSize:11,color:"var(--grn)",cursor:"pointer",fontWeight:600}}>✅ Preview the {Math.min(repairModal.preview.pairs.length, 20)} associations to create (sample)</summary>
+                <div style={{maxHeight:300,overflow:"auto",marginTop:10,fontSize:10,color:"var(--t3)",lineHeight:1.6}}>
+                  <table style={{width:"100%",fontSize:10,borderCollapse:"collapse"}}>
+                    <thead><tr style={{borderBottom:"1px solid var(--bdr)"}}>
+                      <th style={{textAlign:"left",padding:"4px 8px",color:"var(--t2)"}}>Task Subject</th>
+                      <th style={{textAlign:"left",padding:"4px 8px",color:"var(--t2)"}}>Lead</th>
+                      <th style={{textAlign:"left",padding:"4px 8px",color:"var(--t2)"}}>Email</th>
+                      <th style={{textAlign:"left",padding:"4px 8px",color:"var(--t2)"}}>Match Type</th>
+                    </tr></thead>
+                    <tbody>
+                      {repairModal.preview.pairs.slice(0, 20).map((p, i) => (
+                        <tr key={i} style={{borderBottom:"1px solid var(--bdr)"}}>
+                          <td style={{padding:"4px 8px",color:"var(--t2)",maxWidth:220,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.taskSubject}</td>
+                          <td style={{padding:"4px 8px"}}>{p.leadName || "—"}</td>
+                          <td style={{padding:"4px 8px",fontFamily:"monospace",fontSize:9}}>{p.contactEmail}</td>
+                          <td style={{padding:"4px 8px"}}>
+                            <span style={{fontSize:9,padding:"2px 6px",borderRadius:3,background:p.matchMethod==="tracked_hubspot_id"?"var(--grn-d)":p.matchMethod==="exact_subject"?"var(--hover)":"rgba(245,158,11,0.2)",color:p.matchMethod==="tracked_hubspot_id"?"var(--grn)":p.matchMethod==="fuzzy_company_name"?"var(--amb)":"var(--t2)"}}>
+                              {p.matchMethod === "tracked_hubspot_id" ? "✓ tracked" : p.matchMethod === "exact_subject" ? "exact" : "fuzzy"}
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {repairModal.preview.pairs.length > 20 && <div style={{padding:"6px 8px",fontStyle:"italic"}}>...and {repairModal.preview.pairs.length - 20} more</div>}
+                </div>
+              </details>
+            )}
+
+            {/* Unmatched details */}
+            {repairModal.preview.unmatchable > 0 && (
+              <details style={{marginBottom:14,padding:10,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:6}}>
+                <summary style={{fontSize:11,color:"var(--amb)",cursor:"pointer",fontWeight:600}}>⚠️ {repairModal.preview.unmatchable} skipped (click for reasons){repairModal.preview.ambiguous > 0 ? ` — ${repairModal.preview.ambiguous} skipped as ambiguous for safety` : ""}</summary>
+                <div style={{maxHeight:200,overflow:"auto",marginTop:10,fontSize:10,color:"var(--t3)",lineHeight:1.6}}>
+                  {(repairModal.preview.unmatched || []).slice(0, 50).map((u, i) => (
+                    <div key={i} style={{padding:"4px 0",borderBottom:"1px solid var(--bdr)"}}>
+                      <strong style={{color:"var(--t2)"}}>{u.taskSubject || "(no subject)"}</strong> — {u.reason}
+                    </div>
+                  ))}
+                  {repairModal.preview.unmatched?.length > 50 && <div style={{paddingTop:6,fontStyle:"italic"}}>...and {repairModal.preview.unmatched.length - 50} more</div>}
+                </div>
+              </details>
+            )}
+
+            {/* Diagnostics */}
+            {repairModal.preview.diagnostics && (
+              <details style={{marginBottom:14,padding:10,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:6}}>
+                <summary style={{fontSize:11,color:"var(--t3)",cursor:"pointer",fontWeight:600}}>🔍 Scan Diagnostics</summary>
+                <div style={{marginTop:10,fontSize:10,color:"var(--t3)",lineHeight:1.8,fontFamily:"monospace"}}>
+                  {Object.entries(repairModal.preview.diagnostics).map(([k, v]) => (
+                    <div key={k}><span style={{color:"var(--t2)"}}>{k}:</span> <strong>{v}</strong></div>
+                  ))}
+                </div>
+              </details>
+            )}
+
+            {repairModal.preview.warnings?.length > 0 && (
+              <div style={{padding:10,background:"rgba(245,158,11,0.1)",color:"var(--amb)",borderRadius:6,fontSize:11,marginBottom:10}}>
+                ⚠️ {repairModal.preview.warnings.join("; ")}
+              </div>
+            )}
+
+            {repairModal.preview.matchable > 0 && (
+              <div style={{padding:12,background:"var(--grn-d)",color:"var(--grn)",borderRadius:6,fontSize:11,lineHeight:1.5}}>
+                ✅ <strong>Ready to safely repair {repairModal.preview.matchable} task{repairModal.preview.matchable!==1?"s":""}.</strong> Each will be linked to its verified contact. Review the sample above before clicking Execute.
+              </div>
+            )}
+            {repairModal.preview.matchable === 0 && repairModal.preview.orphanedTasks > 0 && (
+              <div style={{padding:12,background:"var(--red-d)",color:"var(--red)",borderRadius:6,fontSize:11,lineHeight:1.5}}>
+                ❌ No tasks could be safely matched. Review the skipped reasons above. Common fixes: upload leads to HubSpot first, or check that lead names on tasks match the Leads table exactly.
+              </div>
+            )}
+            {repairModal.preview.orphanedTasks === 0 && (
+              <div style={{padding:12,background:"var(--grn-d)",color:"var(--grn)",borderRadius:6,fontSize:11,lineHeight:1.5}}>
+                ✨ No orphans found in the selected date range. All tasks are properly linked.
+              </div>
+            )}
+            {repairModal.error && <div style={{padding:10,background:"var(--red-d)",color:"var(--red)",borderRadius:6,fontSize:11,marginTop:10}}>❌ {repairModal.error}</div>}
+          </div>)}
+
+          {/* STEP 3: RUNNING */}
+          {repairModal.step === "running" && (<div style={{padding:"40px 20px",textAlign:"center"}}>
+            <div style={{fontSize:32,marginBottom:14}}>⏳</div>
+            <div style={{fontSize:13,color:"var(--t1)",fontWeight:600,marginBottom:6}}>Creating associations...</div>
+            <div style={{fontSize:11,color:"var(--t3)"}}>Linking {repairModal.preview?.matchable || 0} tasks to their contacts in HubSpot</div>
+          </div>)}
+
+          {/* STEP 4: DONE */}
+          {repairModal.step === "done" && repairModal.result && (<div>
+            <div style={{padding:20,background:repairModal.result.repaired>0?"var(--grn-d)":"var(--red-d)",borderRadius:8,textAlign:"center",marginBottom:14}}>
+              <div style={{fontSize:32,marginBottom:8}}>{repairModal.result.repaired>0?"✅":"❌"}</div>
+              <div style={{fontSize:16,fontWeight:700,color:repairModal.result.repaired>0?"var(--grn)":"var(--red)"}}>{repairModal.result.repaired} task{repairModal.result.repaired!==1?"s":""} linked to contacts</div>
+              {repairModal.result.failed > 0 && (
+                <div style={{fontSize:11,color:"var(--amb)",marginTop:6}}>⚠️ {repairModal.result.failed} failed — see details below</div>
+              )}
+              {repairModal.result.airtableSynced > 0 && (
+                <div style={{fontSize:11,color:"var(--grn)",marginTop:6}}>💾 {repairModal.result.airtableSynced} HubSpot IDs synced to Airtable (future pushes will update instead of duplicate)</div>
+              )}
+              {repairModal.result.runId && (
+                <div style={{fontSize:9,color:"var(--t3)",marginTop:10,fontFamily:"monospace"}}>
+                  Run ID: <strong>{repairModal.result.runId}</strong>
+                </div>
+              )}
+            </div>
+            {repairModal.result.partialFailures?.length > 0 && (
+              <details style={{marginBottom:14,padding:10,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:6}}>
+                <summary style={{fontSize:11,color:"var(--amb)",cursor:"pointer",fontWeight:600}}>⚠️ Individual task failures ({repairModal.result.partialFailures.length})</summary>
+                <div style={{maxHeight:200,overflow:"auto",marginTop:10,fontSize:10,color:"var(--t3)",lineHeight:1.6,fontFamily:"monospace"}}>
+                  {repairModal.result.partialFailures.slice(0, 30).map((f, i) => (
+                    <div key={i} style={{padding:"4px 0",borderBottom:"1px solid var(--bdr)"}}>
+                      Task {f.taskId} → Contact {f.contactId}: <span style={{color:"var(--red)"}}>{f.error}</span>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
+            {repairModal.result.errors?.length > 0 && (
+              <details style={{marginBottom:14,padding:10,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:6}}>
+                <summary style={{fontSize:11,color:"var(--red)",cursor:"pointer",fontWeight:600}}>❌ Batch-level errors ({repairModal.result.errors.length})</summary>
+                <div style={{maxHeight:200,overflow:"auto",marginTop:10,fontSize:10,color:"var(--t3)",lineHeight:1.6,fontFamily:"monospace"}}>
+                  {repairModal.result.errors.map((e, i) => <div key={i} style={{padding:"4px 0"}}>{e}</div>)}
+                </div>
+              </details>
+            )}
+            {repairModal.result.auditLog?.length > 0 && (
+              <details style={{marginBottom:14,padding:10,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:6}}>
+                <summary style={{fontSize:11,color:"var(--t3)",cursor:"pointer",fontWeight:600}}>📋 Full audit log ({repairModal.result.auditLog.length} entries)</summary>
+                <div style={{marginTop:10}}>
+                  <button className="btn btn-s" onClick={()=>{
+                    const csv = ["Task ID,Contact ID,Success,Method/Reason", ...repairModal.result.auditLog.map(a => `${a.taskId},${a.contactId},${a.success},"${(a.method||a.reason||"").replace(/"/g,'""')}"`)].join("\n");
+                    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `hubspot-repair-audit-${repairModal.result.runId || Date.now()}.csv`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }}>📥 Download audit CSV</button>
+                </div>
+              </details>
+            )}
+            <div style={{padding:12,background:"var(--hover)",borderRadius:6,fontSize:11,color:"var(--t2)",lineHeight:1.5}}>
+              💡 Verify in HubSpot: open any task from the repaired list — you should now see the contact in the right sidebar.
+            </div>
+          </div>)}
+
+        </div>
+        <div className="modal-f">
+          {repairModal.step === "config" && (<>
+            <button className="btn" onClick={()=>setRepairModal(null)}>Cancel</button>
+            <button className="btn btn-p" disabled={repairModal.running} onClick={runRepairPreview}>
+              {repairModal.running ? "⏳ Scanning..." : "🔍 Scan & Preview"}
+            </button>
+          </>)}
+          {repairModal.step === "preview" && (<>
+            <button className="btn" onClick={()=>setRepairModal(m=>({...m,step:"config"}))}>← Back</button>
+            {repairModal.preview?.matchable > 0 ? (
+              <button className="btn btn-p" disabled={repairModal.running} onClick={executeRepair}>
+                🔧 Execute Repair ({repairModal.preview.matchable} links)
+              </button>
+            ) : (
+              <button className="btn" onClick={()=>setRepairModal(null)}>Close</button>
+            )}
+          </>)}
+          {repairModal.step === "done" && (
+            <button className="btn btn-p" onClick={()=>setRepairModal(null)}>Done</button>
+          )}
+        </div>
+      </div>
+    </div>
+  )}
+
   {/* CSV MODAL */}
   {csvModal&&(<div className="modal-o" onClick={e=>e.target===e.currentTarget&&setCsvModal(null)}><div className="modal" style={{maxWidth:700}}>
   <div className="modal-h"><span style={{fontWeight:600}}>Map CSV → {csvModal.table}</span><button className="btn btn-s" onClick={()=>setCsvModal(null)}>✕</button></div>
@@ -1921,6 +2278,7 @@ function PushToHubSpotForm({ tasks, owners, onPush, loading, rules }) {
   const [ruleFilter, setRuleFilter] = useState("all");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
+  const [mode, setMode] = useState("smart"); // smart | skip_existing | force_create
 
   const ruleNames = [...new Set(tasks.map(t => (t.fields || {})["Task Rule"]).filter(Boolean))];
   const filtered = tasks.filter(t => {
@@ -1930,6 +2288,10 @@ function PushToHubSpotForm({ tasks, owners, onPush, loading, rules }) {
     if (dateTo && (f.Date || "") > dateTo) return false;
     return true;
   });
+
+  // Break down filtered tasks into "new" vs "already pushed"
+  const withHubspotId = filtered.filter(t => (t.fields||{})["HubSpot Task ID"]).length;
+  const newTasks = filtered.length - withHubspotId;
 
   return (<div>
     <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
@@ -1970,9 +2332,35 @@ function PushToHubSpotForm({ tasks, owners, onPush, loading, rules }) {
         <input type="date" className="inp" value={dateTo} onChange={e=>setDateTo(e.target.value)}/>
       </div>
     </div>
+
+    {/* Duplicate handling mode */}
+    <div className="ig" style={{marginBottom:14,padding:12,background:"var(--hover)",borderRadius:6}}>
+      <div className="il" style={{marginBottom:8}}>🔄 Duplicate Handling {withHubspotId > 0 && <span style={{fontWeight:400,textTransform:"none",color:"var(--t3)",marginLeft:6}}>· {withHubspotId} of {filtered.length} already pushed to HubSpot</span>}</div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
+        {[
+          { id: "smart", label: "Smart: Create new + Update existing", desc: "Recommended. Fresh Signal text on existing HubSpot tasks.", icon: "🧠" },
+          { id: "skip_existing", label: "Skip already-pushed", desc: "Only create NEW tasks, ignore ones already in HubSpot.", icon: "⏭️" },
+          { id: "force_create", label: "Force create duplicates", desc: "Ignore history. Create a new HubSpot task for every record.", icon: "⚠️" },
+        ].map(opt => (
+          <div key={opt.id} onClick={()=>setMode(opt.id)} style={{padding:10,border:"1px solid "+(mode===opt.id?"var(--acc)":"var(--bdr)"),background:mode===opt.id?"var(--acc-d)":"var(--card)",borderRadius:6,cursor:"pointer"}}>
+            <div style={{fontSize:11,fontWeight:600,color:mode===opt.id?"var(--acc)":"var(--t1)",marginBottom:4}}>{opt.icon} {opt.label}</div>
+            <div style={{fontSize:9,color:"var(--t3)",lineHeight:1.4}}>{opt.desc}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+
     <div style={{display:"flex",alignItems:"center",gap:12}}>
-      <button className="btn btn-p btn-s" disabled={loading || !filtered.length} onClick={() => onPush(filtered, { ownerId, priority, status })}>
-        {loading ? "⏳ Pushing..." : `Push ${filtered.length} Task${filtered.length !== 1 ? "s" : ""} to HubSpot`}
+      <button className="btn btn-p btn-s" disabled={loading || !filtered.length} onClick={() => onPush(filtered, { ownerId, priority, status, mode })}>
+        {loading ? "⏳ Pushing..." : (() => {
+          if (mode === "smart") {
+            if (withHubspotId > 0) return `Push ${filtered.length} (${newTasks} new + ${withHubspotId} updates)`;
+            return `Push ${filtered.length} Task${filtered.length!==1?"s":""} to HubSpot`;
+          }
+          if (mode === "skip_existing") return `Push ${newTasks} new Task${newTasks!==1?"s":""} (skip ${withHubspotId} existing)`;
+          if (mode === "force_create") return `Force create ${filtered.length} new Task${filtered.length!==1?"s":""}`;
+          return `Push ${filtered.length}`;
+        })()}
       </button>
       <span style={{fontSize:10,color:"var(--t3)"}}>{filtered.length} of {tasks.length} tasks match filters</span>
     </div>
@@ -4143,7 +4531,7 @@ function EnrichModal({ mode, tasks, rules, fTasks, selectedTasks, onEnrich, onPu
     <div className="modal-f">
       {step==="select"&&<><button className="btn" onClick={onClose}>Cancel</button><button className="btn btn-p" disabled={enrichLoading||!filtered.length} onClick={async()=>{setStep("enriching");const r=await onEnrich(filtered);if(r)setStep("results");else setStep("select")}}><I.Sparkle/> Enrich {filtered.length} Tasks</button></>}
       {step==="results"&&<><button className="btn" onClick={onClose}>Done</button>{hsConnected&&enrichedWithPhone.length>0&&<button className="btn btn-p" onClick={()=>setStep("push")}>Push to HubSpot →</button>}</>}
-      {step==="push"&&<><button className="btn" onClick={onClose}>Cancel</button><button className="btn btn-p" disabled={hsLoading||!filtered.length} onClick={async()=>{await onPush(filtered,{ownerId,priority,status:"NOT_STARTED"});onClose()}}>{hsLoading?"⏳":"📤 Push "+filtered.length+" Tasks"}</button></>}
+      {step==="push"&&<><button className="btn" onClick={onClose}>Cancel</button><button className="btn btn-p" disabled={hsLoading||!filtered.length} onClick={async()=>{await onPush(filtered,{ownerId,priority,status:"NOT_STARTED",mode:"smart"});onClose()}}>{hsLoading?"⏳":"📤 Push "+filtered.length+" Tasks"}</button></>}
       {step==="enriching"&&<button className="btn" disabled>⏳ Processing...</button>}
     </div>
   </div></div>);
