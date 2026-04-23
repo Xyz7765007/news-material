@@ -146,12 +146,26 @@ function timestampFromActivityUrl(url) {
 }
 
 // ─── RapidAPI: Fresh LinkedIn Scraper ──────────────────────────
-async function rapidCall(path, params, { retries = 2, timeoutMs = 45000 } = {}) {
+// Global throttle state for RapidAPI calls.
+// PRO plan limits vary — observed ~30-60 requests/minute. We pace at ~1 req per 1.2s to stay safe.
+// On a 429, we exponentially back off and also increase the minimum interval for this function's lifetime.
+let rapidLastCallMs = 0;
+let rapidMinIntervalMs = 1200; // starts at 1.2s, grows after 429s
+
+async function rapidCall(path, params, { retries = 3, timeoutMs = 45000 } = {}) {
   if (!RAPIDAPI_KEY) return { ok: false, status: 0, error: "RAPIDAPI_KEY not set in Vercel env" };
   const qs = new URLSearchParams(params).toString();
   const url = `https://${RAPIDAPI_HOST}${path}?${qs}`;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
+    // Global throttle: ensure minimum interval between RapidAPI calls.
+    // This is process-wide — all leads in this invocation share the same throttle.
+    const sinceLast = Date.now() - rapidLastCallMs;
+    if (sinceLast < rapidMinIntervalMs) {
+      await new Promise(res => setTimeout(res, rapidMinIntervalMs - sinceLast));
+    }
+    rapidLastCallMs = Date.now();
+
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
@@ -163,8 +177,18 @@ async function rapidCall(path, params, { retries = 2, timeoutMs = 45000 } = {}) 
       clearTimeout(t);
       const text = await r.text();
       if (!r.ok) {
-        // 429 = rate limit, 503 = upstream overload — retry after delay
-        if ((r.status === 429 || r.status === 503) && attempt < retries) {
+        // 429 = rate limit. Back off aggressively AND widen the throttle for this function's remaining life.
+        if (r.status === 429 && attempt < retries) {
+          // Grow the minimum interval permanently (for this invocation) — tells us we need to slow down
+          rapidMinIntervalMs = Math.min(rapidMinIntervalMs * 1.5, 5000);
+          // Back off for this specific retry: 3s, 6s, 12s
+          const backoffMs = 3000 * Math.pow(2, attempt);
+          console.warn(`[linkedin-posts] RapidAPI 429 — backing off ${backoffMs}ms, new min interval ${rapidMinIntervalMs}ms (attempt ${attempt + 1})`);
+          await new Promise(res => setTimeout(res, backoffMs));
+          continue;
+        }
+        // 503 = upstream overload — normal retry with short delay
+        if (r.status === 503 && attempt < retries) {
           await new Promise(res => setTimeout(res, 1500 * (attempt + 1)));
           continue;
         }
@@ -925,6 +949,18 @@ async function runLinkedInPostScan({
 
   // Process each lead
   for (let i = 0; i < leads.length; i++) {
+    // Check for user-triggered stop — re-read progress state before each lead.
+    // This adds an Airtable read per lead but gives the user a reliable stop mechanism.
+    if (i % 3 === 0) { // Only check every 3 leads to avoid hammering Airtable
+      try {
+        const currentProgress = await readProgress(campaignAirtableId);
+        if (currentProgress?.stopped_by_user) {
+          console.log(`[linkedin-posts] Scan stopped by user at lead ${i}/${leads.length}`);
+          return progress; // exit immediately, don't overwrite stopped state
+        }
+      } catch {}
+    }
+
     // Bail out gracefully if we're about to hit Vercel's timeout.
     // Progress is already persisted after every lead — user hits Resume to continue.
     if (shouldStopForTime()) {
@@ -1202,6 +1238,26 @@ export async function POST(request) {
         if (!campaignAirtableId) return NextResponse.json({ error: "campaignAirtableId required" }, { status: 400 });
         await atUpdateWithAutoCreate(MASTER_BASE_ID, "Campaigns", campaignAirtableId, { "LinkedIn Post Scan Status": "" });
         return NextResponse.json({ ok: true, cleared: true });
+      }
+
+      // Stop a running scan by marking it complete in progress state.
+      // The actively-running function will see status!==running next time it checks and bail out.
+      // Any cron-triggered resume will also see status=complete and return DONE.
+      case "stop_scan": {
+        const { campaignAirtableId } = body;
+        if (!campaignAirtableId) return NextResponse.json({ error: "campaignAirtableId required" }, { status: 400 });
+        const prior = await readProgress(campaignAirtableId);
+        if (!prior) return NextResponse.json({ ok: true, message: "No scan to stop" });
+        const stopped = {
+          ...prior,
+          status: "complete",
+          phase: "done",
+          last_log: `⛔ Scan stopped by user at ${prior.leads_done}/${prior.total_leads} leads.`,
+          ended_at: new Date().toISOString(),
+          stopped_by_user: true,
+        };
+        await writeProgress(campaignAirtableId, stopped);
+        return NextResponse.json({ ok: true, stopped: true, progress: stopped });
       }
 
       // List stale LinkedIn post tasks (for preview before deletion). Returns count + sample.

@@ -3798,6 +3798,18 @@ function LinkedInPostsTab({ baseId, campaign, leads, onCampaignProvisioned }) {
     } catch (e) { setErr(e.message); }
   };
 
+  const stopScan = async () => {
+    if (!confirm("Stop the running scan? The current lead will finish, then the scan will halt. Cron (if enabled) will also stop resuming. Tasks already created are preserved.")) return;
+    try {
+      const res = await fetch("/api/linkedin-posts", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "stop_scan", campaignAirtableId: campaign.airtableId }),
+      });
+      const d = await res.json();
+      if (d.progress) setProgress(d.progress);
+    } catch (e) { setErr(e.message); }
+  };
+
   const testProfile = async (leadId) => {
     setErr("");
     try {
@@ -4027,6 +4039,11 @@ function LinkedInPostsTab({ baseId, campaign, leads, onCampaignProvisioned }) {
           {isResumable && (
             <button className="btn btn-s" onClick={()=>startScan(true)} disabled={scanning} style={{background:"rgba(245,158,11,.1)",color:"var(--amb)",borderColor:"var(--amb)"}}>
               ↺ Resume ({progress.leads_remaining} leads left)
+            </button>
+          )}
+          {(isRunning || isResumable) && (
+            <button className="btn btn-s" onClick={stopScan} style={{background:"rgba(239,68,68,.1)",color:"var(--red)",borderColor:"var(--red)"}}>
+              ⛔ Stop Scan
             </button>
           )}
           {progress && <button className="btn btn-s" onClick={clearProgress} disabled={scanning}>🗑 Clear State</button>}
