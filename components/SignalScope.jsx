@@ -1236,6 +1236,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     {id:"tasks",label:"Tasks",count:tasks.length},
     null,
     {id:"outreach",label:"💬 LinkedIn Automation",count:null},
+    {id:"linkedin_posts",label:"📝 LinkedIn Posts",count:null},
     {id:"email_campaign",label:"📧 Email Campaign",count:null},
     {id:"google_analytics",label:"📊 Google Analytics",count:null},
     {id:"hubspot",label:"🔗 HubSpot",count:null},
@@ -1807,7 +1808,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         {e:"📊",n:"Google Analytics Integration",s:"Planned",d:"Pull GA4 data into dashboards — traffic, conversions, channel performance. Correlate web analytics with signal data.",f:["GA4 property connection","Traffic & conversion dashboards","Channel attribution reports","Signal-to-web-visit correlation"]},
         {e:"📧",n:"Smartlead Integration",s:"Planned",d:"Connect Smartlead for email campaign tracking — opens, replies, bounces alongside LinkedIn outreach data.",f:["Campaign sync & status tracking","Reply & bounce monitoring","Email + LinkedIn sequence coordination","Deliverability analytics"]},
         {e:"🤖",n:"Post-Demo Automation",s:"Live",d:"When a lead's status changes, AI analyzes their profile + engagement history and creates personalized SDR follow-up tasks.",f:["Trigger on any field value change","AI generates 1-3 tasks per lead","References engagement history","Dedup — won't re-process leads"]},
-        {e:"📰",n:"LinkedIn Post Monitoring",s:"In Testing",d:"Monitor leads' LinkedIn posts weekly. AI scores relevance, generates structured summaries and suggested comments for engagement.",f:["Auto-fetch posts via Apify (last 7 days)","AI relevance scoring with custom prompts","Structured sentence + suggested comment output","Engagement opportunity tasks"]},
+        {e:"📝",n:"LinkedIn Post Monitoring",s:"Live",d:"Monitor leads' LinkedIn posts weekly. AI scores relevance, generates structured summaries and suggested comments for engagement.",f:["Fetch posts via RapidAPI (last 7 days)","AI relevance scoring with custom prompts","Apps-Script style category filters (hiring/spam/etc)","Resumable across crashes","Structured sentence + suggested comment output"]},
         {e:"💬",n:"LinkedIn Outreach Automation",s:"In Development",d:"Automated connection requests → DM sequences → follow-ups. AI personalizes each message. Full dashboard with acceptance rates.",f:["Multi-step DM sequences","AI message personalization with merge fields","Connection acceptance tracking","Rate-limited scheduling (safe for LinkedIn)"]},
         {e:"🧠",n:"AI Task Recommendations",s:"Planned",d:"AI analyzes contact + company data to recommend priority tasks. Based on engagement signals, deal stage, and historical patterns.",f:["Next-best-action scoring","Engagement pattern analysis","SDR workload optimization","Priority queue with reasoning"]},
         {e:"📋",n:"Automated HubSpot Task Push",s:"Planned",d:"Tasks created in SignalScope automatically pushed to HubSpot as activities/tasks, assigned to the right rep with full context.",f:["Real-time task sync to HubSpot","Rep assignment rules","Signal context in task description","Two-way status sync"]},
@@ -2048,6 +2049,9 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       <td><button className="btn btn-d btn-s" onClick={()=>del("Tasks",[t.id],setTasks)}><I.Trash/></button></td>
     </tr>)})}</tbody></table></div>}
   </div>)}
+
+  {/* ════ LINKEDIN POSTS SCANNER ════ */}
+  {tab==="linkedin_posts"&&!loading&&(<LinkedInPostsTab baseId={bid} campaign={camp} leads={leads}/>)}
 
   {/* ════ LINKEDIN AUTOMATION ════ */}
   {tab==="outreach"&&!loading&&(<div>
@@ -3504,6 +3508,406 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
 
       {/* STATUS MESSAGE */}
       {msg && <div style={{marginTop:14,padding:10,background:msg.startsWith("✅")?"var(--grn-d)":msg.startsWith("⏳")||msg.startsWith("🔗")?"var(--hover)":"var(--red-d)",color:msg.startsWith("✅")?"var(--grn)":msg.startsWith("⏳")||msg.startsWith("🔗")?"var(--t2)":"var(--red)",borderRadius:6,fontSize:11,whiteSpace:"pre-wrap"}}>{msg}</div>}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// LINKEDIN POSTS TAB — Fetch + Score + Create tasks from lead posts
+// ═══════════════════════════════════════════════════════════════
+function LinkedInPostsTab({ baseId, campaign, leads }) {
+  const [selectedLeadIds, setSelectedLeadIds] = useState(new Set());
+  const [selectMode, setSelectMode] = useState("all"); // "all" | "specific"
+  const [scoreThreshold, setScoreThreshold] = useState(70);
+  const [daysBack, setDaysBack] = useState(7);
+  const [taskRuleName, setTaskRuleName] = useState("LinkedIn Post Engagement");
+  const [systemPromptOverride, setSystemPromptOverride] = useState("");
+  const [showPromptEditor, setShowPromptEditor] = useState(false);
+  const [searchLeads, setSearchLeads] = useState("");
+  const [progress, setProgress] = useState(null);
+  const [scanning, setScanning] = useState(false);
+  const [err, setErr] = useState("");
+  const pollRef = useRef(null);
+
+  // Filter leads to those with a LinkedIn URL (can't scan without it)
+  const linkedinLeads = (leads || []).filter(l => (l.fields?.["LinkedIn URL"] || l.fields?.["Linkedin URL"] || "").trim());
+  const visibleLeads = searchLeads
+    ? linkedinLeads.filter(l => {
+        const s = searchLeads.toLowerCase();
+        const f = l.fields || {};
+        return (f.Name || "").toLowerCase().includes(s) || (f.Company || "").toLowerCase().includes(s) || (f.Title || "").toLowerCase().includes(s);
+      })
+    : linkedinLeads;
+
+  // Load existing progress on mount so user sees any in-flight scan
+  useEffect(() => {
+    if (!campaign?.airtableId) return;
+    (async () => {
+      try {
+        const res = await fetch("/api/linkedin-posts", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "get_progress", campaignAirtableId: campaign.airtableId }),
+        });
+        const d = await res.json();
+        if (d.progress) setProgress(d.progress);
+      } catch {}
+    })();
+  }, [campaign?.airtableId]);
+
+  // Poll progress every 2s when scanning
+  useEffect(() => {
+    if (!scanning || !campaign?.airtableId) return;
+    pollRef.current = setInterval(async () => {
+      try {
+        const res = await fetch("/api/linkedin-posts", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "get_progress", campaignAirtableId: campaign.airtableId }),
+        });
+        const d = await res.json();
+        if (d.progress) setProgress(d.progress);
+      } catch {}
+    }, 2000);
+    return () => { clearInterval(pollRef.current); pollRef.current = null; };
+  }, [scanning, campaign?.airtableId]);
+
+  const toggleLead = (id) => {
+    setSelectedLeadIds(prev => {
+      const n = new Set(prev);
+      if (n.has(id)) n.delete(id); else n.add(id);
+      return n;
+    });
+  };
+  const selectAll = () => setSelectedLeadIds(new Set(visibleLeads.map(l => l.id)));
+  const selectNone = () => setSelectedLeadIds(new Set());
+
+  const startScan = async (resume = false) => {
+    setErr("");
+    if (!campaign?.airtableId) { setErr("Campaign not configured — can't persist progress"); return; }
+    const leadIds = selectMode === "specific" ? Array.from(selectedLeadIds) : null;
+    if (selectMode === "specific" && leadIds.length === 0) { setErr("Select at least one lead or switch to 'all leads'"); return; }
+
+    setScanning(true);
+    try {
+      const res = await fetch("/api/linkedin-posts", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "scan", baseId,
+          campaignAirtableId: campaign.airtableId,
+          leadIds,
+          scoreThreshold,
+          daysBack,
+          taskRuleName,
+          systemPromptOverride: systemPromptOverride.trim() || null,
+          resume,
+        }),
+      });
+      const d = await res.json();
+      if (!d.ok) {
+        setErr(d.error || "Scan failed");
+      } else if (d.progress) {
+        setProgress(d.progress);
+      }
+    } catch (e) { setErr(e.message); }
+    setScanning(false);
+  };
+
+  const clearProgress = async () => {
+    if (!confirm("Clear the saved progress? This doesn't delete any tasks already created, just resets the status display.")) return;
+    try {
+      await fetch("/api/linkedin-posts", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "clear_progress", campaignAirtableId: campaign.airtableId }),
+      });
+      setProgress(null);
+    } catch (e) { setErr(e.message); }
+  };
+
+  const testProfile = async (leadId) => {
+    setErr("");
+    try {
+      const res = await fetch("/api/linkedin-posts", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "test_profile", baseId, leadId }),
+      });
+      const d = await res.json();
+      if (!d.ok) { alert("❌ " + (d.error || "Test failed")); return; }
+      const postsData = d.posts?.posts || [];
+      alert(`✅ URN: ${d.urn}${d.cached ? " (cached)" : ""}\n\nFound ${postsData.length} post(s) in last 7 days:\n\n${postsData.slice(0, 3).map(p => "• " + (p.text || "").slice(0, 120)).join("\n\n")}`);
+    } catch (e) { alert("❌ " + e.message); }
+  };
+
+  const isRunning = scanning || (progress?.status === "running");
+  const isResumable = progress && progress.status === "running" && progress.leads_remaining > 0 && !scanning;
+
+  return (
+    <div>
+      <div className="ph">
+        <div>
+          <div className="pt">📝 LinkedIn Posts Scanner</div>
+          <div className="pd">Fetch recent posts from leads → AI-score for relevance → create tasks for the winners</div>
+        </div>
+      </div>
+
+      {/* ── CONFIG ── */}
+      <div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginBottom:16}}>
+        <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:14}}>⚙️ Scan Configuration</div>
+
+        {/* Lead selection mode */}
+        <div className="ig">
+          <div className="il">Leads to Scan</div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
+            <div onClick={()=>setSelectMode("all")} style={{padding:12,border:"1px solid "+(selectMode==="all"?"var(--acc)":"var(--bdr)"),background:selectMode==="all"?"var(--acc-d)":"var(--card)",borderRadius:6,cursor:"pointer"}}>
+              <div style={{fontSize:11,fontWeight:600,color:selectMode==="all"?"var(--acc)":"var(--t1)"}}>🌐 All campaign leads</div>
+              <div style={{fontSize:10,color:"var(--t3)",marginTop:3}}>{linkedinLeads.length} leads with LinkedIn URL · out of {(leads||[]).length} total</div>
+            </div>
+            <div onClick={()=>setSelectMode("specific")} style={{padding:12,border:"1px solid "+(selectMode==="specific"?"var(--acc)":"var(--bdr)"),background:selectMode==="specific"?"var(--acc-d)":"var(--card)",borderRadius:6,cursor:"pointer"}}>
+              <div style={{fontSize:11,fontWeight:600,color:selectMode==="specific"?"var(--acc)":"var(--t1)"}}>🎯 Selected leads only</div>
+              <div style={{fontSize:10,color:"var(--t3)",marginTop:3}}>{selectedLeadIds.size} lead{selectedLeadIds.size!==1?"s":""} selected</div>
+            </div>
+          </div>
+
+          {selectMode==="specific" && (
+            <div style={{border:"1px solid var(--bdr)",borderRadius:6,overflow:"hidden"}}>
+              <div style={{padding:"8px 10px",background:"var(--hover)",display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+                <input type="text" placeholder="Search leads by name, company, title..." value={searchLeads} onChange={e=>setSearchLeads(e.target.value)} style={{flex:1,padding:"4px 8px",fontSize:11,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:4,color:"var(--t1)"}}/>
+                <button className="btn btn-s" onClick={selectAll} style={{fontSize:10}}>Select all visible</button>
+                <button className="btn btn-s" onClick={selectNone} style={{fontSize:10}}>Clear</button>
+              </div>
+              <div style={{maxHeight:260,overflowY:"auto"}}>
+                {visibleLeads.length === 0 && <div style={{padding:20,textAlign:"center",fontSize:11,color:"var(--t3)"}}>No leads match your search.</div>}
+                {visibleLeads.slice(0, 200).map(l => {
+                  const f = l.fields || {};
+                  const sel = selectedLeadIds.has(l.id);
+                  return (
+                    <div key={l.id} onClick={()=>toggleLead(l.id)} style={{padding:"8px 10px",display:"flex",alignItems:"center",gap:10,borderTop:"1px solid var(--bdr)",cursor:"pointer",background:sel?"var(--acc-d)":"transparent"}}>
+                      <input type="checkbox" checked={sel} onChange={()=>{}} onClick={e=>e.stopPropagation()} style={{margin:0}}/>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:11,fontWeight:500,color:"var(--t1)"}}>{f.Name||"(no name)"}</div>
+                        <div style={{fontSize:9,color:"var(--t3)",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{f.Title||""} {f.Company?"@ "+f.Company:""}</div>
+                      </div>
+                      <button className="btn btn-s" onClick={e=>{e.stopPropagation();testProfile(l.id);}} style={{fontSize:9,padding:"2px 6px"}} title="Test fetch (no scoring, no tasks)">🧪</button>
+                    </div>
+                  );
+                })}
+                {visibleLeads.length > 200 && <div style={{padding:10,textAlign:"center",fontSize:10,color:"var(--t3)",borderTop:"1px solid var(--bdr)"}}>Showing first 200 of {visibleLeads.length}. Use search to narrow down.</div>}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Config grid */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12,marginTop:12}}>
+          <div className="ig" style={{marginBottom:0}}>
+            <div className="il">Score Threshold</div>
+            <input type="number" min="0" max="100" className="inp" value={scoreThreshold} onChange={e=>setScoreThreshold(parseInt(e.target.value)||70)}/>
+            <div style={{fontSize:9,color:"var(--t3)",marginTop:3}}>Posts scoring below this become tasks. Default 70 (strict). Lower to 50 for more coverage, but expect more false positives.</div>
+          </div>
+          <div className="ig" style={{marginBottom:0}}>
+            <div className="il">Days Back</div>
+            <input type="number" min="1" max="30" className="inp" value={daysBack} onChange={e=>setDaysBack(parseInt(e.target.value)||7)}/>
+            <div style={{fontSize:9,color:"var(--t3)",marginTop:3}}>Posts older than this are filtered out. Default 7.</div>
+          </div>
+          <div className="ig" style={{marginBottom:0}}>
+            <div className="il">Task Rule Name</div>
+            <input type="text" className="inp" value={taskRuleName} onChange={e=>setTaskRuleName(e.target.value)}/>
+            <div style={{fontSize:9,color:"var(--t3)",marginTop:3}}>Appears in the Task Rule column of Tasks tab.</div>
+          </div>
+        </div>
+
+        {/* Prompt editor (collapsible) */}
+        <div style={{marginTop:14,padding:12,background:"var(--hover)",borderRadius:6}}>
+          <div onClick={()=>setShowPromptEditor(!showPromptEditor)} style={{cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div style={{fontSize:11,fontWeight:600,color:"var(--t1)"}}>🧠 Custom Scoring Prompt {systemPromptOverride.trim() ? <span style={{color:"var(--grn)",fontWeight:400,fontSize:10,marginLeft:6}}>· custom prompt set</span> : <span style={{color:"var(--t3)",fontWeight:400,fontSize:10,marginLeft:6}}>· using default</span>}</div>
+            <span style={{fontSize:11,color:"var(--t3)"}}>{showPromptEditor?"▲":"▼"}</span>
+          </div>
+          {showPromptEditor && (
+            <div style={{marginTop:10}}>
+              <div style={{fontSize:10,color:"var(--t2)",marginBottom:8,lineHeight:1.5}}>
+                <strong>Output schema (required JSON, enforced by OpenAI response_format):</strong>
+                <pre style={{fontSize:9,background:"var(--card)",padding:8,borderRadius:4,marginTop:6,overflow:"auto"}}>{`{
+  "post_type": "holiday" | "anniversary" | "birthday" | "award" | "gratitude" |
+               "condolence" | "hiring" | "farewell" | "self_promo" |
+               "content_promo" | "motivational" | "reshare" |
+               "thought_leadership" | "industry_news" | "event_announcement" |
+               "pain_point" | "project_announcement" | "question_to_network" |
+               "personal" | "other",
+  "relevance_score": integer 1-100,
+  "evidence_quote": string <=25 words — EXACT sentence from post that justifies
+                    the score. If no specific evidence, return "NO_SPECIFIC_EVIDENCE"
+                    and score must be <=25.
+  "relevance_rationale": string <=40 words, referencing what in our offering
+                         the post connects (or fails to connect) to.
+  "structured_sentence": "{name}, {title} at {company} posted about {summary <=15 words}",
+  "suggested_comment": string <=20 words, starts with 'You could comment' or 'You could highlight'
+}`}</pre>
+                <div style={{marginTop:8,color:"var(--amb)"}}>⚠️ Backend sanity checks: if evidence is "NO_SPECIFIC_EVIDENCE" → score capped at 25. If post_type is holiday/anniversary/birthday/award → cap at 5-25. If rationale doesn't reference words from evidence → cap at 50.</div>
+                <div style={{marginTop:8}}>Leave blank to use the default strict prompt built from this campaign's Email Reference / ICP. The default includes a 5-band rubric (IRRELEVANT / TANGENTIAL / ADJACENT / INTEREST SIGNAL / STRONG BUYING SIGNAL) with anchor examples.</div>
+              </div>
+              <textarea className="inp" rows="10" placeholder="Leave blank for default strict prompt. If writing custom, must return all 6 JSON fields above or sanity checks will cap your scores." value={systemPromptOverride} onChange={e=>setSystemPromptOverride(e.target.value)} style={{fontSize:11,fontFamily:"'JetBrains Mono',monospace",lineHeight:1.5}}/>
+            </div>
+          )}
+        </div>
+
+        {/* Action buttons */}
+        <div style={{display:"flex",gap:8,marginTop:16,flexWrap:"wrap"}}>
+          <button className="btn btn-p" onClick={()=>startScan(false)} disabled={isRunning}>
+            {isRunning ? "⏳ Scanning..." : `🚀 Start Scan`}
+          </button>
+          {isResumable && (
+            <button className="btn btn-s" onClick={()=>startScan(true)} disabled={scanning} style={{background:"rgba(245,158,11,.1)",color:"var(--amb)",borderColor:"var(--amb)"}}>
+              ↺ Resume ({progress.leads_remaining} leads left)
+            </button>
+          )}
+          {progress && <button className="btn btn-s" onClick={clearProgress} disabled={scanning}>🗑 Clear State</button>}
+        </div>
+
+        {err && <div style={{marginTop:12,padding:10,background:"var(--red-d)",color:"var(--red)",borderRadius:6,fontSize:11}}>❌ {err}</div>}
+      </div>
+
+      {/* ── PROGRESS PANEL ── */}
+      {progress && (
+        <div style={{padding:20,background:"var(--card)",border:"1px solid "+(progress.status==="complete"?"var(--grn)":progress.status==="running"?"var(--blu)":"var(--bdr)"),borderRadius:10,marginBottom:16}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12}}>
+            <div>
+              <div style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>
+                {progress.status==="complete" ? "✅ Scan Complete" : progress.status==="running" ? "⏳ Scan Running" : "🔄 Scan Status"}
+                {progress.campaign && <span style={{color:"var(--t3)",fontWeight:400,marginLeft:8}}>· {progress.campaign}</span>}
+              </div>
+              {progress.started_at && <div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>Started: {new Date(progress.started_at).toLocaleString()}{progress.ended_at?" · Ended: "+new Date(progress.ended_at).toLocaleString():""}</div>}
+            </div>
+            {isRunning && <div style={{fontSize:10,color:"var(--blu)",fontWeight:500}}>● polling every 2s</div>}
+          </div>
+
+          {/* Progress bar */}
+          {progress.total_leads > 0 && (
+            <div style={{marginBottom:12}}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:4,fontSize:10,color:"var(--t2)"}}>
+                <span><strong style={{color:"var(--t1)"}}>{progress.leads_done}</strong> / {progress.total_leads} leads processed</span>
+                <span>{Math.round((progress.leads_done/progress.total_leads)*100)}%</span>
+              </div>
+              <div style={{height:8,background:"var(--hover)",borderRadius:4,overflow:"hidden"}}>
+                <div style={{height:"100%",background:progress.status==="complete"?"var(--grn)":"var(--blu)",width:`${Math.round((progress.leads_done/progress.total_leads)*100)}%`,transition:"width .3s"}}/>
+              </div>
+            </div>
+          )}
+
+          {/* Current step + log */}
+          {progress.last_log && (
+            <div style={{padding:10,background:"var(--hover)",borderRadius:6,fontSize:10,color:"var(--t2)",marginBottom:12,fontFamily:"'JetBrains Mono',monospace",lineHeight:1.6}}>
+              {progress.last_log}
+              {progress.current_lead_step && <span style={{color:"var(--blu)",marginLeft:6}}>[{progress.current_lead_step}]</span>}
+            </div>
+          )}
+
+          {/* Stats grid */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill, minmax(140px, 1fr))",gap:8,marginBottom:12}}>
+            <div style={{padding:10,background:"var(--hover)",borderRadius:6}}>
+              <div style={{fontSize:9,color:"var(--t3)",marginBottom:2}}>POSTS FETCHED</div>
+              <div style={{fontSize:18,fontWeight:600,color:"var(--t1)"}}>{progress.posts_fetched || 0}</div>
+            </div>
+            <div style={{padding:10,background:"var(--hover)",borderRadius:6}}>
+              <div style={{fontSize:9,color:"var(--t3)",marginBottom:2}}>FILTERED OUT (junk)</div>
+              <div style={{fontSize:18,fontWeight:600,color:"var(--amb)"}}>{progress.posts_filtered_out || 0}</div>
+            </div>
+            <div style={{padding:10,background:"var(--hover)",borderRadius:6}}>
+              <div style={{fontSize:9,color:"var(--t3)",marginBottom:2}}>AI-SCORED</div>
+              <div style={{fontSize:18,fontWeight:600,color:"var(--blu)"}}>{progress.posts_scored || 0}</div>
+            </div>
+            <div style={{padding:10,background:"var(--hover)",borderRadius:6}}>
+              <div style={{fontSize:9,color:"var(--t3)",marginBottom:2}}>TASKS CREATED</div>
+              <div style={{fontSize:18,fontWeight:600,color:"var(--grn)"}}>{progress.tasks_created || 0}</div>
+            </div>
+          </div>
+
+          {/* Category breakdown */}
+          {progress.category_counts && Object.keys(progress.category_counts).length > 0 && (
+            <div style={{marginBottom:12}}>
+              <div style={{fontSize:10,color:"var(--t3)",marginBottom:6,fontWeight:500}}>Posts by pre-filter category:</div>
+              <div style={{display:"flex",flexWrap:"wrap",gap:6,fontSize:10}}>
+                {Object.entries(progress.category_counts).sort((a,b)=>b[1]-a[1]).map(([cat,n])=>{
+                  const meta = {
+                    genuine_content: { emoji: "✨", color: "var(--grn)" },
+                    event_promo: { emoji: "📅", color: "var(--amb)" },
+                    engagement_bait: { emoji: "🎣", color: "var(--amb)" },
+                    thin_content: { emoji: "📏", color: "var(--t3)" },
+                    short_content: { emoji: "📝", color: "var(--t3)" },
+                    self_promo: { emoji: "🎉", color: "var(--t3)" },
+                    farewell: { emoji: "👋", color: "var(--t3)" },
+                    linkedin_spam: { emoji: "🏆", color: "var(--t3)" },
+                    hiring: { emoji: "💼", color: "var(--t3)" },
+                    holiday: { emoji: "🎄", color: "var(--t3)" },
+                    anniversary: { emoji: "🎂", color: "var(--t3)" },
+                    birthday: { emoji: "🎈", color: "var(--t3)" },
+                    condolence: { emoji: "🕊", color: "var(--t3)" },
+                    award: { emoji: "🏅", color: "var(--t3)" },
+                    gratitude: { emoji: "🙏", color: "var(--t3)" },
+                    content_promo: { emoji: "📚", color: "var(--t3)" },
+                    motivational: { emoji: "💪", color: "var(--t3)" },
+                    reshare_minimal: { emoji: "🔁", color: "var(--t3)" },
+                    funding_announcement: { emoji: "💰", color: "var(--t3)" },
+                    unknown: { emoji: "❓", color: "var(--t3)" },
+                  }[cat] || { emoji: "•", color: "var(--t3)" };
+                  return <span key={cat} style={{padding:"3px 8px",background:"var(--hover)",borderRadius:3,color:meta.color}}>{meta.emoji} {cat.replace(/_/g," ")}: <strong>{n}</strong></span>;
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Rejection reasons — shows WHY posts didn't become tasks */}
+          {progress.rejection_reasons && Object.keys(progress.rejection_reasons).length > 0 && (
+            <div style={{marginBottom:12}}>
+              <div style={{fontSize:10,color:"var(--t3)",marginBottom:6,fontWeight:500}}>Scoring outcomes (after AI + sanity checks):</div>
+              <div style={{display:"flex",flexWrap:"wrap",gap:6,fontSize:10}}>
+                {Object.entries(progress.rejection_reasons).sort((a,b)=>b[1]-a[1]).map(([reason,n])=>{
+                  const isPassed = reason === "passed";
+                  const isCapped = reason.includes("capped");
+                  const color = isPassed ? "var(--grn)" : isCapped ? "var(--amb)" : "var(--t3)";
+                  const emoji = isPassed ? "✅" : isCapped ? "⚠️" : "⬇";
+                  return <span key={reason} style={{padding:"3px 8px",background:"var(--hover)",borderRadius:3,color}} title={reason}>{emoji} {reason.replace(/_/g," ").slice(0,50)}: <strong>{n}</strong></span>;
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Errors (collapsed) */}
+          {progress.errors?.length > 0 && (
+            <details style={{marginTop:10}}>
+              <summary style={{cursor:"pointer",fontSize:10,color:"var(--red)"}}>⚠️ {progress.errors.length} error{progress.errors.length!==1?"s":""} during scan (click to view)</summary>
+              <div style={{padding:10,background:"var(--red-d)",borderRadius:6,fontSize:10,color:"var(--red)",marginTop:6,maxHeight:180,overflowY:"auto",fontFamily:"'JetBrains Mono',monospace",lineHeight:1.5}}>
+                {progress.errors.slice(0, 50).map((e, i) => <div key={i}>• {e}</div>)}
+                {progress.errors.length > 50 && <div style={{color:"var(--t3)",marginTop:6}}>... and {progress.errors.length - 50} more</div>}
+              </div>
+            </details>
+          )}
+        </div>
+      )}
+
+      {/* ── INFO PANEL ── */}
+      <div style={{padding:16,background:"var(--hover)",borderRadius:8,fontSize:10,color:"var(--t2)",lineHeight:1.6}}>
+        <div style={{fontSize:11,fontWeight:600,color:"var(--t1)",marginBottom:6}}>How it works</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+          <div>
+            <div style={{color:"var(--t1)",fontWeight:500,marginBottom:4}}>1. Fetch</div>
+            Hits Fresh LinkedIn Scraper (RapidAPI) per lead. Caches URN on the Lead record so repeat scans don't re-fetch profile. Only returns posts from the last {daysBack} days.
+          </div>
+          <div>
+            <div style={{color:"var(--t1)",fontWeight:500,marginBottom:4}}>2. Pre-filter</div>
+            Before hitting OpenAI, posts are classified by keyword rules (hiring, farewell, course completion spam, etc.). Junk categories are skipped — no AI cost spent on them.
+          </div>
+          <div>
+            <div style={{color:"var(--t1)",fontWeight:500,marginBottom:4}}>3. Score</div>
+            Remaining posts go to gpt-5.4-mini with a sales-relevance prompt. Returns score 1-100, rationale, a neutral one-line summary, and a suggested non-salesy comment.
+          </div>
+          <div>
+            <div style={{color:"var(--t1)",fontWeight:500,marginBottom:4}}>4. Create tasks</div>
+            Score is adjusted down based on category (event_promo -15, thin_content -35, etc.). If final score ≥ threshold, a task is created with the suggested comment ready to copy.
+          </div>
+        </div>
+        <div style={{marginTop:10,paddingTop:10,borderTop:"1px solid var(--bdr)"}}>
+          <strong style={{color:"var(--t1)"}}>Resumable:</strong> progress is saved to Airtable after every lead. If the function times out or crashes mid-scan, hit <em>Resume</em> to continue from where it stopped. No duplicate work, no lost data.
+        </div>
+      </div>
     </div>
   );
 }
