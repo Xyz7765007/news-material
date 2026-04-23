@@ -632,7 +632,12 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       setTimeout(() => setHsMsg(""), 20000);
 
       // Refresh tasks so UI reflects the new HubSpot Task IDs
-      if (d.airtableSynced > 0) { try { await loadTasks(); } catch {} }
+      if (d.airtableSynced > 0) {
+        try {
+          const refreshed = await at("list", "Tasks", {}, bid);
+          if (refreshed?.records) setTasks(refreshed.records.sort((a, b) => ((b.fields?.Created || "") > (a.fields?.Created || "") ? 1 : -1)));
+        } catch {}
+      }
     } catch (e) { setHsMsg("❌ " + e.message); } setHsLoading(false);
   };
   const pushLeadsToHS = async (leadsToPush, config) => {
@@ -721,7 +726,13 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         const icon = d.airtableSynced > 0 ? "✅" : (d.unmatched > 0 || d.ambiguous > 0 ? "⚠️" : "ℹ️");
         setBackfillMsg(`${icon} ${parts.join(" · ")}\n\nRun ID: ${d.runId} — search Vercel logs by [backfill:${d.runId}]`);
       }
-      await loadTasks();
+      // Refresh tasks so the newly-populated "HubSpot Task ID" column shows up
+      try {
+        const refreshed = await at("list", "Tasks", {}, bid);
+        if (refreshed?.records) {
+          setTasks(refreshed.records.sort((a, b) => ((b.fields?.Created || "") > (a.fields?.Created || "") ? 1 : -1)));
+        }
+      } catch (e) { console.warn("Task refresh failed:", e.message); }
     } catch (e) {
       setBackfillMsg("❌ " + e.message);
     }
