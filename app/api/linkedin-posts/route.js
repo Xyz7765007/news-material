@@ -63,42 +63,51 @@ async function atUpdate(baseId, table, id, fields) {
 async function atCreateBatch(baseId, table, records) {
   const results = [];
   const errors = [];
-  for (let i = 0; i < records.length; i += 10) {
-    const batch = records.slice(i, i + 10);
+
+  // Iteratively strip unknown fields and retry. Airtable only tells us ONE bad field per error,
+  // so if your schema is missing 3 fields, we need 3 retries. Max 10 to avoid infinite loops.
+  async function tryBatchWithStripping(batch, strippedFields = []) {
+    if (strippedFields.length > 10) {
+      return { ok: false, error: `Gave up after stripping 10 fields: ${strippedFields.join(", ")}` };
+    }
     const r = await fetch(`${AT_API}/${baseId}/${encodeURIComponent(table)}`, {
       method: "POST", headers: atHdr, body: JSON.stringify({ records: batch, typecast: true }),
     });
-    if (r.ok) { const d = await r.json(); results.push(...(d.records || [])); }
-    else {
-      const errText = await r.text().then(t => t.slice(0, 500));
-      console.error(`[linkedin-posts] Task create failed: ${r.status} to base=${baseId} table=${table}`, errText);
-      errors.push(`${r.status}: ${errText}`);
-
-      // If Airtable says a field is unknown, try stripping offending fields one at a time
-      // and re-attempting. This catches schema mismatches between environments.
-      if (errText.includes("UNKNOWN_FIELD_NAME") || errText.includes("INVALID_VALUE_FOR_COLUMN") || errText.includes("TABLE_NOT_FOUND")) {
-        const m = errText.match(/[Uu]nknown field name:?\s*\\?"([^"\\]+)\\?"/) || errText.match(/Field\s+\\?"([^"\\]+)\\?"/);
-        const badField = m ? m[1] : null;
-        if (badField) {
-          console.warn(`[linkedin-posts] Retrying batch without bad field: "${badField}"`);
-          const stripped = batch.map(rec => {
-            const f = { ...rec.fields };
-            delete f[badField];
-            return { ...rec, fields: f };
-          });
-          const retry = await fetch(`${AT_API}/${baseId}/${encodeURIComponent(table)}`, {
-            method: "POST", headers: atHdr, body: JSON.stringify({ records: stripped, typecast: true }),
-          });
-          if (retry.ok) {
-            const d = await retry.json();
-            results.push(...(d.records || []));
-            errors.pop(); // recovered, remove the error
-          } else {
-            const retryText = await retry.text().then(t => t.slice(0, 500));
-            console.error(`[linkedin-posts] Retry also failed: ${retry.status}`, retryText);
-          }
-        }
+    if (r.ok) {
+      const d = await r.json();
+      return { ok: true, records: d.records || [], strippedFields };
+    }
+    const errText = await r.text().then(t => t.slice(0, 500));
+    // Match Airtable's error shape for unknown fields
+    if (errText.includes("UNKNOWN_FIELD_NAME") || errText.includes("INVALID_VALUE_FOR_COLUMN")) {
+      const m = errText.match(/[Uu]nknown field name:?\s*\\?"([^"\\]+)\\?"/)
+        || errText.match(/Field\s+\\?"([^"\\]+)\\?"/)
+        || errText.match(/"([^"]+)"\s+(?:does not exist|is not a valid column)/);
+      const badField = m ? m[1] : null;
+      if (badField) {
+        console.warn(`[linkedin-posts] Stripping bad field "${badField}" from Tasks batch (attempt ${strippedFields.length + 1})`);
+        const stripped = batch.map(rec => {
+          const f = { ...rec.fields };
+          delete f[badField];
+          return { ...rec, fields: f };
+        });
+        return tryBatchWithStripping(stripped, [...strippedFields, badField]);
       }
+    }
+    return { ok: false, error: `${r.status}: ${errText}`, strippedFields };
+  }
+
+  for (let i = 0; i < records.length; i += 10) {
+    const batch = records.slice(i, i + 10);
+    const result = await tryBatchWithStripping(batch);
+    if (result.ok) {
+      results.push(...result.records);
+      if (result.strippedFields.length > 0) {
+        console.log(`[linkedin-posts] Batch succeeded after stripping: ${result.strippedFields.join(", ")}`);
+      }
+    } else {
+      console.error(`[linkedin-posts] Task batch failed permanently:`, result.error);
+      errors.push(result.error);
     }
   }
   return { results, errors };
@@ -268,20 +277,45 @@ async function getUrnForLead(lead, baseId) {
 }
 
 // Fetch posts for a URN. Paginates until we hit a post older than cutoff, collect N recent posts,
-// OR we exhaust pages. maxPosts caps how many we keep (default 2 — the two most recent posts within
-// the window; anything more is diminishing returns for engagement workflows).
+// OR we exhaust pages. maxPosts caps how many we keep.
+//
+// CRITICAL behavior: we trust the API's newest-first ordering. LinkedIn post APIs return posts
+// in reverse chronological order. So even without a timestamp, the FIRST N posts are "probably recent".
+// We use best-effort timestamp parsing to enforce a date cutoff, but accept undatable posts if they're
+// among the first few in the response (assumed newest).
 async function fetchPostsForUrn(urn, cutoffMs, maxPages = 3, maxPosts = 2) {
   const all = [];
   let reachedCutoff = false;
   let reachedMaxPosts = false;
   let undatableCount = 0;
   let rawReturnedCount = 0;
+  let loggedSample = false;
 
   for (let page = 1; page <= maxPages && !reachedCutoff && !reachedMaxPosts; page++) {
     const r = await rapidCall("/api/v1/user/posts", { urn, page: String(page) });
     if (!r.ok) {
       return { ok: false, error: `Posts fetch page ${page} failed (${r.status}): ${r.error}`, posts: all, undatableCount, rawReturnedCount };
     }
+
+    // Log the raw response structure ONCE per fetch so we can debug API shape changes
+    if (!loggedSample && page === 1) {
+      loggedSample = true;
+      const sampleShape = {
+        top_keys: Object.keys(r.data || {}).slice(0, 10),
+        data_keys: r.data?.data ? Object.keys(r.data.data).slice(0, 10) : null,
+        first_post_keys: null,
+      };
+      const firstPost = r.data?.data?.posts?.[0]
+        || (Array.isArray(r.data?.data) ? r.data.data[0] : null)
+        || r.data?.posts?.[0]
+        || (Array.isArray(r.data) ? r.data[0] : null);
+      if (firstPost && typeof firstPost === "object") {
+        sampleShape.first_post_keys = Object.keys(firstPost).slice(0, 30);
+        sampleShape.first_post_preview = JSON.stringify(firstPost).slice(0, 500);
+      }
+      console.log(`[linkedin-posts] RapidAPI response shape for URN ${urn}:`, JSON.stringify(sampleShape));
+    }
+
     const posts = r.data?.data?.posts
       || (Array.isArray(r.data?.data) ? r.data.data : null)
       || r.data?.posts
@@ -290,7 +324,8 @@ async function fetchPostsForUrn(urn, cutoffMs, maxPages = 3, maxPosts = 2) {
     if (!Array.isArray(posts) || posts.length === 0) break;
     rawReturnedCount += posts.length;
 
-    for (const p of posts) {
+    for (let idx = 0; idx < posts.length; idx++) {
+      const p = posts[idx];
       // Extract post timestamp — field names vary across API responses.
       let ts = null;
       const candidates = [
@@ -298,44 +333,60 @@ async function fetchPostsForUrn(urn, cutoffMs, maxPages = 3, maxPosts = 2) {
         p.publishedAt, p.date, p.timestamp, p.created_at,
         p.posted_date, p.time, p.createdAt,
         p.posted_at?.timestamp, p.posted_at?.date,
+        p.time_info?.timestamp, p.time_info?.posted_at,
+        p.metadata?.posted_at, p.metadata?.timestamp,
       ];
       for (const c of candidates) {
         if (!c) continue;
         if (typeof c === "number") { ts = c < 1e12 ? c * 1000 : c; break; }
-        if (typeof c === "object") continue; // not a primitive
+        if (typeof c === "object") continue;
         const parsed = new Date(c).getTime();
         if (!isNaN(parsed) && parsed > 1262304000000) { ts = parsed; break; }
       }
       // Fallback: extract from activity URL (LinkedIn embeds unix ms in the ID)
       if (!ts) ts = timestampFromActivityUrl(p.post_url || p.url || p.share_url || p.activity_url || "");
 
-      // CRITICAL: If we couldn't determine a timestamp, REJECT the post.
-      // Letting undatable posts through means months-old content sneaks past the 7-day filter.
-      // Better to drop a legitimate recent post than to flood the scan with stale ones.
+      // Extract text up-front so we can decide what to do with undatable posts
+      const textSource = p.text || p.post_text || p.content || p.commentary || p.description || "";
+      const text = (typeof textSource === "string" ? textSource : String(textSource || "")).trim();
+
       if (!ts) {
-        // Log first few so user can see what's happening
-        if (undatableCount < 3) {
-          console.warn(`[linkedin-posts] Post rejected: no parseable timestamp.`, {
-            keys: Object.keys(p).slice(0, 20),
-            sample: JSON.stringify(p).slice(0, 300),
-          });
-        }
         undatableCount++;
+        // If this is one of the first 3 posts in the response AND it has text, accept it.
+        // Posts are newest-first, so first 3 are almost certainly within the 7-day window.
+        // This is a pragmatic fallback — better than rejecting every post when API schema changes.
+        if (idx < 3 && text) {
+          // Log the rejected-schema for debugging, just once
+          if (undatableCount <= 2) {
+            console.warn(`[linkedin-posts] Accepting undatable post (idx=${idx}, assumed recent):`, {
+              keys: Object.keys(p).slice(0, 20),
+              text_preview: text.slice(0, 100),
+            });
+          }
+          all.push({
+            text,
+            date: new Date().toISOString(), // best guess: now
+            url: p.post_url || p.url || p.share_url || "",
+            urn: p.urn || p.post_urn || p.activity_urn || "",
+            likes: p.total_reactions || p.likes_count || p.likes || 0,
+            comments: p.comments_count || p.comments || 0,
+            reposts: p.reposts_count || p.reposts || 0,
+            is_repost: !!(p.reshared || p.is_repost || p.reposted_post),
+            _undated: true, // flag so we know this one's date is a guess
+          });
+          if (all.length >= maxPosts) { reachedMaxPosts = true; break; }
+        }
+        // If it's deeper in the response, skip — likely old content
         continue;
       }
 
       // Hard 7-day filter — skip anything older
       if (ts < cutoffMs) {
-        // Posts are returned newest-first by LinkedIn API, so once we hit an old one,
-        // subsequent posts will also be older. Stop paginating to save API calls.
         reachedCutoff = true;
         continue;
       }
 
-      // Skip posts without text (reshares without commentary, video-only, etc.)
-      // RapidAPI sometimes returns nested objects here — guard with String() coercion.
-      const textSource = p.text || p.post_text || p.content || p.commentary || p.description || "";
-      const text = (typeof textSource === "string" ? textSource : String(textSource || "")).trim();
+      // Skip posts without text
       if (!text) continue;
 
       all.push({
@@ -349,7 +400,6 @@ async function fetchPostsForUrn(urn, cutoffMs, maxPages = 3, maxPosts = 2) {
         is_repost: !!(p.reshared || p.is_repost || p.reposted_post),
       });
 
-      // Stop collecting once we hit the max. Posts are newest-first so these are the freshest.
       if (all.length >= maxPosts) { reachedMaxPosts = true; break; }
     }
 
@@ -1210,11 +1260,11 @@ async function runLinkedInPostScan({
 
         return {
           fields: {
+            Name: leadName,                          // Primary field in user's Tasks table
             Company: leadCompany,
             "Task Rule": taskRuleName,
             Score: sp.adjusted_score,
             "Scan Target": leadName,
-            "Lead Name": leadName,
             "Lead Title": f.Title || "",
             Email: f.Email || "",
             "LinkedIn URL": f["LinkedIn URL"] || f["Linkedin URL"] || "",
@@ -1339,7 +1389,7 @@ export async function POST(request) {
         const rule = (taskRuleName || "LinkedIn Post Engagement").replace(/"/g, '\\"');
         const formula = `AND({Task Rule} = "${rule}", IS_BEFORE({Created}, "${cutoffISO}"))`;
         try {
-          const stale = await atList(baseId, "Tasks", { filterByFormula: formula, fields: ["Lead Name", "Company", "Score", "Created", "HubSpot Task ID"] });
+          const stale = await atList(baseId, "Tasks", { filterByFormula: formula, fields: ["Name", "Company", "Score", "Created", "HubSpot Task ID"] });
           const pushedCount = stale.filter(r => r.fields?.["HubSpot Task ID"]).length;
           return NextResponse.json({
             ok: true,
@@ -1350,7 +1400,7 @@ export async function POST(request) {
             days,
             sample: stale.slice(0, 10).map(r => ({
               id: r.id,
-              lead: r.fields?.["Lead Name"] || "",
+              lead: r.fields?.["Name"] || r.fields?.["Lead Name"] || "",
               company: r.fields?.Company || "",
               score: r.fields?.Score,
               created: r.fields?.Created,
