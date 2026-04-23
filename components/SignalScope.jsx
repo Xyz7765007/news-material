@@ -3518,7 +3518,8 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
 // ═══════════════════════════════════════════════════════════════
 function LinkedInPostsTab({ baseId, campaign, leads }) {
   const [selectedLeadIds, setSelectedLeadIds] = useState(new Set());
-  const [selectMode, setSelectMode] = useState("all"); // "all" | "specific"
+  const [selectedCompanies, setSelectedCompanies] = useState(new Set());
+  const [selectMode, setSelectMode] = useState("all"); // "all" | "specific" | "by_company"
   const [scoreThreshold, setScoreThreshold] = useState(70);
   const [daysBack, setDaysBack] = useState(7);
   const [taskRuleName, setTaskRuleName] = useState("LinkedIn Post Engagement");
@@ -3585,11 +3586,53 @@ function LinkedInPostsTab({ baseId, campaign, leads }) {
   const selectAll = () => setSelectedLeadIds(new Set(visibleLeads.map(l => l.id)));
   const selectNone = () => setSelectedLeadIds(new Set());
 
+  // Company grouping — for "by company" selection mode.
+  // Material has 54 accounts with multiple leads each; scanning by account is the natural workflow.
+  const leadsByCompany = linkedinLeads.reduce((acc, l) => {
+    const company = (l.fields?.Company || "— no company —").trim();
+    if (!acc[company]) acc[company] = [];
+    acc[company].push(l);
+    return acc;
+  }, {});
+  const companyList = Object.entries(leadsByCompany)
+    .map(([company, leads]) => ({ company, count: leads.length, leadIds: leads.map(l => l.id) }))
+    .sort((a, b) => a.company.localeCompare(b.company));
+  const visibleCompanies = searchLeads
+    ? companyList.filter(c => c.company.toLowerCase().includes(searchLeads.toLowerCase()))
+    : companyList;
+
+  const toggleCompany = (company) => {
+    setSelectedCompanies(prev => {
+      const n = new Set(prev);
+      if (n.has(company)) n.delete(company); else n.add(company);
+      return n;
+    });
+  };
+  const selectAllCompanies = () => setSelectedCompanies(new Set(visibleCompanies.map(c => c.company)));
+  const selectNoCompanies = () => setSelectedCompanies(new Set());
+
+  // Resolve selected companies to the underlying lead IDs for backend
+  const leadIdsFromSelectedCompanies = () => {
+    const ids = [];
+    for (const c of companyList) {
+      if (selectedCompanies.has(c.company)) ids.push(...c.leadIds);
+    }
+    return ids;
+  };
+
   const startScan = async (resume = false) => {
     setErr("");
     if (!campaign?.airtableId) { setErr("Campaign not configured — can't persist progress"); return; }
-    const leadIds = selectMode === "specific" ? Array.from(selectedLeadIds) : null;
-    if (selectMode === "specific" && leadIds.length === 0) { setErr("Select at least one lead or switch to 'all leads'"); return; }
+
+    // Resolve leadIds based on selection mode
+    let leadIds = null;
+    if (selectMode === "specific") {
+      leadIds = Array.from(selectedLeadIds);
+      if (leadIds.length === 0) { setErr("Select at least one lead or switch to 'all leads'"); return; }
+    } else if (selectMode === "by_company") {
+      leadIds = leadIdsFromSelectedCompanies();
+      if (leadIds.length === 0) { setErr("Select at least one company or switch to 'all leads'"); return; }
+    }
 
     setScanning(true);
     try {
@@ -3709,16 +3752,51 @@ function LinkedInPostsTab({ baseId, campaign, leads }) {
         {/* Lead selection mode */}
         <div className="ig">
           <div className="il">Leads to Scan</div>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:10}}>
             <div onClick={()=>setSelectMode("all")} style={{padding:12,border:"1px solid "+(selectMode==="all"?"var(--acc)":"var(--bdr)"),background:selectMode==="all"?"var(--acc-d)":"var(--card)",borderRadius:6,cursor:"pointer"}}>
               <div style={{fontSize:11,fontWeight:600,color:selectMode==="all"?"var(--acc)":"var(--t1)"}}>🌐 All campaign leads</div>
               <div style={{fontSize:10,color:"var(--t3)",marginTop:3}}>{linkedinLeads.length} leads with LinkedIn URL · out of {(leads||[]).length} total</div>
+            </div>
+            <div onClick={()=>setSelectMode("by_company")} style={{padding:12,border:"1px solid "+(selectMode==="by_company"?"var(--acc)":"var(--bdr)"),background:selectMode==="by_company"?"var(--acc-d)":"var(--card)",borderRadius:6,cursor:"pointer"}}>
+              <div style={{fontSize:11,fontWeight:600,color:selectMode==="by_company"?"var(--acc)":"var(--t1)"}}>🏢 By company / account</div>
+              <div style={{fontSize:10,color:"var(--t3)",marginTop:3}}>{selectedCompanies.size} {selectedCompanies.size===1?"company":"companies"} selected · {companyList.length} total accounts</div>
             </div>
             <div onClick={()=>setSelectMode("specific")} style={{padding:12,border:"1px solid "+(selectMode==="specific"?"var(--acc)":"var(--bdr)"),background:selectMode==="specific"?"var(--acc-d)":"var(--card)",borderRadius:6,cursor:"pointer"}}>
               <div style={{fontSize:11,fontWeight:600,color:selectMode==="specific"?"var(--acc)":"var(--t1)"}}>🎯 Selected leads only</div>
               <div style={{fontSize:10,color:"var(--t3)",marginTop:3}}>{selectedLeadIds.size} lead{selectedLeadIds.size!==1?"s":""} selected</div>
             </div>
           </div>
+
+          {selectMode==="by_company" && (
+            <div style={{border:"1px solid var(--bdr)",borderRadius:6,overflow:"hidden"}}>
+              <div style={{padding:"8px 10px",background:"var(--hover)",display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+                <input type="text" placeholder="Search companies..." value={searchLeads} onChange={e=>setSearchLeads(e.target.value)} style={{flex:1,padding:"4px 8px",fontSize:11,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:4,color:"var(--t1)"}}/>
+                <button className="btn btn-s" onClick={selectAllCompanies} style={{fontSize:10}}>Select all visible</button>
+                <button className="btn btn-s" onClick={selectNoCompanies} style={{fontSize:10}}>Clear</button>
+              </div>
+              <div style={{padding:"6px 10px",fontSize:10,color:"var(--t3)",borderBottom:"1px solid var(--bdr)",background:"var(--card)"}}>
+                {selectedCompanies.size > 0 && <>Selected: {selectedCompanies.size} {selectedCompanies.size===1?"account":"accounts"} · <strong style={{color:"var(--t1)"}}>{leadIdsFromSelectedCompanies().length} leads</strong> will be scanned</>}
+                {selectedCompanies.size === 0 && "Tick one or more accounts below"}
+              </div>
+              <div style={{maxHeight:320,overflowY:"auto"}}>
+                {visibleCompanies.length === 0 && <div style={{padding:20,textAlign:"center",fontSize:11,color:"var(--t3)"}}>No companies match your search.</div>}
+                {visibleCompanies.slice(0, 200).map(c => {
+                  const sel = selectedCompanies.has(c.company);
+                  return (
+                    <div key={c.company} onClick={()=>toggleCompany(c.company)} style={{padding:"8px 10px",display:"flex",alignItems:"center",gap:10,borderTop:"1px solid var(--bdr)",cursor:"pointer",background:sel?"var(--acc-d)":"transparent"}}>
+                      <input type="checkbox" checked={sel} onChange={()=>{}} onClick={e=>e.stopPropagation()} style={{margin:0}}/>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:11,fontWeight:500,color:"var(--t1)"}}>{c.company}</div>
+                        <div style={{fontSize:9,color:"var(--t3)"}}>{c.count} lead{c.count!==1?"s":""} with LinkedIn URL</div>
+                      </div>
+                      <span style={{fontSize:10,color:"var(--t3)",fontFamily:"'JetBrains Mono',monospace"}}>{c.count}</span>
+                    </div>
+                  );
+                })}
+                {visibleCompanies.length > 200 && <div style={{padding:10,textAlign:"center",fontSize:10,color:"var(--t3)",borderTop:"1px solid var(--bdr)"}}>Showing first 200 of {visibleCompanies.length}. Use search to narrow.</div>}
+              </div>
+            </div>
+          )}
 
           {selectMode==="specific" && (
             <div style={{border:"1px solid var(--bdr)",borderRadius:6,overflow:"hidden"}}>
