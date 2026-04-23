@@ -212,15 +212,20 @@ async function getUrnForLead(lead, baseId) {
   return { urn, username };
 }
 
-// Fetch posts for a URN. Paginates until we hit a post older than cutoff OR no more pages.
-async function fetchPostsForUrn(urn, cutoffMs, maxPages = 3) {
+// Fetch posts for a URN. Paginates until we hit a post older than cutoff, collect N recent posts,
+// OR we exhaust pages. maxPosts caps how many we keep (default 2 — the two most recent posts within
+// the window; anything more is diminishing returns for engagement workflows).
+async function fetchPostsForUrn(urn, cutoffMs, maxPages = 3, maxPosts = 2) {
   const all = [];
   let reachedCutoff = false;
+  let reachedMaxPosts = false;
+  let undatableCount = 0;
+  let rawReturnedCount = 0;
 
-  for (let page = 1; page <= maxPages && !reachedCutoff; page++) {
+  for (let page = 1; page <= maxPages && !reachedCutoff && !reachedMaxPosts; page++) {
     const r = await rapidCall("/api/v1/user/posts", { urn, page: String(page) });
     if (!r.ok) {
-      return { ok: false, error: `Posts fetch page ${page} failed (${r.status}): ${r.error}`, posts: all };
+      return { ok: false, error: `Posts fetch page ${page} failed (${r.status}): ${r.error}`, posts: all, undatableCount, rawReturnedCount };
     }
     const posts = r.data?.data?.posts
       || (Array.isArray(r.data?.data) ? r.data.data : null)
@@ -228,26 +233,46 @@ async function fetchPostsForUrn(urn, cutoffMs, maxPages = 3) {
       || (Array.isArray(r.data) ? r.data : null)
       || [];
     if (!Array.isArray(posts) || posts.length === 0) break;
+    rawReturnedCount += posts.length;
 
     for (const p of posts) {
-      // Extract post timestamp — field names vary, try multiple
+      // Extract post timestamp — field names vary across API responses.
       let ts = null;
       const candidates = [
         p.posted_at_timestamp, p.posted_at, p.postedAt, p.published_at,
         p.publishedAt, p.date, p.timestamp, p.created_at,
+        p.posted_date, p.time, p.createdAt,
+        p.posted_at?.timestamp, p.posted_at?.date,
       ];
       for (const c of candidates) {
         if (!c) continue;
         if (typeof c === "number") { ts = c < 1e12 ? c * 1000 : c; break; }
+        if (typeof c === "object") continue; // not a primitive
         const parsed = new Date(c).getTime();
         if (!isNaN(parsed) && parsed > 1262304000000) { ts = parsed; break; }
       }
-      // Fallback: extract from activity URL
-      if (!ts) ts = timestampFromActivityUrl(p.post_url || p.url || p.share_url || "");
+      // Fallback: extract from activity URL (LinkedIn embeds unix ms in the ID)
+      if (!ts) ts = timestampFromActivityUrl(p.post_url || p.url || p.share_url || p.activity_url || "");
+
+      // CRITICAL: If we couldn't determine a timestamp, REJECT the post.
+      // Letting undatable posts through means months-old content sneaks past the 7-day filter.
+      // Better to drop a legitimate recent post than to flood the scan with stale ones.
+      if (!ts) {
+        // Log first few so user can see what's happening
+        if (undatableCount < 3) {
+          console.warn(`[linkedin-posts] Post rejected: no parseable timestamp.`, {
+            keys: Object.keys(p).slice(0, 20),
+            sample: JSON.stringify(p).slice(0, 300),
+          });
+        }
+        undatableCount++;
+        continue;
+      }
 
       // Hard 7-day filter — skip anything older
-      if (ts && ts < cutoffMs) {
-        // Since posts are returned newest-first, once we hit an old one, subsequent will be older too
+      if (ts < cutoffMs) {
+        // Posts are returned newest-first by LinkedIn API, so once we hit an old one,
+        // subsequent posts will also be older. Stop paginating to save API calls.
         reachedCutoff = true;
         continue;
       }
@@ -258,7 +283,7 @@ async function fetchPostsForUrn(urn, cutoffMs, maxPages = 3) {
 
       all.push({
         text,
-        date: ts ? new Date(ts).toISOString() : null,
+        date: new Date(ts).toISOString(),
         url: p.post_url || p.url || p.share_url || "",
         urn: p.urn || p.post_urn || p.activity_urn || "",
         likes: p.total_reactions || p.likes_count || p.likes || 0,
@@ -266,13 +291,16 @@ async function fetchPostsForUrn(urn, cutoffMs, maxPages = 3) {
         reposts: p.reposts_count || p.reposts || 0,
         is_repost: !!(p.reshared || p.is_repost || p.reposted_post),
       });
+
+      // Stop collecting once we hit the max. Posts are newest-first so these are the freshest.
+      if (all.length >= maxPosts) { reachedMaxPosts = true; break; }
     }
 
     // Small delay between pages to be nice to the API
-    if (page < maxPages && !reachedCutoff) await new Promise(r => setTimeout(r, 400));
+    if (page < maxPages && !reachedCutoff && !reachedMaxPosts) await new Promise(r => setTimeout(r, 400));
   }
 
-  return { ok: true, posts: all };
+  return { ok: true, posts: all, undatableCount, rawReturnedCount, reachedMaxPosts };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -799,11 +827,20 @@ async function runLinkedInPostScan({
   // this function was called, so the existingTaskUrls dedupe set below will naturally reflect
   // the post-cleanup state.
 
+  // Load prior progress first — needed for resume to know original scope (leadIds may be null on resume calls)
+  const prior = await readProgress(campaignAirtableId);
+  // On resume, if the original scan was scoped to specific leadIds, use that scope.
+  // (Cron-triggered resumes don't pass leadIds, so this restores the original subset.)
+  let effectiveLeadIds = leadIds;
+  if (resume && !effectiveLeadIds?.length && prior?.original_lead_ids?.length) {
+    effectiveLeadIds = prior.original_lead_ids;
+  }
+
   // Load leads. For "specific leads", it's still faster to list all and filter
   // than to hit atGet for each ID (N sequential API calls vs one paginated list).
   let leads = await atList(baseId, "Leads");
-  if (leadIds?.length) {
-    const idSet = new Set(leadIds);
+  if (effectiveLeadIds?.length) {
+    const idSet = new Set(effectiveLeadIds);
     leads = leads.filter(l => idSet.has(l.id));
   }
 
@@ -811,8 +848,7 @@ async function runLinkedInPostScan({
   leads = leads.filter(l => (l.fields?.["LinkedIn URL"] || l.fields?.["Linkedin URL"] || "").trim());
 
   // Resume mode: skip leads already processed in the saved progress record
-  const prior = resume ? await readProgress(campaignAirtableId) : null;
-  const completedLeadIds = new Set(prior?.completed_lead_ids || []);
+  const completedLeadIds = new Set(resume ? (prior?.completed_lead_ids || []) : []);
   if (resume && completedLeadIds.size > 0) {
     leads = leads.filter(l => !completedLeadIds.has(l.id));
     console.log(`[linkedin-posts] Resume: skipping ${completedLeadIds.size} already-processed leads, ${leads.length} remaining`);
@@ -828,7 +864,7 @@ async function runLinkedInPostScan({
     leads_done: completedLeadIds.size,
     leads_remaining: leads.length,
     current_lead: null,
-    current_lead_step: null, // "fetching_urn" | "fetching_posts" | "scoring" | "creating_tasks"
+    current_lead_step: null,
     posts_fetched: prior?.posts_fetched || 0,
     posts_scored: prior?.posts_scored || 0,
     posts_filtered_out: prior?.posts_filtered_out || 0,
@@ -836,6 +872,13 @@ async function runLinkedInPostScan({
     tasks_created: prior?.tasks_created || 0,
     errors: prior?.errors || [],
     completed_lead_ids: Array.from(completedLeadIds),
+    // Scan config persisted so external cron resume knows how to call runLinkedInPostScan
+    score_threshold: scoreThreshold,
+    days_back: daysBack,
+    task_rule_name: taskRuleName,
+    system_prompt_override: systemPromptOverride || null,
+    // Preserve the original leadIds (if user scanned a subset) so resume stays scoped to same set
+    original_lead_ids: prior?.original_lead_ids || (leadIds || null),
     last_log: "Scan started",
   };
   await writeProgress(campaignAirtableId, progress);
@@ -873,8 +916,24 @@ async function runLinkedInPostScan({
 
   const rollupCategoryCounts = prior?.category_counts || {};
 
+  // Time budget: we must return BEFORE Vercel kills the function.
+  // Fluid Compute on Hobby now supports 300s. Leave 30s safety margin for final writes.
+  // The scan self-terminates with status=running so Resume picks up cleanly.
+  const scanStartMs = Date.now();
+  const maxBudgetMs = 270_000; // 270s = 4.5min — 30s safety on 300s fluid compute limit
+  const shouldStopForTime = () => (Date.now() - scanStartMs) > maxBudgetMs;
+
   // Process each lead
   for (let i = 0; i < leads.length; i++) {
+    // Bail out gracefully if we're about to hit Vercel's timeout.
+    // Progress is already persisted after every lead — user hits Resume to continue.
+    if (shouldStopForTime()) {
+      progress.last_log = `⏸ Paused at ${i}/${leads.length} (time budget, ${Math.round((Date.now() - scanStartMs) / 1000)}s elapsed). ${leads.length - i} leads remaining. Hit Resume to continue.`;
+      progress.status = "running"; // signals frontend to show Resume button
+      progress.paused_for_time_budget = true;
+      await writeProgress(campaignAirtableId, progress);
+      return progress;
+    }
     const lead = leads[i];
     const f = lead.fields || {};
     const leadName = f.Name || f["Full Name"] || "Unknown";
@@ -916,9 +975,18 @@ async function runLinkedInPostScan({
 
     const fetchedPosts = postsResult.posts;
     progress.posts_fetched += fetchedPosts.length;
+    if (postsResult.undatableCount) {
+      progress.posts_undatable = (progress.posts_undatable || 0) + postsResult.undatableCount;
+    }
+    if (postsResult.rawReturnedCount) {
+      progress.posts_raw_returned = (progress.posts_raw_returned || 0) + postsResult.rawReturnedCount;
+    }
 
     if (fetchedPosts.length === 0) {
-      progress.last_log = `[${i + 1}/${leads.length}] ${leadName}: no posts in last ${daysBack} days`;
+      const reason = postsResult.undatableCount
+        ? `${postsResult.rawReturnedCount} posts returned, ${postsResult.undatableCount} had no parseable date, others older than ${daysBack} days`
+        : `no posts in last ${daysBack} days`;
+      progress.last_log = `[${i + 1}/${leads.length}] ${leadName}: ${reason}`;
       progress.completed_lead_ids.push(lead.id);
       progress.leads_done++;
       progress.leads_remaining--;
@@ -1213,16 +1281,17 @@ export async function POST(request) {
         if (!OPENAI_KEY) return NextResponse.json({ error: "OPENAI_API_KEY not set" }, { status: 400 });
         if (!RAPIDAPI_KEY) return NextResponse.json({ error: "RAPIDAPI_KEY not set (for Fresh LinkedIn Scraper API)" }, { status: 400 });
 
-        // Concurrent-scan lock: refuse if another scan is actively running on this campaign.
-        // "Actively running" = status=running AND updated within last 2 minutes.
-        // User can force with { force: true } to override (e.g. if a prior scan crashed and left stale state).
+        // Concurrent-scan lock: refuse if another scan is actively writing progress.
+        // Progress is updated after every lead (~every 5-15s), so a live scan will always
+        // have a fresh updated_at. 30s threshold catches legit concurrent scans while
+        // allowing cron-triggered resumes to pick up after the prior function completes.
         if (!force) {
           const prior = await readProgress(campaignAirtableId);
           if (prior?.status === "running" && prior.updated_at) {
             const ageMs = Date.now() - new Date(prior.updated_at).getTime();
-            if (!isNaN(ageMs) && ageMs < 2 * 60 * 1000) {
+            if (!isNaN(ageMs) && ageMs < 30 * 1000) {
               return NextResponse.json({
-                error: `Another scan is already running on this campaign (last update ${Math.round(ageMs/1000)}s ago). Wait for it to finish, or retry with force:true to override.`,
+                error: `Another scan is actively running (last progress write ${Math.round(ageMs/1000)}s ago). Wait ${Math.ceil((30*1000-ageMs)/1000)}s or retry with force:true.`,
                 locked: true,
                 prior,
               }, { status: 409 });
@@ -1288,4 +1357,84 @@ export async function POST(request) {
   }
 }
 
-export const maxDuration = 60; // Vercel Hobby cap; Pro can go up to 300
+export const maxDuration = 300; // Fluid Compute on Hobby now allows 300s (was 60s pre-2025)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET HANDLER — public cron endpoint for external schedulers
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Designed for cron-job.org / UptimeRobot / any GET-based webhook scheduler.
+// Call every 1-5 minutes from an external scheduler. It:
+//   1. Checks if a scan is running for the given campaign
+//   2. If yes, calls resume (picks up where last invocation stopped)
+//   3. If scan is complete, returns 200 with "DONE" so cron can be disabled
+//   4. If no scan exists, returns 200 with "IDLE"
+//
+// URL format:
+//   https://<vercel-app>/api/linkedin-posts?key=<CRON_SECRET>&base=<baseId>&campaign=<campaignAirtableId>
+//
+// Security: requires ?key=<CRON_SECRET> matching env var.
+// If CRON_SECRET env not set, the endpoint is disabled.
+
+export async function GET(request) {
+  const url = new URL(request.url);
+  const key = url.searchParams.get("key");
+  const baseId = url.searchParams.get("base");
+  const campaignAirtableId = url.searchParams.get("campaign");
+  const taskRuleName = url.searchParams.get("task_rule") || "LinkedIn Post Engagement";
+
+  // Auth
+  const CRON_SECRET = process.env.CRON_SECRET;
+  if (!CRON_SECRET) return NextResponse.json({ error: "CRON_SECRET not set on server" }, { status: 500 });
+  if (key !== CRON_SECRET) return NextResponse.json({ error: "Invalid or missing key" }, { status: 401 });
+
+  if (!baseId || !campaignAirtableId) {
+    return NextResponse.json({ error: "base and campaign query params required" }, { status: 400 });
+  }
+
+  try {
+    const prior = await readProgress(campaignAirtableId);
+    if (!prior) {
+      return NextResponse.json({ status: "IDLE", message: "No scan state exists for this campaign. Start one from the UI first." });
+    }
+    if (prior.status === "complete" || prior.phase === "done") {
+      return NextResponse.json({
+        status: "DONE",
+        message: "Scan complete — you can disable the cron now.",
+        leads_done: prior.leads_done,
+        tasks_created: prior.tasks_created,
+        ended_at: prior.ended_at,
+      });
+    }
+    if (prior.leads_remaining === 0) {
+      return NextResponse.json({ status: "DONE", message: "No leads remaining" });
+    }
+
+    // Resume. Pull scoreThreshold/daysBack/systemPromptOverride from the prior progress if available,
+    // otherwise use safe defaults. The scan function reads these as args.
+    const scoreThreshold = typeof prior.score_threshold === "number" ? prior.score_threshold : 70;
+    const daysBack = typeof prior.days_back === "number" ? prior.days_back : 7;
+    const ruleName = prior.task_rule_name || taskRuleName;
+
+    const result = await runLinkedInPostScan({
+      baseId, campaignAirtableId,
+      leadIds: null, // resume uses the original lead set (filtered by completed_lead_ids internally)
+      scoreThreshold,
+      daysBack,
+      taskRuleName: ruleName,
+      systemPromptOverride: prior.system_prompt_override || null,
+      resume: true,
+    });
+
+    return NextResponse.json({
+      status: result.status === "complete" ? "DONE" : "RESUMED",
+      leads_done: result.leads_done,
+      leads_remaining: result.leads_remaining,
+      tasks_created: result.tasks_created,
+      last_log: result.last_log,
+    });
+  } catch (e) {
+    console.error("[linkedin-posts cron] Error:", e.message);
+    return NextResponse.json({ status: "ERROR", error: e.message }, { status: 500 });
+  }
+}
