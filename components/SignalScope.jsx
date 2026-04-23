@@ -3794,10 +3794,10 @@ function LinkedInPostsTab({ baseId, campaign, leads }) {
   "structured_sentence": "{name}, {title} at {company} posted about {summary <=15 words}",
   "suggested_comment": string <=20 words, starts with 'You could comment' or 'You could highlight'
 }`}</pre>
-                <div style={{marginTop:8,color:"var(--amb)"}}>⚠️ Backend sanity checks: if evidence is "NO_SPECIFIC_EVIDENCE" → score capped at 25. If post_type is holiday/anniversary/birthday/award → cap at 5-25. If rationale doesn't reference words from evidence → cap at 50.</div>
-                <div style={{marginTop:8}}>Leave blank to use the default strict prompt built from this campaign's Email Reference / ICP. The default includes a 5-band rubric (IRRELEVANT / TANGENTIAL / ADJACENT / INTEREST SIGNAL / STRONG BUYING SIGNAL) with anchor examples.</div>
+                <div style={{marginTop:8,color:"var(--amb)"}}>⚠️ Backend sanity checks: if evidence is "NO_SPECIFIC_EVIDENCE" → score capped at 25. If post_type is holiday/anniversary/birthday/award → cap at 5-15. If rationale doesn't reference words from evidence → cap at 50.</div>
+                <div style={{marginTop:8}}>Leave blank for the <strong style={{color:"var(--t1)"}}>default engagement-quality prompt</strong> — scores "is this a substantive post worth commenting on?" independent of any campaign context. Same approach as your Apify+AppsScript flow. Paste a custom prompt here only if you want sales-relevance scoring tied to a specific ICP.</div>
               </div>
-              <textarea className="inp" rows="10" placeholder="Leave blank for default strict prompt. If writing custom, must return all 6 JSON fields above or sanity checks will cap your scores." value={systemPromptOverride} onChange={e=>setSystemPromptOverride(e.target.value)} style={{fontSize:11,fontFamily:"'JetBrains Mono',monospace",lineHeight:1.5}}/>
+              <textarea className="inp" rows="10" placeholder="Leave blank for default post-quality prompt (campaign-agnostic). Write custom only if you want sales-relevance scoring — must return all 6 JSON fields above or sanity checks will cap scores." value={systemPromptOverride} onChange={e=>setSystemPromptOverride(e.target.value)} style={{fontSize:11,fontFamily:"'JetBrains Mono',monospace",lineHeight:1.5}}/>
             </div>
           )}
         </div>
@@ -4060,7 +4060,7 @@ function LinkedInPostsTab({ baseId, campaign, leads }) {
           </div>
           <div>
             <div style={{color:"var(--t1)",fontWeight:500,marginBottom:4}}>3. Score</div>
-            Remaining posts go to gpt-5.4-mini with a sales-relevance prompt. Returns score 1-100, rationale, a neutral one-line summary, and a suggested non-salesy comment.
+            Remaining posts go to gpt-5.4-mini with an engagement-quality prompt (campaign-agnostic — scores post substance, not sales intent). Returns score 1-100, evidence quote, rationale, neutral summary, and a suggested non-salesy comment.
           </div>
           <div>
             <div style={{color:"var(--t1)",fontWeight:500,marginBottom:4}}>4. Create tasks</div>

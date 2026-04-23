@@ -529,75 +529,100 @@ const CATEGORY_SCORE_CEILING = {
 // OPENAI SCORING
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// Prompt is configurable PER CAMPAIGN (read from Campaigns.LinkedIn Post Scoring Prompt).
-// If not set, uses a sensible default built from the campaign's Email Reference / ICP.
+// DEFAULT MODE: Campaign-agnostic post-quality scoring.
+// Scores "is this a substantive post worth engaging with?" — NOT "does this reveal buying intent?"
+// This matches how users typically work LinkedIn: they comment on good posts to warm up leads,
+// not only when the post reveals a sales opportunity.
+//
+// CUSTOM MODE: Pass systemPromptOverride for sales-relevance scoring tied to a specific ICP.
 //
 // Output schema (JSON, enforced via response_format):
-//   relevance_score: integer 1-100
-//   relevance_rationale: string (<=50 words)
-//   structured_sentence: string (<=20 words, format: "{name}, {title} at {company} posted about {summary}")
-//   suggested_comment: string (<=20 words, starts with "You could comment" or "You could highlight")
+//   relevance_score: integer 1-100 (engagement quality score)
+//   relevance_rationale, evidence_quote, structured_sentence, suggested_comment, post_type
 
 function defaultScoringSystemPrompt(campaignContext) {
-  const ctx = campaignContext && campaignContext.trim() ? campaignContext.trim() : "B2B consultative services (context missing — score conservatively)";
+  // campaignContext is IGNORED in default mode — scoring is post-quality only, no sales framing.
+  // If user wants sales framing, they must paste a custom prompt.
   return `ROLE
-You are a CONSERVATIVE B2B sales analyst scoring LinkedIn posts for buying-signal relevance. You err heavily on the side of LOW scores. When in doubt, score LOW. It is MUCH worse to false-positive a post (SDR wastes time on fluff) than to miss one.
+You score LinkedIn posts for ENGAGEMENT-WORTHINESS. Return JSON only.
 
-WHAT WE OFFER
-${ctx}
+GOAL
+You are scoring: "Is this post substantive enough for a human to leave a thoughtful, non-salesy comment on it?"
 
-SCORING RUBRIC — use these anchor points strictly:
+You are NOT scoring sales relevance, buying intent, or product fit. Ignore whether the post mentions any specific industry, product, or pain point.
 
-1-15 IRRELEVANT. Post has nothing to do with our offering OR is pure social content.
-- Birthdays, anniversaries, holidays, condolences, personal milestones
-- Award/recognition ("honored to be named in Top 50...")
-- Generic motivational quotes, "5 lessons I learned this week"
-- Thanks/gratitude posts to their team
-- Book/podcast/newsletter promos by the author
-- Personal life updates, photos with no business relevance
+A substantive post:
+- Has an original perspective, framework, observation, or concrete example
+- Articulates a real opinion or asks a genuine question
+- Gives the reader something to react to or extend
+- Is the author's own thinking, not a generic celebration or rewrap
 
-16-35 TANGENTIAL. Post is on an adjacent topic but reveals nothing actionable.
-- Generic commentary on industry trends we work in
-- Reshare of a third-party article with 1-2 sentences of token praise
-- Announcing they'll speak at a conference
-- Funding round announcement (the need is already met)
+A non-substantive post:
+- Celebrates a personal milestone (birthday, anniversary, holiday, award)
+- Thanks a team without context
+- Reshares someone else's content with 1-2 sentences of token praise
+- Is pure motivational fluff or generic enthusiasm
+- Is self-promotional (book/podcast/course announcements, hiring, farewell)
 
-36-55 ADJACENT. Post is clearly in our domain, but NOT a buying signal.
-- Thought leadership on themes we address
-- Company achievement touching our themes
-- Opinion piece on our category with no pain point
-- Panel recap or conference observations
+SCORING RUBRIC — use these anchors strictly:
 
-56-74 INTEREST SIGNAL. Post reveals active thinking or work in our space, but no concrete need.
-- Author describing ongoing work relevant to our offering
-- Open question to their network about a topic we solve
-- Discussing a framework or approach relevant to us
-- Lessons-learned from a project adjacent to what we do
+1-15 JUNK. No one should comment on this for business reasons.
+- Holiday greetings, birthdays, anniversaries, condolences
+- Work anniversaries, farewells, award announcements
+- Course completion / certification spam
 
-75-100 STRONG BUYING SIGNAL. Post explicitly reveals a problem we solve OR announces a project that implies a need.
-- "We're struggling with X" where X maps directly to our offering
-- "Looking for tools/partners/approaches to help us with Y"
-- "Launching new [initiative] and need to figure out [thing we solve]"
-- "Transitioning our team to [something that requires our service]"
-- Explicit pain point with a specific context
+16-30 LOW VALUE. Technically on LinkedIn but not worth engaging.
+- Thank-you posts to team without substance
+- Self-promo (book launch, podcast plug, newsletter promo)
+- Pure motivational / "5 lessons I learned this week" without depth
+- Hiring posts, job listings
+
+31-45 MEH. Some signal but thin.
+- Reshare of a third-party article with brief commentary
+- Event announcements, "join me at..." posts
+- Funding round announcements
+- Generic enthusiasm ("excited about the future of X!")
+- Very short posts (< 80 words of substantive content)
+- Engagement bait ("agree or disagree?", "repost if...")
+
+46-65 DECENT. Engagement has some value but post is routine.
+- Thought leadership piece with a standard industry take
+- Event recap with basic observations
+- Reshare with 3-4 sentences of own analysis
+- Question to network that's somewhat open-ended
+- Industry observation without concrete data or example
+
+66-85 GOOD. Clearly worth commenting on.
+- Substantive thought leadership with original perspective
+- Specific observation backed by data, numbers, or a concrete example
+- Sharp opinion that invites debate
+- Specific question that a commenter could genuinely answer
+- Lessons from a real project with specifics
+
+86-100 EXCELLENT. High-quality post, priority to engage.
+- Articulates a genuine pain point or challenge they're working through
+- Asks their network for recommendations/help/input on a real decision
+- Announces a major initiative in substantive detail
+- Takes a strong, unusual position with reasoning
+- Shares a framework or breakdown original to the author
 
 CRITICAL RULES:
-1. DEFAULT LOW. Only score above 55 if you can point to a SPECIFIC sentence in the post that maps to OUR offering above. Not a theme — an actual signal.
-2. Ignore the author's name/title/company completely. Score from post_text ONLY.
-3. If the post is a reshare (starts with "Reposting", "Great read", "Must read", "Sharing this"), max score is 30.
-4. If the post is less than 80 words of substantive content (URLs/hashtags excluded), max score is 50.
-5. If rationale doesn't cite a specific quote from the post, score must be <=40.
-6. If the post is a holiday greeting, birthday, anniversary, condolence, or award — score 1-10.
-7. Generic enthusiasm ("Excited about the future of X!", "Loved today's panel on Y") is NEVER a buying signal. Max 25.
+1. DEFAULT LOW. Score above 60 requires the author's own substantive thought — not just a topic.
+2. Reshares (starts with "Reposting", "Great read", "Must read", "Sharing this"): max 35.
+3. Posts under 80 words of substantive content (URLs/hashtags excluded): max 50.
+4. If evidence_quote is "NO_SPECIFIC_EVIDENCE" or the post has no substantive sentence: score must be <=25.
+5. Holiday/birthday/anniversary/condolence/award/farewell: 1-10 regardless of other content.
+6. Generic enthusiasm without substance ("Excited about the future of X!", "Loved today's panel"): max 25.
+7. Ignore name/title/company. Judge purely on post content.
 
 OUTPUT JSON (no other text, no markdown):
 {
   "post_type": string, one of: "holiday" | "anniversary" | "birthday" | "award" | "gratitude" | "condolence" | "hiring" | "farewell" | "self_promo" | "content_promo" | "motivational" | "reshare" | "thought_leadership" | "industry_news" | "event_announcement" | "pain_point" | "project_announcement" | "question_to_network" | "personal" | "other",
-  "relevance_score": integer 1-100,
-  "evidence_quote": string <=25 words — the EXACT sentence from the post that justifies your score. If no specific evidence, write "NO_SPECIFIC_EVIDENCE" and score must be <=25.
-  "relevance_rationale": string <=40 words, explicitly referencing what in OUR offering the post connects (or fails to connect) to.
-  "structured_sentence": string <=20 words, format: "{Full name}, {simplified job title} at {simplified company} posted about {neutral 15-word summary}",
-  "suggested_comment": string <=20 words, MUST start with 'You could comment' or 'You could highlight'. Must reference SPECIFIC content, not generic pleasantries.
+  "relevance_score": integer 1-100 (engagement-worthiness score),
+  "evidence_quote": string <=25 words — the EXACT sentence from the post that justifies your score. If no substantive content, write "NO_SPECIFIC_EVIDENCE" and score must be <=25.
+  "relevance_rationale": string <=40 words — what makes this post engagement-worthy (or why not).
+  "structured_sentence": string <=20 words, format: "{Full name}, {simplified title} at {simplified company} posted about {neutral 15-word summary}",
+  "suggested_comment": string <=20 words, MUST start with 'You could comment' or 'You could highlight'. Must reference specific content from THIS post, not generic pleasantries.
 }`;
 }
 
@@ -651,14 +676,16 @@ async function scorePost({ post, lead, campaignContext, systemPromptOverride, ca
     if (!evidenceQuote || evidenceQuote === "NO_SPECIFIC_EVIDENCE" || evidenceQuote.length < 10) {
       if (score > 25) { sanityFlags.push(`no_evidence → capped 25`); score = Math.min(score, 25); }
     }
-    // Rule: post_type is structurally irrelevant → hard cap
+    // Rule: post_type has a quality ceiling. Matches the post-quality rubric above.
+    // Thought leadership and industry news CAN be genuinely engagement-worthy (not just sales-relevant)
+    // so they get higher ceilings in this mode.
     const postTypeCeiling = {
       holiday: 5, anniversary: 5, birthday: 5, condolence: 5,
-      hiring: 10, farewell: 10, award: 20, gratitude: 25,
-      self_promo: 30, content_promo: 30, motivational: 30,
-      reshare: 35, event_announcement: 55, personal: 15,
-      thought_leadership: 70, industry_news: 50,
-      pain_point: 100, project_announcement: 95, question_to_network: 85,
+      hiring: 10, farewell: 10, award: 15, gratitude: 20,
+      self_promo: 25, content_promo: 25, motivational: 30,
+      reshare: 35, event_announcement: 45, personal: 15,
+      thought_leadership: 85, industry_news: 70,
+      pain_point: 100, project_announcement: 95, question_to_network: 90,
       other: 70,
     };
     const ceiling = postTypeCeiling[postType];
