@@ -507,6 +507,12 @@ const NEVER_TASK_CATEGORIES = new Set([
   "award", "gratitude",
 ]);
 
+// Post types (from AI) that CAN become tasks. Anything else is structurally not a buying signal.
+const VALID_TASK_POST_TYPES = new Set([
+  "pain_point", "project_announcement", "question_to_network",
+  "thought_leadership", "industry_news", "event_announcement", "other",
+]);
+
 // Hard score ceilings per category. Even if AI scores 95, if category is "motivational", cap at 30.
 const CATEGORY_SCORE_CEILING = {
   holiday: 5, anniversary: 5, birthday: 5, condolence: 5,
@@ -619,7 +625,7 @@ async function scorePost({ post, lead, campaignContext, systemPromptOverride, ca
     const c = await openai.chat.completions.create({
       model: "gpt-5.4-mini",
       temperature: 0.1, // very low — we want consistency, not creativity
-      max_tokens: 500,
+      max_completion_tokens: 500,
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: systemPrompt },
@@ -931,18 +937,33 @@ async function runLinkedInPostScan({
         sanity_flags: scored.sanity_flags,
       });
 
+      // Keep a rolling sample of the last 20 scored posts so the user can audit decisions
+      // without having to look up individual tasks. Especially useful for debugging "why nothing passed".
+      if (!progress.recent_samples) progress.recent_samples = [];
+      progress.recent_samples.unshift({
+        lead: leadName,
+        company: leadCompany,
+        post_text: (post.text || "").slice(0, 280),
+        post_url: post.url || "",
+        category: cat.category,
+        penalty: cat.penalty,
+        ai_score: scored.raw_ai_score,
+        final_score: adjusted,
+        post_type: scored.post_type,
+        evidence: scored.evidence_quote,
+        rationale: scored.relevance_rationale,
+        outcome: adjusted >= scoreThreshold && VALID_TASK_POST_TYPES.has(scored.post_type) && !NEVER_TASK_CATEGORIES.has(cat.category) ? "task_created" : "dropped",
+      });
+      if (progress.recent_samples.length > 20) progress.recent_samples = progress.recent_samples.slice(0, 20);
+
       await new Promise(r => setTimeout(r, 250));
     }
     progress.rejection_reasons = rejectionReasons;
 
     // Step 4: Only post_types that CAN be buying signals create tasks
-    const validPostTypesForTask = new Set([
-      "pain_point", "project_announcement", "question_to_network",
-      "thought_leadership", "industry_news", "event_announcement", "other",
-    ]);
     const taskWorthy = scoredPosts.filter(sp =>
       sp.adjusted_score >= scoreThreshold &&
-      validPostTypesForTask.has(sp.post_type) &&
+      VALID_TASK_POST_TYPES.has(sp.post_type) &&
       !NEVER_TASK_CATEGORIES.has(sp.category)
     );
 

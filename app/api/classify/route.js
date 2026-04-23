@@ -17,7 +17,7 @@ async function classifyNews(newsItem, taskDefs, companyName) {
     const completion = await getOpenAI().chat.completions.create({
       model: "gpt-5.4",
       temperature: 0.1,
-      max_tokens: 600,
+      max_completion_tokens: 600,
       messages: [
         {
           role: "system",
@@ -57,7 +57,7 @@ async function refineTask(userInput) {
     const completion = await getOpenAI().chat.completions.create({
       model: "gpt-5.4",
       temperature: 0.5,
-      max_tokens: 1000,
+      max_completion_tokens: 1000,
       messages: [
         {
           role: "system",
@@ -97,7 +97,7 @@ async function generateInsights(task, companyName) {
     const completion = await getOpenAI().chat.completions.create({
       model: "gpt-5.4",
       temperature: 0.6,
-      max_tokens: 600,
+      max_completion_tokens: 600,
       messages: [
         {
           role: "system",
@@ -131,7 +131,7 @@ async function generateJobKeywords(taskName, taskDescription) {
     const completion = await getOpenAI().chat.completions.create({
       model: "gpt-5.4",
       temperature: 0.3,
-      max_tokens: 400,
+      max_completion_tokens: 400,
       messages: [
         {
           role: "system",
@@ -173,7 +173,7 @@ async function generateScoringPrompt(taskName, taskDescription, taskKeywords, ta
     const completion = await getOpenAI().chat.completions.create({
       model: "gpt-5.4",
       temperature: 0.25,
-      max_tokens: 1500,
+      max_completion_tokens: 1500,
       messages: [
         {
           role: "system",
@@ -259,7 +259,7 @@ async function dedupTasks(taskGroups) {
       const completion = await getOpenAI().chat.completions.create({
         model: "gpt-5.4-mini",
         temperature: 0,
-        max_tokens: 600,
+        max_completion_tokens: 600,
         messages: [
           { role: "system", content: `You are a deduplication engine. Given a list of B2B signal tasks for the same company, identify which ones are semantically duplicated (same underlying event/signal described differently). Return ONLY a JSON object: {"keep": [0, 2, 5]}. Keep the task with the highest score when merging duplicates. ONLY remove true duplicates where the underlying real-world event is the same. No markdown.` },
           { role: "user", content: `Company: ${group.company}\n\nTasks:\n${taskList}` }

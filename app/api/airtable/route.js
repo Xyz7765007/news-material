@@ -677,7 +677,7 @@ async function runTopXScoring(baseId, rule) {
         const completion = await openai.chat.completions.create({
           model: "gpt-5.4-mini",
           temperature: 0.2,
-          max_tokens: BATCH > 10 ? 4000 : 2048,
+          max_completion_tokens: BATCH > 10 ? 4000 : 2048,
           messages: [
             { role: "system", content: `You are a data-driven B2B lead scoring engine. Score each record 0-100 based STRICTLY on the user's criteria and the ACTUAL DATA VALUES in each record.
 
@@ -735,7 +735,7 @@ Return ONLY JSON: [{"idx":0,"score":85,"reason":"max 15 words explaining which d
               .map(([k, v]) => `${k}: ${v === "" ? "(empty)" : String(v).slice(0, 200)}`)
               .join(" | ");
             const retry = await openai.chat.completions.create({
-              model: "gpt-5.4-mini", temperature: 0.2, max_tokens: 200,
+              model: "gpt-5.4-mini", temperature: 0.2, max_completion_tokens: 200,
               messages: [
                 { role: "system", content: `Score this record 0-100 based STRICTLY on its data values. If key metric fields are zero/empty, score below 30. Return ONLY: {"score":85,"reason":"max 15 words citing actual data values"}` },
                 { role: "user", content: `Criteria:\n${scoringPrompt}\n\nRecord: ${item.name} — ${dataStr}` }

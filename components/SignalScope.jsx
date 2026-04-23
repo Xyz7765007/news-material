@@ -3880,6 +3880,38 @@ function LinkedInPostsTab({ baseId, campaign, leads }) {
               </div>
             </details>
           )}
+          {/* Recent scored samples — audit what AI is deciding */}
+          {progress.recent_samples?.length > 0 && (
+            <details style={{marginTop:10}} open={progress.tasks_created === 0 && progress.posts_scored > 0}>
+              <summary style={{cursor:"pointer",fontSize:10,color:"var(--t2)",fontWeight:500}}>🔍 Recent scored posts ({progress.recent_samples.length}) — click to audit</summary>
+              <div style={{marginTop:8,maxHeight:400,overflowY:"auto",display:"flex",flexDirection:"column",gap:8}}>
+                {progress.recent_samples.map((s, i) => (
+                  <div key={i} style={{padding:10,background:s.outcome==="task_created"?"rgba(93,168,122,.08)":"var(--hover)",border:"1px solid "+(s.outcome==="task_created"?"var(--grn)":"var(--bdr)"),borderRadius:6,fontSize:10}}>
+                    <div style={{display:"flex",justifyContent:"space-between",gap:8,marginBottom:4}}>
+                      <div style={{color:"var(--t1)",fontWeight:500}}>{s.lead} {s.company && <span style={{color:"var(--t3)",fontWeight:400}}>· {s.company}</span>}</div>
+                      <div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}>
+                        <span style={{color:s.outcome==="task_created"?"var(--grn)":"var(--t3)",fontWeight:600}}>{s.outcome==="task_created"?"✓ TASK":"✗ DROPPED"}</span>
+                        <span style={{padding:"1px 6px",background:"var(--card)",borderRadius:3,color:"var(--t1)",fontWeight:600,fontFamily:"'JetBrains Mono',monospace"}}>{s.final_score}</span>
+                      </div>
+                    </div>
+                    <div style={{color:"var(--t2)",marginBottom:4,fontStyle:"italic",lineHeight:1.5}}>"{s.post_text}{s.post_text?.length >= 280 ? "..." : ""}"</div>
+                    <div style={{display:"flex",flexWrap:"wrap",gap:8,fontSize:9,color:"var(--t3)"}}>
+                      <span>type: <strong style={{color:"var(--t2)"}}>{s.post_type}</strong></span>
+                      <span>category: <strong style={{color:"var(--t2)"}}>{s.category}</strong>{s.penalty !== 0 ? ` (${s.penalty})` : ""}</span>
+                      <span>AI: <strong style={{color:"var(--t2)"}}>{s.ai_score}</strong> → final: <strong style={{color:s.final_score>=70?"var(--grn)":"var(--amb)"}}>{s.final_score}</strong></span>
+                      {s.post_url && <a href={s.post_url} target="_blank" rel="noreferrer" onClick={e=>e.stopPropagation()} style={{color:"var(--blu)"}}>view post →</a>}
+                    </div>
+                    {s.evidence && s.evidence !== "NO_SPECIFIC_EVIDENCE" && (
+                      <div style={{marginTop:4,fontSize:9,color:"var(--t3)"}}>evidence: <span style={{color:"var(--t2)"}}>"{s.evidence}"</span></div>
+                    )}
+                    {s.rationale && (
+                      <div style={{marginTop:3,fontSize:9,color:"var(--t3)"}}>reason: <span style={{color:"var(--t2)"}}>{s.rationale}</span></div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
         </div>
       )}
 

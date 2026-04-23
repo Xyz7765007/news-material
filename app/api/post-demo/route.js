@@ -193,7 +193,7 @@ async function generateTasks(contact, deal, timeline, conversionPatterns, rule) 
 
   try {
     const c = await openai.chat.completions.create({
-      model: "gpt-5.4-mini", temperature: 0.3, max_tokens: 1200,
+      model: "gpt-5.4-mini", temperature: 0.3, max_completion_tokens: 1200,
       messages: [
         { role: "system", content: `You are an expert SDR task engine. You have access to a contact's FULL HubSpot history (emails, meetings, calls, notes) plus patterns from successfully converted deals.
 

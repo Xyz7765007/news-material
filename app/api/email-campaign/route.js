@@ -187,7 +187,7 @@ Write the email${config.sequenceLength > 1 ? "s" : ""} now. Return JSON only.`;
   try {
     const msg = await anthropic.messages.create({
       model: "claude-sonnet-4-6",
-      max_tokens: 1500,
+      max_completion_tokens: 1500,
       temperature: 0.7,
       system: cached.system,
       messages: [{ role: "user", content: userMsg }],

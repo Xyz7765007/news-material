@@ -353,7 +353,7 @@ Only include articles scoring 50+. No markdown.`;
 
     try {
       const c = await getOpenAI().chat.completions.create({
-        model: "gpt-5.4-mini", temperature: 0.15, max_tokens: 1000,
+        model: "gpt-5.4-mini", temperature: 0.15, max_completion_tokens: 1000,
         messages: [
           { role: "system", content: sysPrompt },
           { role: "user", content: `${taskDesc}\n\nSignals:\n${signalList}` },

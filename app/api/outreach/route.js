@@ -298,7 +298,7 @@ async function aiSelectLeads(leads, prompt, count) {
 
   try {
     const c = await openai.chat.completions.create({
-      model: "gpt-5.4-mini", temperature: 0.2, max_tokens: 500,
+      model: "gpt-5.4-mini", temperature: 0.2, max_completion_tokens: 500,
       messages: [
         { role: "system", content: `Select the top ${count} leads that best match the criteria. Return ONLY a JSON array of indices: [0, 3, 7, ...]. No markdown.` },
         { role: "user", content: `Criteria:\n${prompt}\n\nLeads:\n${leadList}` },
@@ -412,7 +412,7 @@ RULES:
     const c = await openai.chat.completions.create({
       model: "gpt-5.4-mini",
       temperature: hasGAContext ? 0.85 : 0.5, // higher creativity when writing from scratch with engagement data
-      max_tokens: 300,
+      max_completion_tokens: 300,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
@@ -501,7 +501,7 @@ async function classifyReplyIntent(replyText, context = {}) {
     const c = await openai.chat.completions.create({
       model: "gpt-5.4-mini",
       temperature: 0.1, // low temp — classification needs determinism
-      max_tokens: 250,
+      max_completion_tokens: 250,
       response_format: { type: "json_object" },
       messages: [
         {
