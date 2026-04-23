@@ -1086,11 +1086,22 @@ async function runLinkedInPostScan({
       if (ceiling != null && adjusted > ceiling) adjusted = ceiling;
       adjusted = Math.max(0, Math.min(100, adjusted + cat.penalty));
 
-      const reasonCode = adjusted < scoreThreshold
-        ? (scored.relevance_score >= scoreThreshold
-            ? `ai_scored_${scored.relevance_score}_but_capped_by_${cat.category}_to_${adjusted}`
-            : `below_threshold_${adjusted}`)
-        : "passed";
+      // Determine final outcome (same logic as task creation at line 1132-1136)
+      const wouldCreateTask = adjusted >= scoreThreshold
+        && VALID_TASK_POST_TYPES.has(scored.post_type)
+        && !NEVER_TASK_CATEGORIES.has(cat.category);
+
+      const reasonCode = wouldCreateTask
+        ? "task_created"
+        : adjusted < scoreThreshold
+          ? (scored.relevance_score >= scoreThreshold
+              ? `ai_scored_${scored.relevance_score}_but_capped_by_${cat.category}_to_${adjusted}`
+              : `below_threshold_${adjusted}`)
+          : NEVER_TASK_CATEGORIES.has(cat.category)
+            ? `score_${adjusted}_but_category_${cat.category}_never_creates_tasks`
+            : !VALID_TASK_POST_TYPES.has(scored.post_type)
+              ? `score_${adjusted}_but_post_type_${scored.post_type}_not_engagement_worthy`
+              : `dropped_${adjusted}`;
       rejectionReasons[reasonCode] = (rejectionReasons[reasonCode] || 0) + 1;
 
       scoredPosts.push({
