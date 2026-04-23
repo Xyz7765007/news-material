@@ -3525,6 +3525,10 @@ function LinkedInPostsTab({ baseId, campaign, leads }) {
   const [systemPromptOverride, setSystemPromptOverride] = useState("");
   const [showPromptEditor, setShowPromptEditor] = useState(false);
   const [searchLeads, setSearchLeads] = useState("");
+  const [autoCleanup, setAutoCleanup] = useState(true);
+  const [autoCleanupDays, setAutoCleanupDays] = useState(14);
+  const [autoCleanupExcludePushed, setAutoCleanupExcludePushed] = useState(true);
+  const [cleanupModal, setCleanupModal] = useState(null); // { days, preview, loading }
   const [progress, setProgress] = useState(null);
   const [scanning, setScanning] = useState(false);
   const [err, setErr] = useState("");
@@ -3600,6 +3604,9 @@ function LinkedInPostsTab({ baseId, campaign, leads }) {
           taskRuleName,
           systemPromptOverride: systemPromptOverride.trim() || null,
           resume,
+          // Don't auto-cleanup on resume (we want the already-created tasks preserved)
+          autoCleanupDays: !resume && autoCleanup ? autoCleanupDays : null,
+          autoCleanupExcludePushed: autoCleanupExcludePushed,
         }),
       });
       const d = await res.json();
@@ -3610,6 +3617,52 @@ function LinkedInPostsTab({ baseId, campaign, leads }) {
       }
     } catch (e) { setErr(e.message); }
     setScanning(false);
+  };
+
+  const openCleanupModal = async () => {
+    setCleanupModal({ days: autoCleanupDays, preview: null, loading: true, excludePushed: autoCleanupExcludePushed });
+    try {
+      const res = await fetch("/api/linkedin-posts", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "list_stale_tasks", baseId,
+          taskRuleName,
+          olderThanDays: autoCleanupDays,
+        }),
+      });
+      const d = await res.json();
+      setCleanupModal(m => m ? { ...m, preview: d, loading: false } : null);
+    } catch (e) {
+      setCleanupModal(m => m ? { ...m, loading: false, error: e.message } : null);
+    }
+  };
+
+  const runCleanup = async () => {
+    if (!cleanupModal) return;
+    setCleanupModal(m => ({ ...m, running: true }));
+    try {
+      const res = await fetch("/api/linkedin-posts", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "cleanup_old_tasks", baseId,
+          taskRuleName,
+          olderThanDays: cleanupModal.days,
+          excludePushed: cleanupModal.excludePushed,
+          confirm: true,
+        }),
+      });
+      const d = await res.json();
+      if (d.ok) {
+        alert(`✅ Deleted ${d.deleted} stale task${d.deleted!==1?"s":""}.${d.failed ? ` ${d.failed} failed.` : ""}`);
+        setCleanupModal(null);
+      } else {
+        alert("❌ " + (d.error || "Cleanup failed"));
+        setCleanupModal(m => m ? { ...m, running: false } : null);
+      }
+    } catch (e) {
+      alert("❌ " + e.message);
+      setCleanupModal(m => m ? { ...m, running: false } : null);
+    }
   };
 
   const clearProgress = async () => {
@@ -3749,6 +3802,26 @@ function LinkedInPostsTab({ baseId, campaign, leads }) {
           )}
         </div>
 
+        {/* Auto-cleanup settings — prevents Airtable Tasks table from piling up */}
+        <div style={{marginTop:14,padding:12,background:"var(--hover)",borderRadius:6}}>
+          <div style={{fontSize:11,fontWeight:600,color:"var(--t1)",marginBottom:8}}>🧹 Task Cleanup</div>
+          <div style={{display:"flex",alignItems:"flex-start",gap:10,marginBottom:8}}>
+            <input type="checkbox" id="auto-cleanup-toggle" checked={autoCleanup} onChange={e=>setAutoCleanup(e.target.checked)} style={{marginTop:3}}/>
+            <label htmlFor="auto-cleanup-toggle" style={{flex:1,cursor:"pointer"}}>
+              <div style={{fontSize:11,color:"var(--t1)",fontWeight:500}}>Auto-delete old tasks before each scan</div>
+              <div style={{fontSize:10,color:"var(--t3)",marginTop:2,lineHeight:1.5}}>Deletes LinkedIn post tasks older than <input type="number" min="1" max="180" value={autoCleanupDays} onChange={e=>setAutoCleanupDays(parseInt(e.target.value)||14)} style={{width:40,padding:"1px 4px",margin:"0 3px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:3,color:"var(--t1)",fontSize:10}}/>days before starting. Prevents the Tasks table from piling up weekly.</div>
+            </label>
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginLeft:24,marginBottom:10}}>
+            <input type="checkbox" id="exclude-pushed" checked={autoCleanupExcludePushed} onChange={e=>setAutoCleanupExcludePushed(e.target.checked)}/>
+            <label htmlFor="exclude-pushed" style={{fontSize:10,color:"var(--t2)",cursor:"pointer"}}>Skip tasks already pushed to HubSpot (recommended — preserves records you're still acting on)</label>
+          </div>
+          <div style={{display:"flex",gap:6,paddingTop:8,borderTop:"1px solid var(--bdr)"}}>
+            <button className="btn btn-s" onClick={openCleanupModal} disabled={scanning}>🗑 Preview / Run Cleanup Now</button>
+            <div style={{fontSize:10,color:"var(--t3)",alignSelf:"center"}}>Also: duplicate posts (same URL within {Math.min(autoCleanupDays, 14)} days) are auto-skipped during every scan regardless of this setting.</div>
+          </div>
+        </div>
+
         {/* Action buttons */}
         <div style={{display:"flex",gap:8,marginTop:16,flexWrap:"wrap"}}>
           <button className="btn btn-p" onClick={()=>startScan(false)} disabled={isRunning}>
@@ -3764,6 +3837,64 @@ function LinkedInPostsTab({ baseId, campaign, leads }) {
 
         {err && <div style={{marginTop:12,padding:10,background:"var(--red-d)",color:"var(--red)",borderRadius:6,fontSize:11}}>❌ {err}</div>}
       </div>
+
+      {/* Cleanup preview modal */}
+      {cleanupModal && (
+        <div onClick={e=>e.target===e.currentTarget&&!cleanupModal.running&&setCleanupModal(null)} style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.75)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+          <div style={{background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:12,padding:24,width:"100%",maxWidth:560,maxHeight:"90vh",overflow:"auto"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:14}}>
+              <div style={{fontSize:15,fontWeight:600,color:"var(--t1)"}}>🗑 Clean Up Old LinkedIn Post Tasks</div>
+              <button onClick={()=>!cleanupModal.running&&setCleanupModal(null)} style={{background:"transparent",border:"none",color:"var(--t3)",cursor:"pointer",fontSize:20,padding:0,lineHeight:1}}>×</button>
+            </div>
+            <div style={{fontSize:11,color:"var(--t2)",marginBottom:14,lineHeight:1.6}}>
+              This will DELETE tasks from your Airtable Tasks table where <code style={{background:"var(--hover)",padding:"1px 4px",borderRadius:3}}>Task Rule = "{taskRuleName}"</code> AND created more than {cleanupModal.days} days ago.
+              <br/><br/>
+              <strong style={{color:"var(--t1)"}}>HubSpot records are untouched</strong> — only local Airtable records.
+            </div>
+            {cleanupModal.loading && <div style={{padding:20,textAlign:"center",color:"var(--t3)",fontSize:11}}>⏳ Looking up stale tasks...</div>}
+            {cleanupModal.preview && !cleanupModal.loading && (
+              <div>
+                <div style={{padding:14,background:"var(--hover)",borderRadius:6,marginBottom:14}}>
+                  <div style={{fontSize:24,fontWeight:600,color:cleanupModal.preview.total > 0 ? "var(--red)" : "var(--grn)"}}>{cleanupModal.preview.total}</div>
+                  <div style={{fontSize:10,color:"var(--t3)"}}>tasks would be deleted</div>
+                  {cleanupModal.preview.pushed_to_hubspot > 0 && (
+                    <div style={{marginTop:8,fontSize:10,color:"var(--t2)"}}>
+                      • {cleanupModal.preview.pushed_to_hubspot} already pushed to HubSpot
+                      <br/>• {cleanupModal.preview.not_pushed} not yet pushed
+                    </div>
+                  )}
+                </div>
+                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14}}>
+                  <input type="checkbox" id="modal-exclude-pushed" checked={cleanupModal.excludePushed} onChange={e=>setCleanupModal(m=>({...m,excludePushed:e.target.checked}))}/>
+                  <label htmlFor="modal-exclude-pushed" style={{fontSize:11,color:"var(--t2)",cursor:"pointer"}}>Only delete tasks NOT yet pushed to HubSpot {cleanupModal.preview.pushed_to_hubspot > 0 && `(will keep ${cleanupModal.preview.pushed_to_hubspot} pushed tasks)`}</label>
+                </div>
+                {cleanupModal.preview.sample?.length > 0 && (
+                  <div>
+                    <div style={{fontSize:10,color:"var(--t3)",marginBottom:6,fontWeight:500}}>Sample (first {cleanupModal.preview.sample.length}):</div>
+                    <div style={{maxHeight:200,overflowY:"auto",border:"1px solid var(--bdr)",borderRadius:6}}>
+                      {cleanupModal.preview.sample.map(s => (
+                        <div key={s.id} style={{padding:"6px 10px",borderBottom:"1px solid var(--bdr)",fontSize:10,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                          <div>
+                            <div style={{color:"var(--t1)",fontWeight:500}}>{s.lead} {s.company && <span style={{color:"var(--t3)",fontWeight:400}}>· {s.company}</span>}</div>
+                            <div style={{color:"var(--t3)",fontSize:9,marginTop:2}}>Created: {s.created?.slice(0,10)} · Score: {s.score}</div>
+                          </div>
+                          {s.pushed && <span style={{padding:"2px 6px",fontSize:9,background:"var(--amb-d)",color:"var(--amb)",borderRadius:3}}>pushed</span>}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+            <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:14}}>
+              <button className="btn btn-s" onClick={()=>setCleanupModal(null)} disabled={cleanupModal.running}>Cancel</button>
+              <button className="btn btn-p btn-s" onClick={runCleanup} disabled={cleanupModal.running || cleanupModal.loading || !cleanupModal.preview?.total} style={{background:"var(--red)",borderColor:"var(--red)"}}>
+                {cleanupModal.running ? "⏳ Deleting..." : `🗑 Delete ${cleanupModal.preview?.total || 0} tasks`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── PROGRESS PANEL ── */}
       {progress && (

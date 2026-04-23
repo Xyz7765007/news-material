@@ -767,6 +767,11 @@ async function runLinkedInPostScan({
     }
   }
 
+  // Note: old-task cleanup is handled at the handler level (see the "scan" case in POST),
+  // not here. If autoCleanupDays was passed, stale tasks have already been deleted before
+  // this function was called, so the existingTaskUrls dedupe set below will naturally reflect
+  // the post-cleanup state.
+
   // Load leads. For "specific leads", it's still faster to list all and filter
   // than to hit atGet for each ID (N sequential API calls vs one paginated list).
   let leads = await atList(baseId, "Leads");
@@ -800,6 +805,7 @@ async function runLinkedInPostScan({
     posts_fetched: prior?.posts_fetched || 0,
     posts_scored: prior?.posts_scored || 0,
     posts_filtered_out: prior?.posts_filtered_out || 0,
+    posts_deduped: prior?.posts_deduped || 0,
     tasks_created: prior?.tasks_created || 0,
     errors: prior?.errors || [],
     completed_lead_ids: Array.from(completedLeadIds),
@@ -814,6 +820,28 @@ async function runLinkedInPostScan({
     progress.ended_at = new Date().toISOString();
     await writeProgress(campaignAirtableId, progress);
     return progress;
+  }
+
+  // Pre-load existing task URLs for dedup — prevents re-creating tasks for posts we already processed.
+  // Scope: tasks with this Task Rule, created in last N days (default 14).
+  // Why 14 days: longer than the 7-day post window + buffer for weekly scan cadence.
+  // A post URL is permanent on LinkedIn so same URL = same post content.
+  const dedupLookbackDays = 14;
+  const dedupCutoffISO = new Date(Date.now() - dedupLookbackDays * 86400000).toISOString();
+  const existingTaskUrls = new Set();
+  try {
+    const escapedRule = (taskRuleName || "").replace(/"/g, '\\"');
+    const formula = `AND({Task Rule} = "${escapedRule}", IS_AFTER({Created}, "${dedupCutoffISO}"), {URL} != "")`;
+    const existing = await atList(baseId, "Tasks", { filterByFormula: formula, fields: ["URL"] });
+    for (const rec of existing) {
+      const url = rec.fields?.URL;
+      if (url) existingTaskUrls.add(String(url).trim());
+    }
+    progress.last_log = `Pre-loaded ${existingTaskUrls.size} existing task URL(s) for dedup (last ${dedupLookbackDays} days).`;
+    await writeProgress(campaignAirtableId, progress);
+  } catch (e) {
+    console.error("[linkedin-posts] Dedup pre-load failed:", e.message);
+    // Continue without dedup — better to risk duplicates than block the scan
   }
 
   const rollupCategoryCounts = prior?.category_counts || {};
@@ -876,6 +904,15 @@ async function runLinkedInPostScan({
     const rejectionReasons = progress.rejection_reasons || {};
     for (let p = 0; p < fetchedPosts.length; p++) {
       const post = fetchedPosts[p];
+
+      // DEDUP: skip if this exact post URL already has a recent task. Saves AI cost too.
+      const postUrl = (post.url || "").trim();
+      if (postUrl && existingTaskUrls.has(postUrl)) {
+        progress.posts_deduped++;
+        rejectionReasons["deduped_already_scanned"] = (rejectionReasons["deduped_already_scanned"] || 0) + 1;
+        continue;
+      }
+
       const cat = categorizePost(post.text);
       rollupCategoryCounts[cat.category] = (rollupCategoryCounts[cat.category] || 0) + 1;
 
@@ -1016,6 +1053,13 @@ async function runLinkedInPostScan({
 
       const created = await atCreateBatch(baseId, "Tasks", records);
       progress.tasks_created += created.length;
+
+      // Add these URLs to the in-memory dedup set so subsequent posts in the same
+      // scan (e.g., if a resume picks up mid-lead) don't double-create.
+      for (const sp of taskWorthy) {
+        const u = (sp.post?.url || "").trim();
+        if (u) existingTaskUrls.add(u);
+      }
     }
 
     progress.completed_lead_ids.push(lead.id);
@@ -1065,11 +1109,78 @@ export async function POST(request) {
         return NextResponse.json({ ok: true, cleared: true });
       }
 
+      // List stale LinkedIn post tasks (for preview before deletion). Returns count + sample.
+      case "list_stale_tasks": {
+        const { baseId, olderThanDays, taskRuleName } = body;
+        if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
+        const days = typeof olderThanDays === "number" && olderThanDays > 0 ? olderThanDays : 14;
+        const cutoffISO = new Date(Date.now() - days * 86400000).toISOString();
+        const rule = (taskRuleName || "LinkedIn Post Engagement").replace(/"/g, '\\"');
+        const formula = `AND({Task Rule} = "${rule}", IS_BEFORE({Created}, "${cutoffISO}"))`;
+        try {
+          const stale = await atList(baseId, "Tasks", { filterByFormula: formula, fields: ["Lead Name", "Company", "Score", "Created", "HubSpot Task ID"] });
+          const pushedCount = stale.filter(r => r.fields?.["HubSpot Task ID"]).length;
+          return NextResponse.json({
+            ok: true,
+            total: stale.length,
+            pushed_to_hubspot: pushedCount,
+            not_pushed: stale.length - pushedCount,
+            cutoff: cutoffISO,
+            days,
+            sample: stale.slice(0, 10).map(r => ({
+              id: r.id,
+              lead: r.fields?.["Lead Name"] || "",
+              company: r.fields?.Company || "",
+              score: r.fields?.Score,
+              created: r.fields?.Created,
+              pushed: !!r.fields?.["HubSpot Task ID"],
+            })),
+          });
+        } catch (e) {
+          return NextResponse.json({ error: e.message }, { status: 500 });
+        }
+      }
+
+      // Actually delete stale LinkedIn post tasks. Dangerous → requires explicit confirm flag.
+      // Airtable records only — does NOT touch HubSpot. If a task was already pushed, the HubSpot
+      // record remains (it's independent). We're just cleaning up the local signal history.
+      case "cleanup_old_tasks": {
+        const { baseId, olderThanDays, taskRuleName, excludePushed, confirm } = body;
+        if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
+        if (!confirm) return NextResponse.json({ error: "Pass confirm:true to actually delete (safety guard)" }, { status: 400 });
+        const days = typeof olderThanDays === "number" && olderThanDays > 0 ? olderThanDays : 14;
+        const cutoffISO = new Date(Date.now() - days * 86400000).toISOString();
+        const rule = (taskRuleName || "LinkedIn Post Engagement").replace(/"/g, '\\"');
+        let formula = `AND({Task Rule} = "${rule}", IS_BEFORE({Created}, "${cutoffISO}"))`;
+        // If excludePushed, skip tasks that have a HubSpot Task ID (user is still acting on them in HubSpot)
+        if (excludePushed) formula = `AND(${formula.slice(4, -1)}, {HubSpot Task ID} = "")`;
+        try {
+          const stale = await atList(baseId, "Tasks", { filterByFormula: formula, fields: ["Created"] });
+          if (stale.length === 0) return NextResponse.json({ ok: true, deleted: 0, message: "No stale tasks to delete" });
+
+          // Batch delete (max 10 per DELETE call in Airtable)
+          let deleted = 0;
+          const failures = [];
+          for (let i = 0; i < stale.length; i += 10) {
+            const batch = stale.slice(i, i + 10);
+            const qs = batch.map(r => `records[]=${r.id}`).join("&");
+            const r = await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Tasks")}?${qs}`, {
+              method: "DELETE", headers: atHdr,
+            });
+            if (r.ok) deleted += batch.length;
+            else failures.push(`Batch ${i / 10 + 1}: ${r.status} ${await r.text().then(t => t.slice(0, 100))}`);
+          }
+          return NextResponse.json({ ok: true, deleted, failed: stale.length - deleted, failures, days, cutoff: cutoffISO });
+        } catch (e) {
+          return NextResponse.json({ error: e.message }, { status: 500 });
+        }
+      }
+
       case "scan": {
         // Kick off a scan. This is a long-running op (can take several minutes for large campaigns).
         // Vercel has a 60s limit on Hobby, 300s on Pro — so we process as much as we can within the
         // budget, leaving progress state. User hits "resume" to continue.
-        const { baseId, campaignAirtableId, leadIds, scoreThreshold, daysBack, taskRuleName, systemPromptOverride, resume, force } = body;
+        const { baseId, campaignAirtableId, leadIds, scoreThreshold, daysBack, taskRuleName, systemPromptOverride, resume, force, autoCleanupDays, autoCleanupExcludePushed } = body;
         if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
         if (!campaignAirtableId) return NextResponse.json({ error: "campaignAirtableId required" }, { status: 400 });
         if (!OPENAI_KEY) return NextResponse.json({ error: "OPENAI_API_KEY not set" }, { status: 400 });
@@ -1092,6 +1203,30 @@ export async function POST(request) {
           }
         }
 
+        // Optional: auto-cleanup stale tasks BEFORE starting the scan.
+        // Keeps the Tasks table from piling up week after week.
+        let cleanedUp = 0;
+        if (typeof autoCleanupDays === "number" && autoCleanupDays > 0 && !resume) {
+          const cutoffISO = new Date(Date.now() - autoCleanupDays * 86400000).toISOString();
+          const rule = (taskRuleName || "LinkedIn Post Engagement").replace(/"/g, '\\"');
+          let formula = `AND({Task Rule} = "${rule}", IS_BEFORE({Created}, "${cutoffISO}"))`;
+          if (autoCleanupExcludePushed) formula = `AND(${formula.slice(4, -1)}, {HubSpot Task ID} = "")`;
+          try {
+            const stale = await atList(baseId, "Tasks", { filterByFormula: formula, fields: ["Created"] });
+            for (let i = 0; i < stale.length; i += 10) {
+              const batch = stale.slice(i, i + 10);
+              const qs = batch.map(r => `records[]=${r.id}`).join("&");
+              const r = await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Tasks")}?${qs}`, {
+                method: "DELETE", headers: atHdr,
+              });
+              if (r.ok) cleanedUp += batch.length;
+            }
+            if (cleanedUp > 0) console.log(`[linkedin-posts] Auto-cleanup: deleted ${cleanedUp} stale tasks older than ${autoCleanupDays} days`);
+          } catch (e) {
+            console.error("[linkedin-posts] Auto-cleanup failed (continuing anyway):", e.message);
+          }
+        }
+
         const result = await runLinkedInPostScan({
           baseId, campaignAirtableId, leadIds,
           scoreThreshold: typeof scoreThreshold === "number" ? scoreThreshold : 70,
@@ -1100,6 +1235,7 @@ export async function POST(request) {
           systemPromptOverride,
           resume: !!resume,
         });
+        if (cleanedUp > 0) result.auto_cleaned_up = cleanedUp;
         return NextResponse.json({ ok: true, progress: result });
       }
 
