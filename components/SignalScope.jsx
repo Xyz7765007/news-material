@@ -584,6 +584,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         return {
           airtableId: t.id, // so backend can save HubSpot ID back
           hubspotTaskId: f["HubSpot Task ID"] || "", // existing task? update instead of create
+          "HubSpot Last Synced Hash": f["HubSpot Last Synced Hash"] || "", // for skip-if-unchanged
           Company: f.Company,
           "Task Rule": f["Task Rule"],
           Score: f.Score,
@@ -615,10 +616,11 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       let toast = "";
       if (d.error) {
         toast = `❌ ${d.error}`;
-      } else if (d.created > 0 || d.updated > 0) {
+      } else if (d.created > 0 || d.updated > 0 || d.unchanged > 0) {
         const parts = [];
         if (d.created > 0) parts.push(`✅ ${d.created} created`);
         if (d.updated > 0) parts.push(`🔄 ${d.updated} updated (body refreshed in HubSpot)`);
+        if (d.unchanged > 0) parts.push(`✨ ${d.unchanged} unchanged (no HubSpot API call needed)`);
         if (d.skipped > 0) parts.push(`⏭️ ${d.skipped} skipped`);
         if (typeof d.associated === "number" && d.associated > 0) parts.push(`🔗 ${d.associated} linked to contacts`);
         if (typeof d.notAssociated === "number" && d.notAssociated > 0) parts.push(`⚠️ ${d.notAssociated} unlinked (contact not in HubSpot)`);
@@ -630,8 +632,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       } else if (d.errors?.length) {
         toast = `❌ Push failed: ${d.errors[0]}`;
       } else {
-        // Nothing created, nothing updated, nothing skipped, no errors — something's off
-        toast = `⚠️ HubSpot accepted the request but reported 0 changes. Likely cause: no tasks in selection. Sent ${mapped.length}, breakdown: ${withHubspotId} updates / ${willCreate} new. Response: ${JSON.stringify(d).slice(0, 200)}`;
+        toast = `⚠️ HubSpot accepted the request but reported 0 changes. Sent ${mapped.length}, breakdown: ${withHubspotId} updates / ${willCreate} new. Response: ${JSON.stringify(d).slice(0, 200)}`;
       }
       setHsMsg(toast);
       setTimeout(() => setHsMsg(""), 30000);
@@ -1691,7 +1692,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
           <button className="btn btn-s" onClick={()=>{setHsConnected(false);setHsMasked("")}}>Disconnect</button>
         </div>
       </div>)}
-      {hsMsg && <div style={{marginTop:8,fontSize:11,color:hsMsg.startsWith("✅")?"var(--grn)":"var(--red)"}}>{hsMsg}</div>}
+      {hsMsg && <div style={{marginTop:8,fontSize:11,color:hsMsg.startsWith("✅")||hsMsg.startsWith("🔄")||hsMsg.includes("updated")||hsMsg.includes("created")?"var(--grn)":hsMsg.startsWith("❌")?"var(--red)":"var(--t2)"}}>{hsMsg}</div>}
     </div>
 
     {hsConnected && (<>
@@ -2278,6 +2279,45 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   </div>)}
 
   </div></div>
+
+  {/* GLOBAL FLOATING TOAST — visible from any tab so user always sees push results */}
+  {hsMsg && (
+    <div style={{
+      position: "fixed",
+      bottom: 20,
+      right: 20,
+      maxWidth: 480,
+      padding: "12px 16px",
+      background: hsMsg.startsWith("✅") || hsMsg.startsWith("🔄") || hsMsg.includes("updated") || hsMsg.includes("created")
+        ? "var(--grn-d)"
+        : hsMsg.startsWith("❌")
+          ? "var(--red-d)"
+          : "var(--card)",
+      border: "1px solid " + (hsMsg.startsWith("✅") || hsMsg.startsWith("🔄") || hsMsg.includes("updated") || hsMsg.includes("created")
+        ? "var(--grn)"
+        : hsMsg.startsWith("❌")
+          ? "var(--red)"
+          : "var(--bdr)"),
+      color: hsMsg.startsWith("✅") || hsMsg.startsWith("🔄") || hsMsg.includes("updated") || hsMsg.includes("created")
+        ? "var(--grn)"
+        : hsMsg.startsWith("❌")
+          ? "var(--red)"
+          : "var(--t1)",
+      borderRadius: 8,
+      fontSize: 12,
+      fontWeight: 500,
+      lineHeight: 1.4,
+      zIndex: 9999,
+      boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
+      whiteSpace: "pre-wrap",
+      display: "flex",
+      alignItems: "flex-start",
+      gap: 10,
+    }}>
+      <span style={{ flex: 1 }}>{hsMsg}</span>
+      <button onClick={() => setHsMsg("")} style={{ background: "transparent", border: "none", color: "var(--t3)", cursor: "pointer", fontSize: 16, padding: 0, lineHeight: 1, marginLeft: 4 }}>×</button>
+    </div>
+  )}
 
   {editRule!==null&&<RuleEditor rule={editRule} onSave={saveRule} onClose={()=>setEditRule(null)} availableFields={availableFields}/>}
   {showExportModal&&<ExportModal tasks={selCount>0?fTasks.filter(t=>selectedTasks.has(t.id)):fTasks} accounts={accounts} leads={leads} onClose={()=>setShowExportModal(false)}/>}

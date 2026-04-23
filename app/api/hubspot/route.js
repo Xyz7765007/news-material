@@ -95,12 +95,33 @@ async function createTasks(apiKey, tasks, config) {
     created: 0,
     updated: 0,
     skipped: 0,
+    unchanged: 0,
     associated: 0,
     notAssociated: 0,
     errors: [],
     // Map of task.airtableId → hubspotTaskId so frontend can save back to Airtable
     airtableToHubspotMap: {},
+    // Map of task.airtableId → content hash, so frontend can save and skip-if-unchanged on next push
+    airtableHashes: {},
   };
+
+  // Tiny non-cryptographic hash (FNV-1a 32-bit) for cheap change detection
+  const fnv1a = (str) => {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = (h * 0x01000193) >>> 0;
+    }
+    return h.toString(36);
+  };
+  // Build a content hash from the props we send to HubSpot (excludes timestamp which always changes)
+  const hashProps = (props, customProps) => fnv1a(JSON.stringify({
+    subject: props.hs_task_subject,
+    body: props.hs_task_body,
+    priority: props.hs_task_priority,
+    status: props.hs_task_status || null,
+    custom: customProps || null,
+  }));
 
   // Split into create vs update based on HubSpot Task ID presence
   const toCreate = [];
@@ -152,7 +173,8 @@ async function createTasks(apiKey, tasks, config) {
   // Step 2: BATCH CREATE new tasks (100 per batch, with associations inline)
   for (let i = 0; i < toCreate.length; i += 100) {
     const batch = toCreate.slice(i, i + 100);
-    const inputs = batch.map(t => {
+    // Build props + hash for each (parallel arrays for efficient mapping back)
+    const batchPrepped = batch.map(t => {
       const props = {
         hs_task_subject: t.subject || `${t.Company || ""} — ${t["Task Rule"] || "Task"}`,
         hs_task_body: t.body || buildTaskBody(t),
@@ -164,7 +186,11 @@ async function createTasks(apiKey, tasks, config) {
       else props.hs_timestamp = Date.now() + 7 * 86400000;
       if (ownerId) props.hubspot_owner_id = ownerId;
       if (t.customProps) Object.assign(props, t.customProps);
+      const newHash = hashProps(props, t.customProps);
+      return { task: t, props, newHash };
+    });
 
+    const inputs = batchPrepped.map(({ task: t, props }) => {
       const associations = [];
       const email = (t.Email || "").toLowerCase().trim();
       const contactId = email ? emailToContactId[email] : null;
@@ -174,7 +200,6 @@ async function createTasks(apiKey, tasks, config) {
           types: [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: 204 }],
         });
       }
-
       const input = { properties: props };
       if (associations.length > 0) input.associations = associations;
       return input;
@@ -191,9 +216,10 @@ async function createTasks(apiKey, tasks, config) {
       results.created += created.length;
       // Map back: HubSpot returns results in same order as inputs
       created.forEach((hsTask, idx) => {
-        const airtableTask = batch[idx];
-        if (airtableTask.airtableId) {
+        const { task: airtableTask, newHash } = batchPrepped[idx] || {};
+        if (airtableTask?.airtableId) {
           results.airtableToHubspotMap[airtableTask.airtableId] = hsTask.id;
+          results.airtableHashes[airtableTask.airtableId] = newHash;
         }
       });
       const associatedInBatch = inputs.filter(inp => (inp.associations || []).length > 0).length;
@@ -209,21 +235,45 @@ async function createTasks(apiKey, tasks, config) {
   // Step 3: BATCH UPDATE existing tasks (100 per batch)
   // Note: HubSpot batch update does NOT modify associations — only properties.
   // If a task existed with wrong association, that won't be fixed here (rare edge case).
+  //
+  // OPTIMIZATION: skip API call if the body+subject+priority haven't changed since last push.
+  // We store a cheap content hash on the Airtable task (`HubSpot Last Synced Hash`).
+  // If the new hash matches the stored one, this push is a no-op for that task.
+  // This avoids: wasted HubSpot API quota, unnecessary lastmodifieddate bumps that mess up sorting.
+
   for (let i = 0; i < toUpdate.length; i += 100) {
     const batch = toUpdate.slice(i, i + 100);
-    const inputs = batch.map(t => {
+    // Build the props for each task and compute its hash, then split into "changed" vs "unchanged"
+    const candidates = batch.map(t => {
       const props = {
         hs_task_subject: t.subject || `${t.Company || ""} — ${t["Task Rule"] || "Task"}`,
         hs_task_body: t.body || buildTaskBody(t),
         hs_task_priority: priority || "MEDIUM",
       };
-      // Only update status if explicitly provided (don't accidentally reopen completed tasks)
       if (status && status !== "NOT_STARTED") props.hs_task_status = status;
       if (t.dueDate) props.hs_timestamp = new Date(t.dueDate).getTime();
-      // Don't touch ownerId on updates — respects manual reassignments SDRs may have done
       if (t.customProps) Object.assign(props, t.customProps);
-      return { id: t.hubspotTaskId, properties: props };
+
+      const newHash = hashProps(props, t.customProps);
+      const oldHash = t["HubSpot Last Synced Hash"] || "";
+      const unchanged = oldHash === newHash;
+      return { task: t, props, newHash, unchanged };
     });
+
+    const changed = candidates.filter(c => !c.unchanged);
+    const unchangedCount = candidates.length - changed.length;
+    if (unchangedCount > 0) {
+      console.log(`[HUBSPOT createTasks] Skipping ${unchangedCount} unchanged task(s) — body+subject+priority identical to last push`);
+      results.unchanged += unchangedCount;
+      // Still preserve the airtableId mapping so the IDs persist (no-op write but keeps things consistent)
+      candidates.filter(c => c.unchanged).forEach(c => {
+        if (c.task.airtableId) results.airtableToHubspotMap[c.task.airtableId] = c.task.hubspotTaskId;
+      });
+    }
+
+    if (changed.length === 0) continue; // entire batch was unchanged — no API call
+
+    const inputs = changed.map(c => ({ id: c.task.hubspotTaskId, properties: c.props }));
 
     const res = await fetch(`${HS_API}/crm/v3/objects/tasks/batch/update`, {
       method: "POST", headers: hsHdr(apiKey),
@@ -234,9 +284,12 @@ async function createTasks(apiKey, tasks, config) {
       const data = await res.json();
       const updated = data.results || [];
       results.updated += updated.length;
-      // Map back (keep existing ID)
-      batch.forEach(t => {
-        if (t.airtableId) results.airtableToHubspotMap[t.airtableId] = t.hubspotTaskId;
+      // Map back ID + new hash so next push can skip if still unchanged
+      changed.forEach(c => {
+        if (c.task.airtableId) {
+          results.airtableToHubspotMap[c.task.airtableId] = c.task.hubspotTaskId;
+          results.airtableHashes[c.task.airtableId] = c.newHash;
+        }
       });
     } else {
       const err = await res.text();
@@ -1414,12 +1467,16 @@ export async function POST(request) {
         const result = await createTasks(apiKey, tasks, config || {});
 
         // Persist HubSpot Task IDs back to Airtable tasks so future pushes can UPDATE instead of CREATE
+        // Also persist content hashes so future pushes can SKIP if nothing changed
         if (baseId && Object.keys(result.airtableToHubspotMap).length > 0) {
           const nowISO = new Date().toISOString();
-          const updates = Object.entries(result.airtableToHubspotMap).map(([airtableId, hsId]) => ({
-            id: airtableId,
-            fields: { "HubSpot Task ID": String(hsId), "HubSpot Last Synced": nowISO },
-          }));
+          const hashes = result.airtableHashes || {};
+          const updates = Object.entries(result.airtableToHubspotMap).map(([airtableId, hsId]) => {
+            const fields = { "HubSpot Task ID": String(hsId), "HubSpot Last Synced": nowISO };
+            // Only set the hash if we have a new one (i.e. this task was actually pushed, not skipped-unchanged)
+            if (hashes[airtableId]) fields["HubSpot Last Synced Hash"] = hashes[airtableId];
+            return { id: airtableId, fields };
+          });
 
           // Batch update in groups of 10 (Airtable limit) with auto-heal for missing fields
           const attemptUpdate = async (batch, attempt = 0) => {
