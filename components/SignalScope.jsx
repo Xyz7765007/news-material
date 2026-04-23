@@ -4230,16 +4230,25 @@ function LinkedInPostsTab({ baseId, campaign, leads, onCampaignProvisioned }) {
             <details style={{marginTop:10}} open={progress.tasks_created === 0 && progress.posts_scored > 0}>
               <summary style={{cursor:"pointer",fontSize:10,color:"var(--t2)",fontWeight:500}}>🔍 Recent scored posts ({progress.recent_samples.length}) — click to audit</summary>
               <div style={{marginTop:8,maxHeight:400,overflowY:"auto",display:"flex",flexDirection:"column",gap:8}}>
-                {progress.recent_samples.map((s, i) => (
-                  <div key={i} style={{padding:10,background:s.outcome==="task_created"?"rgba(93,168,122,.08)":"var(--hover)",border:"1px solid "+(s.outcome==="task_created"?"var(--grn)":"var(--bdr)"),borderRadius:6,fontSize:10}}>
+                {progress.recent_samples.map((s, i) => {
+                  const isTask = s.outcome === "task_created";
+                  const isPending = s.outcome === "pending_task_creation";
+                  const isFailed = s.outcome === "task_creation_failed";
+                  const badge = isTask ? "✓ TASK" : isPending ? "⏳ PENDING" : isFailed ? "⚠ FAILED" : "✗ DROPPED";
+                  const badgeColor = isTask ? "var(--grn)" : isPending ? "var(--amb)" : isFailed ? "var(--red)" : "var(--t3)";
+                  const bg = isTask ? "rgba(93,168,122,.08)" : isFailed ? "rgba(239,68,68,.08)" : "var(--hover)";
+                  const border = isTask ? "var(--grn)" : isFailed ? "var(--red)" : "var(--bdr)";
+                  return (
+                  <div key={i} style={{padding:10,background:bg,border:"1px solid "+border,borderRadius:6,fontSize:10}}>
                     <div style={{display:"flex",justifyContent:"space-between",gap:8,marginBottom:4}}>
                       <div style={{color:"var(--t1)",fontWeight:500}}>{s.lead} {s.company && <span style={{color:"var(--t3)",fontWeight:400}}>· {s.company}</span>}</div>
                       <div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}>
-                        <span style={{color:s.outcome==="task_created"?"var(--grn)":"var(--t3)",fontWeight:600}}>{s.outcome==="task_created"?"✓ TASK":"✗ DROPPED"}</span>
+                        <span style={{color:badgeColor,fontWeight:600}}>{badge}</span>
                         <span style={{padding:"1px 6px",background:"var(--card)",borderRadius:3,color:"var(--t1)",fontWeight:600,fontFamily:"'JetBrains Mono',monospace"}}>{s.final_score}</span>
                       </div>
                     </div>
                     <div style={{color:"var(--t2)",marginBottom:4,fontStyle:"italic",lineHeight:1.5}}>"{s.post_text}{s.post_text?.length >= 280 ? "..." : ""}"</div>
+                    {isFailed && s.error && <div style={{color:"var(--red)",marginBottom:4,fontSize:9,fontFamily:"'JetBrains Mono',monospace"}}>Airtable error: {String(s.error).slice(0,200)}</div>}
                     <div style={{display:"flex",flexWrap:"wrap",gap:8,fontSize:9,color:"var(--t3)"}}>
                       <span>type: <strong style={{color:"var(--t2)"}}>{s.post_type}</strong></span>
                       <span>category: <strong style={{color:"var(--t2)"}}>{s.category}</strong>{s.penalty !== 0 ? ` (${s.penalty})` : ""}</span>
@@ -4253,7 +4262,8 @@ function LinkedInPostsTab({ baseId, campaign, leads, onCampaignProvisioned }) {
                       <div style={{marginTop:3,fontSize:9,color:"var(--t3)"}}>reason: <span style={{color:"var(--t2)"}}>{s.rationale}</span></div>
                     )}
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </details>
           )}

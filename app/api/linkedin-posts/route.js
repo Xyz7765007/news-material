@@ -62,15 +62,46 @@ async function atUpdate(baseId, table, id, fields) {
 
 async function atCreateBatch(baseId, table, records) {
   const results = [];
+  const errors = [];
   for (let i = 0; i < records.length; i += 10) {
     const batch = records.slice(i, i + 10);
     const r = await fetch(`${AT_API}/${baseId}/${encodeURIComponent(table)}`, {
       method: "POST", headers: atHdr, body: JSON.stringify({ records: batch, typecast: true }),
     });
     if (r.ok) { const d = await r.json(); results.push(...(d.records || [])); }
-    else { console.error(`[linkedin-posts] Task create failed: ${r.status}`, await r.text().then(t => t.slice(0, 300))); }
+    else {
+      const errText = await r.text().then(t => t.slice(0, 500));
+      console.error(`[linkedin-posts] Task create failed: ${r.status} to base=${baseId} table=${table}`, errText);
+      errors.push(`${r.status}: ${errText}`);
+
+      // If Airtable says a field is unknown, try stripping offending fields one at a time
+      // and re-attempting. This catches schema mismatches between environments.
+      if (errText.includes("UNKNOWN_FIELD_NAME") || errText.includes("INVALID_VALUE_FOR_COLUMN") || errText.includes("TABLE_NOT_FOUND")) {
+        const m = errText.match(/[Uu]nknown field name:?\s*\\?"([^"\\]+)\\?"/) || errText.match(/Field\s+\\?"([^"\\]+)\\?"/);
+        const badField = m ? m[1] : null;
+        if (badField) {
+          console.warn(`[linkedin-posts] Retrying batch without bad field: "${badField}"`);
+          const stripped = batch.map(rec => {
+            const f = { ...rec.fields };
+            delete f[badField];
+            return { ...rec, fields: f };
+          });
+          const retry = await fetch(`${AT_API}/${baseId}/${encodeURIComponent(table)}`, {
+            method: "POST", headers: atHdr, body: JSON.stringify({ records: stripped, typecast: true }),
+          });
+          if (retry.ok) {
+            const d = await retry.json();
+            results.push(...(d.records || []));
+            errors.pop(); // recovered, remove the error
+          } else {
+            const retryText = await retry.text().then(t => t.slice(0, 500));
+            console.error(`[linkedin-posts] Retry also failed: ${retry.status}`, retryText);
+          }
+        }
+      }
+    }
   }
-  return results;
+  return { results, errors };
 }
 
 // Auto-create missing fields + retry (for status-progress field on Campaigns, or scoring fields on Leads)
@@ -302,7 +333,9 @@ async function fetchPostsForUrn(urn, cutoffMs, maxPages = 3, maxPosts = 2) {
       }
 
       // Skip posts without text (reshares without commentary, video-only, etc.)
-      const text = (p.text || p.post_text || p.content || p.commentary || p.description || "").trim();
+      // RapidAPI sometimes returns nested objects here — guard with String() coercion.
+      const textSource = p.text || p.post_text || p.content || p.commentary || p.description || "";
+      const text = (typeof textSource === "string" ? textSource : String(textSource || "")).trim();
       if (!text) continue;
 
       all.push({
@@ -1118,6 +1151,9 @@ async function runLinkedInPostScan({
 
       // Keep a rolling sample of the last 20 scored posts so the user can audit decisions
       // without having to look up individual tasks. Especially useful for debugging "why nothing passed".
+      // Outcome is optimistic here — will flip to "task_creation_failed" later if Airtable rejects.
+      // For now: "would_create_task" (pending batch write) or "dropped" (decision final).
+      const willAttemptTask = adjusted >= scoreThreshold && VALID_TASK_POST_TYPES.has(scored.post_type) && !NEVER_TASK_CATEGORIES.has(cat.category);
       if (!progress.recent_samples) progress.recent_samples = [];
       progress.recent_samples.unshift({
         lead: leadName,
@@ -1131,7 +1167,7 @@ async function runLinkedInPostScan({
         post_type: scored.post_type,
         evidence: scored.evidence_quote,
         rationale: scored.relevance_rationale,
-        outcome: adjusted >= scoreThreshold && VALID_TASK_POST_TYPES.has(scored.post_type) && !NEVER_TASK_CATEGORIES.has(cat.category) ? "task_created" : "dropped",
+        outcome: willAttemptTask ? "pending_task_creation" : "dropped",
       });
       if (progress.recent_samples.length > 20) progress.recent_samples = progress.recent_samples.slice(0, 20);
 
@@ -1193,8 +1229,31 @@ async function runLinkedInPostScan({
         };
       });
 
-      const created = await atCreateBatch(baseId, "Tasks", records);
+      const { results: created, errors: createErrors } = await atCreateBatch(baseId, "Tasks", records);
       progress.tasks_created += created.length;
+
+      // Flip the "pending_task_creation" samples to final state based on what Airtable did.
+      if (progress.recent_samples) {
+        // Build a set of URLs that successfully got created (from the Airtable response)
+        const createdUrls = new Set(created.map(rec => rec.fields?.URL).filter(Boolean));
+        for (const sample of progress.recent_samples) {
+          if (sample.outcome !== "pending_task_creation") continue;
+          if (sample.lead !== leadName) continue;
+          if (createdUrls.has(sample.post_url)) {
+            sample.outcome = "task_created";
+          } else {
+            sample.outcome = "task_creation_failed";
+            sample.error = createErrors[0] || "Task not in Airtable response";
+          }
+        }
+      }
+
+      // CRITICAL: Surface task creation failures in progress so the user sees them.
+      if (createErrors && createErrors.length > 0) {
+        for (const err of createErrors) {
+          progress.errors.push(`⚠️ Task create failed for ${leadName}: ${err}`);
+        }
+      }
 
       // Add these URLs to the in-memory dedup set so subsequent posts in the same
       // scan (e.g., if a resume picks up mid-lead) don't double-create.
