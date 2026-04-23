@@ -38,6 +38,7 @@ const slUpdateSchedule = (key, id, payload) => smartleadReq(`/campaigns/${id}/sc
 const slUpdateSettings = (key, id, payload) => smartleadReq(`/campaigns/${id}/settings`, "POST", payload, key);
 const slAddEmailAccounts = (key, id, ids) => smartleadReq(`/campaigns/${id}/email-accounts`, "POST", { email_account_ids: ids }, key);
 const slSaveSequences = (key, id, sequences) => smartleadReq(`/campaigns/${id}/sequences`, "POST", { sequences }, key);
+const slGetSequences = (key, id) => smartleadReq(`/campaigns/${id}/sequences`, "GET", null, key);
 const slAddLeads = (key, id, leads) => smartleadReq(`/campaigns/${id}/leads`, "POST", { lead_list: leads }, key);
 const slUpdateStatus = (key, id, status) => smartleadReq(`/campaigns/${id}/status`, "POST", { status }, key);
 
@@ -51,7 +52,10 @@ async function atList(baseId, table, params = {}) {
   do {
     const url = `${AT_API}/${baseId}/${encodeURIComponent(table)}?${qs}${offset ? "&offset=" + offset : ""}`;
     const res = await fetch(url, { headers: atHdr });
-    if (!res.ok) break;
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Airtable ${table} fetch failed (${res.status}): ${errText.slice(0, 200)}`);
+    }
     const d = await res.json();
     all.push(...(d.records || []));
     offset = d.offset;
@@ -83,6 +87,27 @@ function buildPersonalizationContext(lead, factors) {
   if (factors.linkedin && f["LinkedIn URL"]) lines.push(`LinkedIn: ${f["LinkedIn URL"]}`);
   if (factors.signals && f.Signal) lines.push(`Recent signal: ${f.Signal}`);
   if (factors.bio && f.Bio) lines.push(`Bio: ${String(f.Bio).slice(0, 300)}`);
+
+  // GA engagement data — included by default if present (factors.ga !== false explicitly disables)
+  // This is critical for warm outreach that references actual website behavior
+  const gaScore = Number(f["GA Engagement Score"] || 0);
+  if (factors.ga !== false && gaScore > 0) {
+    const gaSessions = Number(f["GA Sessions"] || 0);
+    const gaViews = Number(f["GA Views"] || 0);
+    const gaEngagementTime = Number(f["GA Engagement Time"] || 0);
+    const gaLastVisit = f["GA Last Visit"] || "";
+    const tier = gaScore >= 51 ? "🔥 Hot" : gaScore >= 21 ? "⚡ Interested" : "👀 Warm";
+    lines.push(`\n=== Website Engagement (THEY VISITED OUR SITE) ===`);
+    lines.push(`Engagement tier: ${tier} (score ${gaScore}/100)`);
+    if (gaSessions > 0) lines.push(`Sessions: ${gaSessions}`);
+    if (gaViews > 0) lines.push(`Pageviews: ${gaViews}`);
+    if (gaEngagementTime > 0) {
+      const t = gaEngagementTime >= 60 ? `${Math.floor(gaEngagementTime/60)} minutes ${Math.floor(gaEngagementTime%60)}s` : `${Math.floor(gaEngagementTime)} seconds`;
+      lines.push(`Time on site: ${t}`);
+    }
+    if (gaLastVisit) lines.push(`Last visit: ${gaLastVisit}`);
+    lines.push(`USE THIS to open the email — they're already aware of you. Don't pitch from scratch; reference their actual interest.`);
+  }
   return lines.join("\n");
 }
 
@@ -111,6 +136,13 @@ RULES:
 - Do NOT include any merge field placeholders like {first_name} — use the actual lead data
 - Do NOT include a signature block (sender's email tool adds it automatically)
 - Do NOT mention you're an AI or apologize for cold outreach
+
+ENGAGEMENT-AWARE OPENING (when "Website Engagement" data is present in the lead context):
+- This is a WARM lead — they've already visited your website
+- The opener MUST reference their actual behavior (e.g., "saw you've been digging into our [topic]" or "noticed you spent X minutes on our [page]")
+- Frame as helpful follow-up, NOT cold pitch — they're already curious
+- Don't be creepy — keep it casual ("happened to notice", "your team's been exploring")
+- The subject line should also reflect this warmth (e.g., "quick follow-up" instead of generic intro)
 
 ${sequenceInstr}
 
@@ -166,12 +198,34 @@ Write the email${config.sequenceLength > 1 ? "s" : ""} now. Return JSON only.`;
     const raw = textBlock?.text || "{}";
     // Strip any accidental markdown fences
     const clean = raw.replace(/^```json\s*|\s*```$/g, "").trim();
-    const parsed = JSON.parse(clean);
+    let parsed;
+    try {
+      parsed = JSON.parse(clean);
+    } catch (parseErr) {
+      console.error(`[generateEmail] JSON parse failed for ${lead.fields?.Name || lead.id}. Raw response:`, raw.slice(0, 500));
+      return { ok: false, error: `AI returned invalid JSON: ${parseErr.message}. Raw start: "${clean.slice(0, 100)}"` };
+    }
 
     if (config.sequenceLength > 1) {
       const emails = parsed.emails || [];
-      return { ok: true, emails: emails.map(e => ({ subject: e.subject || "", body: e.body || "" })) };
+      if (!Array.isArray(emails) || emails.length === 0) {
+        return { ok: false, error: `AI response missing "emails" array. Got keys: ${Object.keys(parsed).join(", ")}` };
+      }
+      // Pad with empty if AI returned fewer than requested
+      const padded = [];
+      for (let i = 0; i < config.sequenceLength; i++) {
+        const e = emails[i] || {};
+        padded.push({ subject: e.subject || "", body: e.body || "" });
+      }
+      // Validate at least the first email has content
+      if (!padded[0].subject || !padded[0].body) {
+        return { ok: false, error: "AI returned email with missing subject or body" };
+      }
+      return { ok: true, emails: padded };
     } else {
+      if (!parsed.subject || !parsed.body) {
+        return { ok: false, error: `AI response missing subject/body. Got: ${JSON.stringify(parsed).slice(0, 150)}` };
+      }
       return { ok: true, emails: [{ subject: parsed.subject || "", body: parsed.body || "" }] };
     }
   } catch (e) {
@@ -333,6 +387,21 @@ export async function POST(request) {
         return NextResponse.json(res.ok ? { campaigns: res.data || [] } : { error: res.data?.message || "Failed", details: res.data });
       }
 
+      // ─── Inspect an existing campaign before adding leads to it ───
+      case "inspect_smartlead_campaign": {
+        const { apiKey, smartleadCampaignId } = body;
+        if (!apiKey) return NextResponse.json({ error: "apiKey required" }, { status: 400 });
+        if (!smartleadCampaignId) return NextResponse.json({ error: "smartleadCampaignId required" }, { status: 400 });
+        const res = await slGetSequences(apiKey, smartleadCampaignId);
+        if (!res.ok) return NextResponse.json({ error: "Failed to fetch sequences", details: res.data }, { status: 400 });
+        // Smartlead returns sequences as array — each with seq_number, subject, email_body
+        const sequences = Array.isArray(res.data) ? res.data : (res.data?.sequences || []);
+        return NextResponse.json({
+          sequenceCount: sequences.length,
+          sequences: sequences.map(s => ({ seq_number: s.seq_number, subject: s.subject, has_body: !!s.email_body })),
+        });
+      }
+
       case "list_smartlead_email_accounts": {
         const key = body.apiKey;
         const res = await slListEmailAccounts(key);
@@ -342,23 +411,31 @@ export async function POST(request) {
       // ─── Lead listing ──────────────────────────────────
       case "list_leads_by_tag": {
         if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
-        const leads = await atList(baseId, "Leads");
-        const tag = body.campaignTag;
-        const filtered = tag ? leads.filter(l => (l.fields?.["Campaign Tag"] || "") === tag) : leads;
-        // Only those with email
-        const withEmail = filtered.filter(l => (l.fields?.Email || "").includes("@"));
-        return NextResponse.json({ leads: withEmail, total: filtered.length, withEmail: withEmail.length });
+        try {
+          const leads = await atList(baseId, "Leads");
+          const tag = body.campaignTag;
+          const filtered = tag ? leads.filter(l => (l.fields?.["Campaign Tag"] || "") === tag) : leads;
+          // Only those with email
+          const withEmail = filtered.filter(l => (l.fields?.Email || "").includes("@"));
+          return NextResponse.json({ leads: withEmail, total: filtered.length, withEmail: withEmail.length });
+        } catch (e) {
+          return NextResponse.json({ error: "Failed to load leads: " + e.message }, { status: 500 });
+        }
       }
 
       case "list_campaign_tags": {
         if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
-        const leads = await atList(baseId, "Leads");
-        const tagCounts = {};
-        for (const l of leads) {
-          const tag = l.fields?.["Campaign Tag"] || "(no tag)";
-          tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+        try {
+          const leads = await atList(baseId, "Leads");
+          const tagCounts = {};
+          for (const l of leads) {
+            const tag = l.fields?.["Campaign Tag"] || "(no tag)";
+            tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+          }
+          return NextResponse.json({ tags: Object.entries(tagCounts).map(([tag, count]) => ({ tag, count })) });
+        } catch (e) {
+          return NextResponse.json({ tags: [], error: "Failed to load tags: " + e.message });
         }
-        return NextResponse.json({ tags: Object.entries(tagCounts).map(([tag, count]) => ({ tag, count })) });
       }
 
       // ─── AI generation ─────────────────────────────────
@@ -369,12 +446,19 @@ export async function POST(request) {
         if (!config?.purpose) return NextResponse.json({ error: "Campaign offer description (purpose) is required" }, { status: 400 });
         if (!config?.senderProfile) return NextResponse.json({ error: "Sender profile is required — set it once at the top of the wizard" }, { status: 400 });
 
-        const allLeads = await atList(baseId, "Leads");
+        let allLeads;
+        try { allLeads = await atList(baseId, "Leads"); }
+        catch (e) { return NextResponse.json({ error: "Failed to load leads from Airtable: " + e.message }, { status: 500 }); }
         const targetLeads = allLeads.filter(l => leadIds.includes(l.id));
+        if (targetLeads.length === 0) {
+          return NextResponse.json({ error: `None of the ${leadIds.length} selected lead IDs were found in Airtable. They may have been deleted.` }, { status: 404 });
+        }
 
         const results = [];
+        let failedCount = 0;
         for (const lead of targetLeads) {
           const r = await generateEmailForLead(lead, config, factors);
+          if (!r.ok) failedCount++;
           results.push({
             leadId: lead.id,
             name: lead.fields?.Name || "Unknown",
@@ -386,13 +470,20 @@ export async function POST(request) {
           // brief throttle to avoid rate limits
           await new Promise(r => setTimeout(r, 300));
         }
-        return NextResponse.json({ results });
+        console.log(`[generate_emails] ${results.length} processed, ${failedCount} failed`);
+        return NextResponse.json({ results, generated: results.length - failedCount, failed: failedCount });
       }
 
       case "regenerate_email": {
         if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
         const { leadId, config, factors = {}, feedback = "" } = body;
-        const allLeads = await atList(baseId, "Leads");
+        if (!leadId) return NextResponse.json({ error: "leadId required" }, { status: 400 });
+        if (!config?.purpose) return NextResponse.json({ error: "config.purpose required" }, { status: 400 });
+        if (!config?.senderProfile) return NextResponse.json({ error: "config.senderProfile required" }, { status: 400 });
+
+        let allLeads;
+        try { allLeads = await atList(baseId, "Leads"); }
+        catch (e) { return NextResponse.json({ error: "Failed to load leads: " + e.message }, { status: 500 }); }
         const lead = allLeads.find(l => l.id === leadId);
         if (!lead) return NextResponse.json({ error: "Lead not found" }, { status: 404 });
         const r = await generateEmailForLead(lead, config, factors, feedback);
@@ -414,15 +505,69 @@ export async function POST(request) {
           if (mode === "existing" && existingCampaignId) {
             slCampaignId = existingCampaignId;
             log.push(`Using existing Smartlead campaign ${slCampaignId}`);
+
+            // CRITICAL: verify the existing campaign's sequence count matches what we generated
+            // If we generated 3 emails per lead but the campaign only has 1 step, follow-ups will be lost
+            const generatedSeqLen = (generatedEmails[0]?.emails || []).length || 1;
+            const seqRes = await slGetSequences(apiKey, slCampaignId);
+            if (!seqRes.ok) {
+              return NextResponse.json({ error: "Couldn't read existing campaign's sequence steps to verify compatibility", details: seqRes.data, log }, { status: 400 });
+            }
+            const existingSequences = Array.isArray(seqRes.data) ? seqRes.data : (seqRes.data?.sequences || []);
+            const existingSeqCount = existingSequences.length;
+            log.push(`Existing campaign has ${existingSeqCount} sequence step(s); generated ${generatedSeqLen} email(s) per lead`);
+
+            if (existingSeqCount === 0) {
+              return NextResponse.json({
+                error: `Existing campaign "${existingCampaignId}" has NO sequence steps configured. Set up sequences in Smartlead first, OR create a new campaign instead.`,
+                log,
+              }, { status: 400 });
+            }
+            if (generatedSeqLen > existingSeqCount && body.allowSequenceMismatch !== true) {
+              return NextResponse.json({
+                error: `Sequence mismatch: you generated ${generatedSeqLen} emails per lead, but the existing campaign only has ${existingSeqCount} step(s). Follow-ups beyond step ${existingSeqCount} would be silently dropped. Either: (1) reduce sequence length to ${existingSeqCount}, (2) create a new campaign, or (3) re-launch with allowSequenceMismatch=true to accept the loss.`,
+                log,
+                existingSeqCount,
+                generatedSeqLen,
+                requiresConfirmation: true,
+              }, { status: 400 });
+            }
+            // Verify each existing sequence step references the placeholder we expect
+            // (subject_2, body_2 for step 2, etc.) — if not, leads' custom_fields won't render
+            const placeholderIssues = [];
+            existingSequences.slice(0, generatedSeqLen).forEach((s, i) => {
+              const expectedSubjectPh = i === 0 ? "{{subject}}" : `{{subject_${i + 1}}}`;
+              const expectedBodyPh = i === 0 ? "{{body}}" : `{{body_${i + 1}}}`;
+              const subjOk = (s.subject || "").includes(expectedSubjectPh);
+              const bodyOk = (s.email_body || "").includes(expectedBodyPh);
+              if (!subjOk || !bodyOk) {
+                placeholderIssues.push(`Step ${i + 1}: ${!subjOk ? `subject missing ${expectedSubjectPh}` : ""}${!subjOk && !bodyOk ? "; " : ""}${!bodyOk ? `body missing ${expectedBodyPh}` : ""}`);
+              }
+            });
+            if (placeholderIssues.length > 0 && body.allowPlaceholderMismatch !== true) {
+              return NextResponse.json({
+                error: `Existing campaign sequences don't reference SignalScope placeholders. Each step must contain ${"{{subject}} / {{body}}"} (step 1) or ${"{{subject_N}} / {{body_N}}"} (step N). Issues:\n${placeholderIssues.join("\n")}\n\nFix the sequences in Smartlead to use these placeholders, or create a new campaign instead.`,
+                log,
+                placeholderIssues,
+                requiresConfirmation: true,
+              }, { status: 400 });
+            }
+            if (placeholderIssues.length > 0) {
+              log.push(`⚠️ Placeholder mismatches accepted by user (${placeholderIssues.length} issue(s))`);
+            }
           } else {
             // Create new
             const createRes = await slCreateCampaign(apiKey, {
               name: campaignName || `SignalScope Campaign ${new Date().toISOString().slice(0,16)}`,
               client_id: null,
             });
-            if (!createRes.ok) return NextResponse.json({ error: "Smartlead create failed", details: createRes.data }, { status: 400 });
-            slCampaignId = createRes.data?.id || createRes.data?.campaign_id;
-            if (!slCampaignId) return NextResponse.json({ error: "No campaign ID returned", details: createRes.data }, { status: 400 });
+            if (!createRes.ok) return NextResponse.json({ error: "Smartlead create failed", details: createRes.data, log }, { status: 400 });
+            // Defensive: parse multiple possible response shapes
+            slCampaignId = createRes.data?.id
+              || createRes.data?.campaign_id
+              || createRes.data?.data?.id
+              || createRes.data?.data?.campaign_id;
+            if (!slCampaignId) return NextResponse.json({ error: "No campaign ID returned by Smartlead", details: createRes.data, log }, { status: 400 });
             log.push(`Created Smartlead campaign ${slCampaignId}`);
 
             // Schedule
@@ -444,6 +589,8 @@ export async function POST(request) {
               const eaRes = await slAddEmailAccounts(apiKey, slCampaignId, emailAccountIds);
               if (!eaRes.ok) return NextResponse.json({ error: "Failed to attach mailboxes", details: eaRes.data, log }, { status: 400 });
               log.push(`Attached ${emailAccountIds.length} mailbox(es)`);
+            } else {
+              return NextResponse.json({ error: "At least one mailbox is required for a new campaign", log }, { status: 400 });
             }
 
             // Sequences — use placeholder template that pulls per-lead custom fields
@@ -463,7 +610,13 @@ export async function POST(request) {
           }
 
           // Add leads with per-lead personalized content via custom_fields
-          const leadList = generatedEmails.filter(g => g.ok && g.email).map(g => {
+          const skippedNoEmail = generatedEmails.filter(g => !g.ok || !g.email).length;
+          const validGenerated = generatedEmails.filter(g => g.ok && g.email);
+          if (skippedNoEmail > 0) log.push(`⚠️ ${skippedNoEmail} lead(s) skipped (generation failed or no email)`);
+          if (validGenerated.length === 0) {
+            return NextResponse.json({ error: "No leads have generated emails — nothing to send", log }, { status: 400 });
+          }
+          const leadList = validGenerated.map(g => {
             const cf = {};
             (g.emails || []).forEach((e, i) => {
               if (i === 0) {
@@ -485,25 +638,49 @@ export async function POST(request) {
           });
 
           // Smartlead caps at 400 per request
-          let added = 0, skipped = 0;
+          let added = 0, skipped = 0, batchFailures = 0;
           const errors = [];
           for (let i = 0; i < leadList.length; i += 400) {
             const batch = leadList.slice(i, i + 400);
             const addRes = await slAddLeads(apiKey, slCampaignId, batch);
             if (addRes.ok) {
-              added += addRes.data?.added_count || addRes.data?.upload_count || batch.length;
-              skipped += addRes.data?.skipped_count || 0;
+              // Smartlead returns { upload_count: N, total_leads: M, ... } for new uploads,
+              // or { added_count } for older API. Don't fall back to batch.length — that masks errors.
+              const a = addRes.data?.upload_count ?? addRes.data?.added_count ?? addRes.data?.uploaded;
+              const s = addRes.data?.duplicate_count ?? addRes.data?.skipped_count ?? 0;
+              if (typeof a === "number") {
+                added += a;
+                skipped += (typeof s === "number" ? s : 0);
+              } else {
+                // Unknown response shape — don't claim success blindly. Log it.
+                log.push(`⚠️ Batch ${Math.floor(i / 400) + 1}: unrecognized response shape, treating as ${batch.length} added pending verification`);
+                added += batch.length;
+              }
             } else {
-              errors.push(JSON.stringify(addRes.data).slice(0, 200));
+              batchFailures++;
+              errors.push(`Batch ${Math.floor(i / 400) + 1} (HTTP ${addRes.status}): ${JSON.stringify(addRes.data).slice(0, 200)}`);
+              console.error("[launch] Lead batch failed:", addRes.status, JSON.stringify(addRes.data).slice(0, 300));
             }
           }
-          log.push(`Added ${added} leads, ${skipped} skipped`);
+          if (batchFailures > 0) log.push(`❌ ${batchFailures} of ${Math.ceil(leadList.length / 400)} lead batches failed`);
+          log.push(`Added ${added} leads${skipped > 0 ? `, ${skipped} duplicates skipped` : ""}`);
 
           // Activate campaign if user requested
-          if (body.activate !== false) {
+          if (body.activate === true) {
             const actRes = await slUpdateStatus(apiKey, slCampaignId, "START");
-            if (!actRes.ok) log.push(`⚠️ Failed to activate: ${JSON.stringify(actRes.data).slice(0,150)}`);
-            else log.push(`✅ Campaign activated`);
+            if (!actRes.ok) {
+              log.push(`⚠️ Failed to activate: ${JSON.stringify(actRes.data).slice(0,150)}`);
+              return NextResponse.json({
+                ok: true,
+                warning: "Campaign created and leads added, but activation failed. Activate manually in Smartlead.",
+                smartleadCampaignId: slCampaignId,
+                added, skipped,
+                errors: errors.length > 0 ? errors : undefined,
+                log,
+                smartleadUrl: `https://app.smartlead.ai/app/email-campaign/${slCampaignId}/analytics`,
+              });
+            }
+            log.push(`✅ Campaign activated`);
           } else {
             log.push(`Campaign created in DRAFT state — activate from Smartlead manually`);
           }
@@ -512,11 +689,14 @@ export async function POST(request) {
             ok: true,
             smartleadCampaignId: slCampaignId,
             added, skipped,
+            skippedNoEmail,
+            batchFailures,
             errors: errors.length > 0 ? errors : undefined,
             log,
             smartleadUrl: `https://app.smartlead.ai/app/email-campaign/${slCampaignId}/analytics`,
           });
         } catch (e) {
+          console.error("[launch] Exception:", e);
           return NextResponse.json({ error: e.message, log }, { status: 500 });
         }
       }

@@ -1298,94 +1298,329 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
 
   {/* ════ DASHBOARD ════ */}
   {tab==="dashboard"&&!loading&&(<div>
-    <div className="ph"><div><div className="pt">{clientMode ? `${camp.emoji||"📊"} ${camp.name}` : "Dashboard"}</div><div className="pd">{clientMode ? "Your campaign workspace — everything you need is here" : `${camp.name} — Overview`}</div></div>
+    <div className="ph"><div><div className="pt">{clientMode ? `${camp.emoji||"📊"} ${camp.name}` : "Dashboard"}</div><div className="pd">{clientMode ? "Your campaign workspace — everything in one view" : `${camp.name} — Real-time overview`}</div></div>
       <div style={{display:"flex",gap:6}}>
         {hasSignals&&<button className="btn btn-s btn-p" onClick={startScan} disabled={scanning||!accounts.length||!signalRules.length}>{scanning?"⏳ "+Math.round(scanProg)+"%":<>▶ Run Scan</>}</button>}
       </div>
     </div>
 
-    {/* Stats Grid */}
-    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(150px,1fr))",gap:12,marginBottom:24}}>
-      {[
-        {l:"Accounts",v:accounts.length,e:"🏢",c:"var(--acc)",t:"accounts"},
-        {l:"Leads",v:leads.length,e:"👤",c:"var(--blu)",t:"leads"},
-        {l:"Task Rules",v:rules.length,e:"⚙️",c:"var(--pur)",t:"rules"},
-        {l:"Tasks",v:tasks.length,e:"📋",c:"var(--grn)",t:"tasks"},
-        {l:"Signal Rules",v:signalRules.length,e:"📰",c:"var(--amb)"},
-        {l:"Top X Rules",v:topXRules.length,e:"🎯",c:"var(--pur)"},
-      ].map(s=>(
-        <div key={s.l} onClick={()=>s.t&&setTab(s.t)} style={{padding:"16px 18px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,cursor:s.t?"pointer":"default",transition:"border-color .2s"}} onMouseOver={e=>{if(s.t)e.currentTarget.style.borderColor="var(--acc)"}} onMouseOut={e=>e.currentTarget.style.borderColor="var(--bdr)"}>
-          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-            <span style={{fontSize:24}}>{s.e}</span>
-            <span style={{fontSize:26,fontWeight:700,fontFamily:"'JetBrains Mono',monospace",color:s.c}}>{s.v}</span>
+    {(() => {
+      // ─── Compute all derived dashboard data ───
+      const now = Date.now();
+      const today = new Date(); today.setHours(0,0,0,0);
+      const todayMs = today.getTime();
+      const week = todayMs - 7 * 86400000;
+      const month = todayMs - 30 * 86400000;
+
+      // Tasks
+      const tasksToday = tasks.filter(t => { const d = (t.fields?.Date || t.fields?.Created || ""); return d && new Date(d).getTime() >= todayMs; });
+      const tasksWeek = tasks.filter(t => { const d = (t.fields?.Date || t.fields?.Created || ""); return d && new Date(d).getTime() >= week; });
+      const tasksMonth = tasks.filter(t => { const d = (t.fields?.Date || t.fields?.Created || ""); return d && new Date(d).getTime() >= month; });
+      const tasksByType = tasks.reduce((acc, t) => { const k = t.fields?.["Task Type"] || "other"; acc[k] = (acc[k] || 0) + 1; return acc; }, {});
+      const tasksHubspot = tasks.filter(t => t.fields?.["HubSpot Task ID"]);
+      const tasksWithPhone = tasks.filter(t => t.fields?.Phone);
+      const tasksAvgScore = tasks.length > 0 ? Math.round(tasks.reduce((s, t) => s + (t.fields?.Score || 0), 0) / tasks.length) : 0;
+      const hotTasks = [...tasks].sort((a, b) => (b.fields?.Score || 0) - (a.fields?.Score || 0)).slice(0, 5);
+
+      // Leads
+      const leadsWithEmail = leads.filter(l => (l.fields?.Email || "").includes("@"));
+      const leadsWithLinkedIn = leads.filter(l => l.fields?.["LinkedIn URL"]);
+      const leadsWithPhone = leads.filter(l => l.fields?.Phone);
+
+      // GA engagement
+      const gaLeads = leads.filter(l => (l.fields?.["GA Engagement Score"] || 0) > 0);
+      const gaHot = gaLeads.filter(l => (l.fields?.["GA Engagement Score"] || 0) >= 51);
+      const gaWarm = gaLeads.filter(l => { const s = l.fields?.["GA Engagement Score"] || 0; return s >= 21 && s <= 50; });
+      const gaCool = gaLeads.filter(l => { const s = l.fields?.["GA Engagement Score"] || 0; return s >= 1 && s <= 20; });
+      const gaThisWeek = leads.filter(l => { const lv = l.fields?.["GA Last Visit"]; return lv && new Date(lv).getTime() >= week; });
+      const gaTotalSessions = gaLeads.reduce((s, l) => s + (l.fields?.["GA Sessions"] || 0), 0);
+      const topGaLeads = [...gaLeads].sort((a, b) => (b.fields?.["GA Engagement Score"] || 0) - (a.fields?.["GA Engagement Score"] || 0)).slice(0, 5);
+
+      // Outreach
+      const ot = outreachStats || {};
+      const otTotal = ot.total || 0;
+      const otReplyRate = (ot.connectionSent + ot.connected) > 0 ? Math.round((ot.replied / (ot.connectionSent + ot.connected)) * 100) : 0;
+      const otAcceptRate = ot.connectionSent > 0 ? Math.round((ot.connected / ot.connectionSent) * 100) : 0;
+
+      // Health checks
+      const issues = [];
+      if (accounts.length === 0) issues.push({ severity: "warn", text: "No accounts uploaded — needed for signal scanning", action: () => setTab("accounts") });
+      if (rules.length === 0) issues.push({ severity: "warn", text: "No task rules configured", action: () => setTab("rules") });
+      if (leads.length > 0 && leadsWithEmail.length / leads.length < 0.5) issues.push({ severity: "info", text: `${Math.round(leadsWithEmail.length / leads.length * 100)}% of leads have emails — enrich for higher coverage`, action: () => setTab("leads") });
+      if (hasOutreach && !linkedinAccount) issues.push({ severity: "warn", text: "LinkedIn outreach enabled but Unipile not connected", action: () => setTab("linkedin_outreach") });
+      if (tasks.length > 50 && !hsConnected) issues.push({ severity: "info", text: `${tasks.length} tasks ready — connect HubSpot to push them`, action: () => setTab("hubspot") });
+
+      const StatTile = ({ label, value, sub, emoji, color, trend, onClick }) => (
+        <div onClick={onClick} style={{padding:"14px 16px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,cursor:onClick?"pointer":"default",transition:"border-color .15s,transform .15s"}} onMouseOver={e=>{if(onClick){e.currentTarget.style.borderColor="var(--acc)";e.currentTarget.style.transform="translateY(-1px)"}}} onMouseOut={e=>{e.currentTarget.style.borderColor="var(--bdr)";e.currentTarget.style.transform="none"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:4}}>
+            <span style={{fontSize:18,opacity:.85}}>{emoji}</span>
+            {trend != null && <span style={{fontSize:9,padding:"2px 6px",borderRadius:3,background:trend>0?"var(--grn-d)":"var(--hover)",color:trend>0?"var(--grn)":"var(--t3)",fontWeight:600}}>{trend>0?"+":""}{trend}</span>}
           </div>
-          <div style={{fontSize:10,color:"var(--t3)",marginTop:6}}>{s.l}</div>
+          <div style={{fontSize:22,fontWeight:700,fontFamily:"'JetBrains Mono',monospace",color:color||"var(--t1)",lineHeight:1.1}}>{value}</div>
+          <div style={{fontSize:10,color:"var(--t3)",marginTop:4,fontWeight:500}}>{label}</div>
+          {sub && <div style={{fontSize:9,color:"var(--t3)",marginTop:2,opacity:.75}}>{sub}</div>}
         </div>
-      ))}
-    </div>
+      );
 
-    {/* Active Features */}
-    <div style={{marginBottom:24}}>
-      <div style={{fontSize:12,fontWeight:600,marginBottom:10,color:"var(--t2)"}}>Active Features</div>
-      <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
-        {activeFeatures.map(f=>{const ft=ALL_FEATURES.find(a=>a.id===f);return ft?<div key={f} style={{padding:"10px 14px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,display:"flex",alignItems:"center",gap:8}}>
-          <span style={{fontSize:18}}>{ft.emoji}</span><div><div style={{fontSize:11,fontWeight:600,color:"var(--t1)"}}>{ft.label}</div><div style={{fontSize:9,color:"var(--t3)"}}>{ft.desc}</div></div>
-        </div>:null})}
-        {activeFeatures.length===0&&<div style={{fontSize:11,color:"var(--t3)"}}>No features active — create a Task Rule to get started</div>}
-      </div>
-    </div>
-
-    {/* Integrations */}
-    <div style={{marginBottom:24}}>
-      <div style={{fontSize:12,fontWeight:600,marginBottom:10,color:"var(--t2)"}}>Integrations</div>
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))",gap:10}}>
-        {[
-          {n:"Airtable",ok:!!bid,sub:bid?"Connected":"Not connected"},
-          {n:"LinkedIn (Unipile)",ok:!!linkedinAccount,sub:linkedinAccount?linkedinAccount.name:"Not connected"},
-          {n:"HubSpot",ok:hsConnected,sub:hsConnected?"Connected":"Not connected",onClick:()=>setTab("hubspot")},
-          {n:"Google Analytics",ok:false,sub:"Coming Soon",dim:true},
-          {n:"Smartlead",ok:false,sub:"Coming Soon",dim:true},
-        ].map(ig=>(
-          <div key={ig.n} onClick={ig.onClick} style={{padding:"12px 14px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,display:"flex",alignItems:"center",gap:10,opacity:ig.dim?.5:1,cursor:ig.onClick?"pointer":"default"}}>
-            <div style={{width:8,height:8,borderRadius:"50%",background:ig.ok?"var(--grn)":"var(--t3)",flexShrink:0}}/>
-            <div><div style={{fontSize:11,fontWeight:600,color:"var(--t1)"}}>{ig.n}</div><div style={{fontSize:9,color:"var(--t3)"}}>{ig.sub}</div></div>
+      const SectionHeader = ({ title, sub, action, actionLabel }) => (
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:10,marginTop:24}}>
+          <div>
+            <div style={{fontSize:12,fontWeight:700,color:"var(--t1)",letterSpacing:".3px",textTransform:"uppercase"}}>{title}</div>
+            {sub && <div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>{sub}</div>}
           </div>
-        ))}
-      </div>
-    </div>
+          {action && <button className="btn btn-s" style={{fontSize:10}} onClick={action}>{actionLabel || "View →"}</button>}
+        </div>
+      );
 
-    {/* Recent Tasks */}
-    {tasks.length>0&&(<div>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
-        <span style={{fontSize:12,fontWeight:600,color:"var(--t2)"}}>Recent Tasks</span>
-        <button className="btn btn-s" style={{fontSize:9}} onClick={()=>setTab("tasks")}>View All →</button>
-      </div>
-      <div className="tw"><table><thead><tr><th>Company</th><th>Rule</th><th>Score</th><th>Type</th><th>Date</th></tr></thead>
-      <tbody>{tasks.slice(0,6).map(t=>{const f=t.fields||{};return(<tr key={t.id} style={{cursor:"pointer"}} onClick={()=>setTab("tasks")}>
-        <td style={{color:"var(--t1)",fontWeight:500}}>{f.Company}</td>
-        <td style={{fontSize:10}}>{f["Task Rule"]}</td>
-        <td><div className="sb"><div className="st"><div className="sf" style={{width:Math.min(100,f.Score||0)+"%",background:f.Score>=80?"var(--grn)":f.Score>=60?"var(--acc)":"var(--red)"}}/></div><span className="sv">{f.Score}</span></div></td>
-        <td><span className={"chip "+(f["Task Type"]==="job_post"?"cb":f["Task Type"]==="top_x"?"cp":"cg")}>{(f["Task Type"]||"news").replace(/_/g," ")}</span></td>
-        <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10}}>{f.Date}</td>
-      </tr>)})}</tbody></table></div>
-    </div>)}
+      return (<>
+        {/* ───── HEALTH BANNER (only if issues) ───── */}
+        {issues.length > 0 && (
+          <div style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginBottom:20}}>
+            <div style={{fontSize:11,fontWeight:600,color:"var(--t2)",marginBottom:10,display:"flex",alignItems:"center",gap:6}}>
+              <span style={{fontSize:14}}>⚠️</span> {issues.length} item{issues.length===1?"":"s"} need attention
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              {issues.map((iss, i) => (
+                <div key={i} onClick={iss.action} style={{padding:"8px 12px",background:iss.severity==="warn"?"rgba(245,158,11,.08)":"var(--hover)",borderRadius:6,fontSize:11,color:iss.severity==="warn"?"var(--amb)":"var(--t2)",cursor:iss.action?"pointer":"default",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <span>{iss.text}</span>
+                  {iss.action && <span style={{fontSize:10,opacity:.7}}>→</span>}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
-    {tasks.length===0&&accounts.length===0&&!clientMode&&(<div className="empty"><div className="em">📡</div><p>Upload accounts & leads, create task rules, and run your first scan</p>
+        {/* ───── TODAY'S PULSE ───── */}
+        <SectionHeader title="📊 Activity Pulse" sub="What's happening right now" />
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(160px,1fr))",gap:10,marginBottom:8}}>
+          <StatTile label="Tasks today" value={tasksToday.length} sub={`${tasksWeek.length} this week`} emoji="📋" color="var(--acc)" onClick={()=>setTab("tasks")} />
+          <StatTile label="GA visitors / wk" value={gaThisWeek.length} sub={`${gaTotalSessions} total sessions`} emoji="📈" color="var(--blu)" onClick={()=>setTab("ga")} />
+          <StatTile label="Hot leads (GA)" value={gaHot.length} sub={gaHot.length > 0 ? "Score 51+" : "No hot leads yet"} emoji="🔥" color={gaHot.length>0?"var(--red)":"var(--t3)"} onClick={()=>setTab("ga")} />
+          <StatTile label="LinkedIn replies" value={ot.replied || 0} sub={otReplyRate > 0 ? `${otReplyRate}% reply rate` : "—"} emoji="💬" color={ot.replied>0?"var(--grn)":"var(--t3)"} onClick={()=>setTab("linkedin_outreach")} />
+        </div>
+
+        {/* ───── PIPELINE ───── */}
+        <SectionHeader title="📦 Pipeline" sub="Your data inventory" />
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(160px,1fr))",gap:10}}>
+          <StatTile label="Accounts" value={accounts.length} sub="Target companies" emoji="🏢" onClick={()=>setTab("accounts")} />
+          <StatTile label="Leads" value={leads.length} sub={`${leadsWithEmail.length} with email · ${leadsWithLinkedIn.length} with LinkedIn`} emoji="👤" onClick={()=>setTab("leads")} />
+          <StatTile label="Task Rules" value={rules.length} sub={hasNews||hasJobs||hasTopX?"Active":"—"} emoji="⚙️" onClick={()=>setTab("rules")} />
+          <StatTile label="Tasks" value={tasks.length} sub={`Avg score ${tasksAvgScore} · ${tasksMonth.length} this month`} emoji="📋" color={tasksAvgScore>=70?"var(--grn)":"var(--t1)"} onClick={()=>setTab("tasks")} />
+        </div>
+
+        {/* ───── GA ENGAGEMENT BREAKDOWN ───── */}
+        {gaLeads.length > 0 && (<>
+          <SectionHeader title="📈 Website Engagement (GA)" sub={`${gaLeads.length} leads scored from analytics`} action={()=>setTab("ga")} />
+          <div style={{display:"grid",gridTemplateColumns:"2fr 3fr",gap:14,marginBottom:8}}>
+            {/* Engagement breakdown */}
+            <div style={{padding:16,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10}}>
+              <div style={{fontSize:11,color:"var(--t3)",marginBottom:12,fontWeight:500}}>Engagement Distribution</div>
+              {[
+                {label:"🔥 Hot (51+)",count:gaHot.length,color:"var(--red)"},
+                {label:"⚡ Interested (21-50)",count:gaWarm.length,color:"var(--amb)"},
+                {label:"👀 Warm (1-20)",count:gaCool.length,color:"var(--t2)"},
+              ].map(b => {
+                const pct = gaLeads.length > 0 ? (b.count / gaLeads.length * 100) : 0;
+                return (
+                  <div key={b.label} style={{marginBottom:8}}>
+                    <div style={{display:"flex",justifyContent:"space-between",marginBottom:4,fontSize:11}}>
+                      <span style={{color:"var(--t2)"}}>{b.label}</span>
+                      <span style={{color:b.color,fontWeight:700,fontFamily:"'JetBrains Mono',monospace"}}>{b.count}</span>
+                    </div>
+                    <div style={{height:5,background:"var(--hover)",borderRadius:3,overflow:"hidden"}}>
+                      <div style={{height:"100%",width:pct+"%",background:b.color,borderRadius:3,transition:"width .3s"}}/>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            {/* Top engaged leads */}
+            <div style={{padding:16,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10}}>
+              <div style={{fontSize:11,color:"var(--t3)",marginBottom:12,fontWeight:500}}>Top Engaged Leads</div>
+              {topGaLeads.length === 0 ? (
+                <div style={{fontSize:10,color:"var(--t3)",fontStyle:"italic"}}>No engaged leads yet</div>
+              ) : topGaLeads.map(l => {
+                const f = l.fields || {};
+                const score = f["GA Engagement Score"] || 0;
+                return (
+                  <div key={l.id} onClick={()=>setTab("ga")} style={{padding:"6px 0",borderBottom:"1px solid var(--bdr)",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontSize:11,color:"var(--t1)",fontWeight:500,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{f.Name || "(no name)"}</div>
+                      <div style={{fontSize:9,color:"var(--t3)"}}>{f.Title || ""}{f.Title && f.Company ? " · " : ""}{f.Company || ""}</div>
+                    </div>
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginLeft:8}}>
+                      <span style={{fontSize:9,color:"var(--t3)"}}>{f["GA Sessions"] || 0} sess</span>
+                      <span style={{fontSize:11,fontWeight:700,fontFamily:"'JetBrains Mono',monospace",color:score>=51?"var(--red)":score>=21?"var(--amb)":"var(--t2)",minWidth:26,textAlign:"right"}}>{score}</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </>)}
+
+        {/* ───── OUTREACH ───── */}
+        {(otTotal > 0 || hasOutreach) && (<>
+          <SectionHeader title="💬 LinkedIn Outreach" sub={otTotal > 0 ? `${otTotal} leads in queue` : "Configure rules to start"} action={()=>setTab("linkedin_outreach")} />
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))",gap:10,marginBottom:8}}>
+            <StatTile label="Queued" value={ot.queued || 0} emoji="⏱" color="var(--t2)" />
+            <StatTile label="Conn. sent" value={ot.connectionSent || 0} emoji="✉" color="var(--blu)" sub={otAcceptRate > 0 ? `${otAcceptRate}% accept` : null} />
+            <StatTile label="Connected" value={ot.connected || 0} emoji="✅" color="var(--grn)" />
+            <StatTile label="Replied" value={ot.replied || 0} emoji="💬" color="var(--grn)" sub={otReplyRate > 0 ? `${otReplyRate}% reply` : null} />
+            {ot.errors > 0 && <StatTile label="Errors" value={ot.errors} emoji="⚠" color="var(--red)" />}
+          </div>
+          {/* Reply intent breakdown — only shown when we have classified replies */}
+          {(() => {
+            const repliedItems = (outreachItems || []).filter(q => q.fields?.Status === "replied");
+            if (repliedItems.length === 0) return null;
+            const byIntent = repliedItems.reduce((acc, q) => { const i = q.fields?.["Reply Intent"] || "unclassified"; acc[i] = (acc[i] || 0) + 1; return acc; }, {});
+            const interested = repliedItems.filter(q => q.fields?.["Reply Intent"] === "interested");
+            const objections = repliedItems.filter(q => q.fields?.["Reply Intent"] === "objection");
+            const intentMeta = {
+              interested: { emoji: "🔥", label: "Interested", color: "var(--grn)" },
+              objection: { emoji: "⚖️", label: "Objection", color: "var(--amb)" },
+              referral: { emoji: "↪️", label: "Referral", color: "var(--blu)" },
+              not_interested: { emoji: "❌", label: "Not interested", color: "var(--red)" },
+              out_of_office: { emoji: "🏖", label: "OOO", color: "var(--t3)" },
+              auto_reply: { emoji: "🤖", label: "Auto-reply", color: "var(--t3)" },
+              unclear: { emoji: "❓", label: "Unclear", color: "var(--t3)" },
+              unclassified: { emoji: "•", label: "Unclassified", color: "var(--t3)" },
+            };
+            return (
+              <div style={{marginTop:12}}>
+                <div style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10}}>
+                  <div style={{fontSize:11,color:"var(--t3)",marginBottom:10,fontWeight:500,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <span>Reply intent distribution ({repliedItems.length} replies)</span>
+                    {interested.length > 0 && <button className="btn btn-s btn-p" style={{fontSize:9}} onClick={()=>setTab("linkedin_outreach")}>{interested.length} hot lead{interested.length===1?"":"s"} to action →</button>}
+                  </div>
+                  <div style={{display:"flex",height:8,borderRadius:4,overflow:"hidden",background:"var(--hover)",marginBottom:8}}>
+                    {Object.entries(byIntent).sort((a,b) => b[1] - a[1]).map(([k, v]) => {
+                      const pct = (v / repliedItems.length) * 100;
+                      return <div key={k} style={{width:pct+"%",background:intentMeta[k]?.color || "var(--t3)"}} title={`${intentMeta[k]?.label || k}: ${v}`} />;
+                    })}
+                  </div>
+                  <div style={{display:"flex",flexWrap:"wrap",gap:10,fontSize:10,color:"var(--t2)"}}>
+                    {Object.entries(byIntent).sort((a,b) => b[1] - a[1]).map(([k, v]) => {
+                      const m = intentMeta[k] || intentMeta.unclassified;
+                      return (
+                        <span key={k} style={{display:"inline-flex",alignItems:"center",gap:4}}>
+                          <span style={{width:6,height:6,borderRadius:"50%",background:m.color}}/>
+                          {m.emoji} <strong style={{color:m.color}}>{v}</strong> {m.label}
+                        </span>
+                      );
+                    })}
+                  </div>
+                  {/* Show top 3 interested replies inline for quick action */}
+                  {interested.length > 0 && (
+                    <div style={{marginTop:12,paddingTop:12,borderTop:"1px solid var(--bdr)"}}>
+                      <div style={{fontSize:10,color:"var(--t3)",marginBottom:6,fontWeight:500}}>🔥 Recent interested replies:</div>
+                      {interested.slice(0,3).map(q => {
+                        const f = q.fields || {};
+                        return (
+                          <div key={q.id} onClick={()=>setTab("linkedin_outreach")} style={{padding:"6px 0",borderBottom:"1px solid var(--bdr)",cursor:"pointer",fontSize:10}}>
+                            <div style={{color:"var(--t1)",fontWeight:500}}>{f["Lead Name"] || "—"} <span style={{color:"var(--t3)",fontWeight:400}}>· {f.Company || ""}</span></div>
+                            {f["Reply Summary"] && <div style={{color:"var(--t2)",marginTop:2,fontSize:10}}>"{f["Reply Summary"].slice(0, 120)}{f["Reply Summary"].length > 120 ? "..." : ""}"</div>}
+                            {f["Reply Suggested Action"] && <div style={{color:"var(--grn)",marginTop:2,fontSize:9}}>→ {f["Reply Suggested Action"].slice(0, 100)}</div>}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
+        </>)}
+
+        {/* ───── HUBSPOT SYNC HEALTH ───── */}
+        {hsConnected && (<>
+          <SectionHeader title="🔗 HubSpot Sync" sub={`${tasksHubspot.length} of ${tasks.length} tasks tracked`} action={()=>setTab("hubspot")} />
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(150px,1fr))",gap:10}}>
+            <StatTile label="Synced tasks" value={tasksHubspot.length} sub={tasks.length>0?`${Math.round(tasksHubspot.length/tasks.length*100)}% coverage`:""} emoji="✅" color="var(--grn)" onClick={()=>setTab("hubspot")} />
+            <StatTile label="Untracked" value={tasks.length - tasksHubspot.length} sub={tasks.length-tasksHubspot.length>0?"Run backfill":"All synced"} emoji="📥" color={tasks.length-tasksHubspot.length>0?"var(--amb)":"var(--t3)"} onClick={()=>setTab("hubspot")} />
+            <StatTile label="With phone" value={tasksWithPhone.length} sub={`Of ${tasks.length} tasks`} emoji="📞" color="var(--t2)" onClick={()=>setTab("tasks")} />
+            <StatTile label="HubSpot key" value={hsMasked || "✓"} sub="Connected" emoji="🔑" color="var(--grn)" />
+          </div>
+        </>)}
+
+        {/* ───── TASK BREAKDOWN BY TYPE ───── */}
+        {Object.keys(tasksByType).length > 0 && (<>
+          <SectionHeader title="📋 Tasks by Source" sub="Where your tasks are coming from" />
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))",gap:10}}>
+            {Object.entries(tasksByType).sort((a,b)=>b[1]-a[1]).map(([type, count]) => {
+              const emojiMap = { news: "📰", job_post: "💼", top_x: "🎯", linkedin_engagement: "🔗", website_engagement: "📈", post_demo: "🤖", other: "📋" };
+              const labelMap = { news: "News signals", job_post: "Job posts", top_x: "Top X scoring", linkedin_engagement: "LinkedIn", website_engagement: "Website (GA)", post_demo: "Post-demo", other: "Other" };
+              const pct = tasks.length > 0 ? Math.round(count / tasks.length * 100) : 0;
+              return (
+                <div key={type} onClick={()=>setTab("tasks")} style={{padding:"12px 14px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,cursor:"pointer"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                    <span style={{fontSize:14}}>{emojiMap[type] || "📋"}</span>
+                    <span style={{fontSize:18,fontWeight:700,fontFamily:"'JetBrains Mono',monospace"}}>{count}</span>
+                  </div>
+                  <div style={{fontSize:10,color:"var(--t2)",marginBottom:4}}>{labelMap[type] || type.replace(/_/g, " ")}</div>
+                  <div style={{height:3,background:"var(--hover)",borderRadius:2,overflow:"hidden"}}>
+                    <div style={{height:"100%",width:pct+"%",background:"var(--acc)"}}/>
+                  </div>
+                  <div style={{fontSize:9,color:"var(--t3)",marginTop:3}}>{pct}% of tasks</div>
+                </div>
+              );
+            })}
+          </div>
+        </>)}
+
+        {/* ───── TOP HOT TASKS ───── */}
+        {hotTasks.length > 0 && (<>
+          <SectionHeader title="🔥 Highest-Scoring Tasks" sub="Top 5 by score" action={()=>setTab("tasks")} actionLabel="All Tasks →" />
+          <div className="tw"><table><thead><tr><th>Company</th><th>Lead</th><th>Rule</th><th>Score</th><th>Type</th><th>Date</th></tr></thead>
+          <tbody>{hotTasks.map(t => { const f = t.fields || {}; return (<tr key={t.id} style={{cursor:"pointer"}} onClick={()=>setTab("tasks")}>
+            <td style={{color:"var(--t1)",fontWeight:500}}>{f.Company}</td>
+            <td style={{fontSize:10,color:"var(--t2)"}}>{f["Lead Name"] || f["Scan Target"] || "—"}</td>
+            <td style={{fontSize:10}}>{f["Task Rule"]}</td>
+            <td><div className="sb"><div className="st"><div className="sf" style={{width:Math.min(100,f.Score||0)+"%",background:f.Score>=80?"var(--grn)":f.Score>=60?"var(--acc)":"var(--red)"}}/></div><span className="sv">{f.Score}</span></div></td>
+            <td><span className={"chip "+(f["Task Type"]==="job_post"?"cb":f["Task Type"]==="top_x"?"cp":"cg")}>{(f["Task Type"]||"news").replace(/_/g," ")}</span></td>
+            <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10}}>{f.Date}</td>
+          </tr>);})}</tbody></table></div>
+        </>)}
+
+        {/* ───── INTEGRATIONS STATUS ───── */}
+        <SectionHeader title="🔌 Integrations" sub="Connected systems" />
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(170px,1fr))",gap:10}}>
+          {[
+            {n:"Airtable",ok:!!bid,sub:bid?"Connected":"Not connected"},
+            {n:"LinkedIn",ok:!!linkedinAccount,sub:linkedinAccount?linkedinAccount.name:"Not connected",onClick:()=>setTab("linkedin_outreach")},
+            {n:"HubSpot",ok:hsConnected,sub:hsConnected?"Connected":"Not connected",onClick:()=>setTab("hubspot")},
+            {n:"Google Analytics",ok:gaLeads.length > 0,sub:gaLeads.length>0?`${gaLeads.length} leads scored`:"Not configured",onClick:()=>setTab("ga")},
+            {n:"Smartlead",ok:false,sub:"Email Campaign tab",onClick:()=>setTab("email_campaign")},
+            {n:"Apollo (Enrich)",ok:tasksWithPhone.length>0,sub:tasksWithPhone.length>0?`${tasksWithPhone.length} enriched`:"Not used yet"},
+          ].map(ig => (
+            <div key={ig.n} onClick={ig.onClick} style={{padding:"12px 14px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,display:"flex",alignItems:"center",gap:10,cursor:ig.onClick?"pointer":"default",transition:"border-color .15s"}} onMouseOver={e=>{if(ig.onClick)e.currentTarget.style.borderColor="var(--acc)"}} onMouseOut={e=>e.currentTarget.style.borderColor="var(--bdr)"}>
+              <div style={{width:8,height:8,borderRadius:"50%",background:ig.ok?"var(--grn)":"var(--t3)",flexShrink:0,boxShadow:ig.ok?"0 0 6px rgba(93,168,122,.6)":"none"}}/>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:11,fontWeight:600,color:"var(--t1)"}}>{ig.n}</div>
+                <div style={{fontSize:9,color:"var(--t3)",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{ig.sub}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </>);
+    })()}
+
+    {/* Empty state for first-time users */}
+    {tasks.length===0&&accounts.length===0&&!clientMode&&(<div className="empty" style={{marginTop:30}}><div className="em">📡</div><p>Upload accounts & leads, create task rules, and run your first scan</p>
       <button className="btn btn-p" onClick={()=>setTab("accounts")}><I.Plus/> Start with Accounts</button>
     </div>)}
 
-    {/* Client mode: Setup Guide */}
-    {clientMode&&(<div style={{marginTop:24}}>
+    {/* Client mode: Setup Guide (only show when not yet set up) */}
+    {clientMode && (accounts.length===0 || leads.length===0 || rules.length===0) &&(<div style={{marginTop:24}}>
       <div style={{fontSize:14,fontWeight:700,color:"var(--t1)",marginBottom:4}}>🚀 Getting Started</div>
       <div style={{fontSize:11,color:"var(--t3)",marginBottom:16}}>Follow these steps to set up your campaign. Each step unlocks the next.</div>
       <div style={{display:"flex",flexDirection:"column",gap:10}}>
         {[
           {n:"Upload Accounts",d:"Upload your target company list (CSV). These are the companies you want to track signals for.",done:accounts.length>0,act:()=>setTab("accounts"),btn:"Upload Accounts"},
           {n:"Upload Leads",d:"Upload your contact list (CSV). Leads are the people at those companies you'll reach out to.",done:leads.length>0,act:()=>setTab("leads"),btn:"Upload Leads"},
-          {n:"Create Task Rules",d:"Define what signals to watch for — news mentions, job posts, or score your leads with Top X. Each rule tells the AI what to look for.",done:rules.length>0,act:()=>setTab("rules"),btn:"Create Rule"},
-          {n:"Run a Scan",d:"Execute your task rules against your accounts. The AI scans RSS feeds, job boards, and scores leads to create actionable tasks.",done:tasks.length>0,act:()=>setTab("tasks"),btn:"Go to Tasks"},
-          {n:"Connect HubSpot",d:"Connect your HubSpot CRM to push tasks and leads directly. You can also run Post-Demo automation from your deal pipeline.",done:hsConnected,act:()=>setTab("hubspot"),btn:"Connect HubSpot"},
-          {n:"Enrich & Push",d:"Enrich leads with phone numbers via Apollo, push tasks and leads to HubSpot, or run Post-Demo automation on your deal stages.",done:tasks.some(t=>(t.fields||{}).Phone),act:()=>setTab("tasks"),btn:"Go to Tasks"},
+          {n:"Create Task Rules",d:"Define what signals to watch for — news mentions, job posts, or score your leads with Top X.",done:rules.length>0,act:()=>setTab("rules"),btn:"Create Rule"},
+          {n:"Run a Scan",d:"Execute your task rules. The AI scans RSS feeds, job boards, and scores leads to create actionable tasks.",done:tasks.length>0,act:()=>setTab("tasks"),btn:"Go to Tasks"},
+          {n:"Connect HubSpot",d:"Push tasks and leads directly to your CRM. Run Post-Demo automation from your deal pipeline.",done:hsConnected,act:()=>setTab("hubspot"),btn:"Connect HubSpot"},
         ].map((step,i)=>(
           <div key={i} onClick={step.act} style={{padding:"16px 20px",background:"var(--card)",border:"1px solid "+(step.done?"rgba(93,168,122,.3)":"var(--bdr)"),borderRadius:10,cursor:"pointer",display:"flex",alignItems:"center",gap:14,transition:"all .15s"}} onMouseOver={e=>e.currentTarget.style.borderColor="var(--acc)"} onMouseOut={e=>e.currentTarget.style.borderColor=step.done?"rgba(93,168,122,.3)":"var(--bdr)"}>
             <div style={{width:32,height:32,borderRadius:"50%",background:step.done?"var(--grn-d)":"var(--hover)",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
@@ -1401,15 +1636,10 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       </div>
     </div>)}
 
-    {/* Admin mode: empty state */}
-    {!clientMode&&tasks.length===0&&accounts.length>0&&(<div className="empty" style={{marginTop:20}}><div className="em">⚙️</div><p>Create task rules and run a scan to generate tasks</p>
-      <button className="btn btn-p" onClick={()=>setTab("rules")}><I.Plus/> Create Task Rule</button>
-    </div>)}
-
     {/* Admin mode: Client Portal Link */}
     {!clientMode && camp?.airtableId && (<div style={{padding:20,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10,marginTop:24}}>
       <div style={{fontSize:13,fontWeight:600,color:"var(--t1)",marginBottom:8}}>🔗 Client Portal</div>
-      <div style={{fontSize:11,color:"var(--t3)",marginBottom:14,lineHeight:1.5}}>Share this link with your client. They get the full SignalScope experience — upload data, create rules, run scans, HubSpot, enrichment, post-demo automation — without Airtable config or campaign switching.</div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:14,lineHeight:1.5}}>Share this link with your client. They get the full SignalScope experience without Airtable config or campaign switching.</div>
       <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:12}}>
         <input className="inp" readOnly value={typeof window!=="undefined"?`${window.location.origin}/client/${camp.airtableId}`:""} style={{flex:1,fontSize:11,fontFamily:"'JetBrains Mono',monospace"}} onClick={e=>e.target.select()}/>
         <button className="btn btn-s btn-p" onClick={()=>{navigator.clipboard.writeText(`${window.location.origin}/client/${camp.airtableId}`)}}>📋 Copy Link</button>
@@ -1970,20 +2200,72 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
 
     {/* Queue Table */}
     {outreachItems.length > 0 && (<div style={{marginTop:20}}>
-      <div style={{fontSize:12,fontWeight:600,marginBottom:8,color:"var(--t2)"}}>Outreach Queue ({outreachItems.length})</div>
-      <div className="tw"><table><thead><tr><th>Lead</th><th>Company</th><th>Campaign</th><th>Status</th><th>DM Step</th><th>Next Action</th></tr></thead>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+        <div style={{fontSize:12,fontWeight:600,color:"var(--t2)"}}>Outreach Queue ({outreachItems.length})</div>
+        {outreachItems.filter(q => q.fields?.Status === "replied").length > 0 && (
+          <div style={{fontSize:10,color:"var(--t2)",display:"flex",gap:10,alignItems:"center"}}>
+            {(() => {
+              const replied = outreachItems.filter(q => q.fields?.Status === "replied");
+              const byIntent = replied.reduce((acc, q) => { const i = q.fields?.["Reply Intent"] || "unclassified"; acc[i] = (acc[i] || 0) + 1; return acc; }, {});
+              const intentColors = { interested: "var(--grn)", objection: "var(--amb)", referral: "var(--blu)", not_interested: "var(--red)", out_of_office: "var(--t3)", auto_reply: "var(--t3)", unclear: "var(--t3)", unclassified: "var(--t3)" };
+              const intentEmoji = { interested: "🔥", objection: "⚖️", referral: "↪️", not_interested: "❌", out_of_office: "🏖", auto_reply: "🤖", unclear: "❓", unclassified: "•" };
+              return Object.entries(byIntent).sort((a,b)=>b[1]-a[1]).map(([k, v]) => (
+                <span key={k} style={{color:intentColors[k]||"var(--t3)"}}>{intentEmoji[k]||"•"} {v} {k.replace(/_/g," ")}</span>
+              ));
+            })()}
+          </div>
+        )}
+      </div>
+      <div className="tw"><table><thead><tr><th>Lead</th><th>Company</th><th>Campaign</th><th>Status</th><th>Reply Intent</th><th>DM Step</th><th>Next Action</th></tr></thead>
       <tbody>{outreachItems.slice(0,50).map(q => {
         const f = q.fields || {};
         const status = f.Status || "queued";
         const statusColor = status==="replied"?"cg":status==="completed"?"cg":status==="error"?"cr":status==="connected"||status.startsWith("dm_")?"cp":status==="connection_sent"?"cb":"ca";
-        return (<tr key={q.id} style={status==="replied"?{background:"var(--grn-d)"}:{}}>
-          <td style={{color:"var(--t1)",fontWeight:500}}>{f["Lead Name"]}</td>
-          <td>{f.Company}</td>
-          <td style={{fontSize:10}}>{f.Campaign}</td>
-          <td><span className={"chip "+statusColor}>{status==="replied"?"✋ replied":status.replace(/_/g," ")}</span></td>
-          <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10}}>{f["DM Step"]||0}</td>
-          <td style={{fontSize:10}}>{status==="replied"?"—":(f["Next Action Date"]||"—")}</td>
-        </tr>);
+        const isReplied = status === "replied";
+        const intent = f["Reply Intent"];
+        const urgency = f["Reply Urgency"];
+        const summary = f["Reply Summary"];
+        const action = f["Reply Suggested Action"];
+        const confidence = f["Reply Confidence"];
+        const intentMap = {
+          interested: { emoji: "🔥", label: "Interested", color: "var(--grn)", bg: "var(--grn-d)" },
+          objection: { emoji: "⚖️", label: "Objection", color: "var(--amb)", bg: "rgba(245,158,11,.1)" },
+          referral: { emoji: "↪️", label: "Referral", color: "var(--blu)", bg: "rgba(96,165,250,.1)" },
+          not_interested: { emoji: "❌", label: "Not interested", color: "var(--red)", bg: "rgba(239,68,68,.1)" },
+          out_of_office: { emoji: "🏖", label: "OOO", color: "var(--t3)", bg: "var(--hover)" },
+          auto_reply: { emoji: "🤖", label: "Auto-reply", color: "var(--t3)", bg: "var(--hover)" },
+          unclear: { emoji: "❓", label: "Unclear", color: "var(--t3)", bg: "var(--hover)" },
+        };
+        const intentInfo = intentMap[intent];
+        const rowBg = isReplied
+          ? (intent === "interested" ? "rgba(93,168,122,.08)" : intent === "not_interested" ? "rgba(239,68,68,.06)" : intent === "objection" ? "rgba(245,158,11,.06)" : "var(--grn-d)")
+          : null;
+        return (<>
+          <tr key={q.id} style={rowBg ? {background: rowBg} : {}}>
+            <td style={{color:"var(--t1)",fontWeight:500}}>{f["Lead Name"]}</td>
+            <td>{f.Company}</td>
+            <td style={{fontSize:10}}>{f.Campaign}</td>
+            <td><span className={"chip "+statusColor}>{status==="replied"?"✋ replied":status.replace(/_/g," ")}</span></td>
+            <td>
+              {isReplied && intentInfo ? (
+                <span title={summary || ""} style={{display:"inline-flex",alignItems:"center",gap:4,fontSize:10,padding:"2px 8px",borderRadius:4,background:intentInfo.bg,color:intentInfo.color,fontWeight:600}}>
+                  {intentInfo.emoji} {intentInfo.label}
+                  {urgency === "high" && <span style={{color:"var(--red)",marginLeft:2}}>!</span>}
+                </span>
+              ) : isReplied ? <span style={{fontSize:10,color:"var(--t3)",fontStyle:"italic"}}>not classified</span> : <span style={{fontSize:10,color:"var(--t3)"}}>—</span>}
+            </td>
+            <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10}}>{f["DM Step"]||0}</td>
+            <td style={{fontSize:10}}>{status==="replied"?"—":(f["Next Action Date"]||"—")}</td>
+          </tr>
+          {isReplied && (summary || action) && (
+            <tr key={q.id+"-detail"} style={{background:rowBg}}>
+              <td colSpan={7} style={{padding:"4px 14px 10px 14px",fontSize:10,color:"var(--t2)",borderTop:"none"}}>
+                {summary && <div style={{marginBottom:3}}><strong style={{color:"var(--t3)"}}>Summary:</strong> {summary}</div>}
+                {action && <div><strong style={{color:"var(--t3)"}}>Next:</strong> <span style={{color:urgency==="high"?"var(--red)":"var(--t2)"}}>{action}</span> {confidence != null && <span style={{color:"var(--t3)",marginLeft:4}}>· {confidence}% confidence</span>}</div>}
+              </td>
+            </tr>
+          )}
+        </>);
       })}</tbody></table></div>
     </div>)}
 
@@ -3229,15 +3511,21 @@ function EmailCampaignTab({ baseId, campaign, leads, prefilledLeadId }) {
   }, [baseId, campaign?.airtableId]);
 
   // Auto-select a specific lead when navigated here from "Send Email" button (GA tab)
+  // IMPORTANT: only run once per prefilledLeadId. Don't re-fire when leads array updates
+  // (which would reset the wizard while user is mid-flow).
+  const prefillProcessedRef = useRef(null);
   useEffect(() => {
     if (!prefilledLeadId || !leads?.length) return;
+    if (prefillProcessedRef.current === prefilledLeadId) return; // already processed this ID
     const lead = leads.find(l => l.id === prefilledLeadId);
     if (!lead) {
       setPrefilledNotice(`⚠️ Couldn't find the lead you selected — they may not have a Campaign Tag. Pick leads below.`);
+      prefillProcessedRef.current = prefilledLeadId;
       return;
     }
     if (!lead.fields?.Email) {
       setPrefilledNotice(`⚠️ ${lead.fields?.Name || "Lead"} has no email address on file.`);
+      prefillProcessedRef.current = prefilledLeadId;
       return;
     }
     // Bypass tag filter, set this lead as the only lead in the pool
@@ -3246,6 +3534,7 @@ function EmailCampaignTab({ baseId, campaign, leads, prefilledLeadId }) {
     setSelectedTag(""); // Clear tag filter
     setStep(1); // Ensure we're on the leads step
     setPrefilledNotice(`✨ Prefilled from Google Analytics — sending to ${lead.fields?.Name || "lead"}. Continue with the flow below.`);
+    prefillProcessedRef.current = prefilledLeadId;
   }, [prefilledLeadId, leads]);
 
   const loadTagLeads = async (tag) => {
@@ -3359,6 +3648,8 @@ function EmailCampaignTab({ baseId, campaign, leads, prefilledLeadId }) {
   };
 
   const regenerateSingle = async (leadId) => {
+    if (!activeOffer) { setErr("Active offer is missing — go back to Step 2 and pick one"); return; }
+    if (!senderProfile) { setErr("Sender profile is missing — set it in Step 2"); return; }
     const fb = perLeadFeedback[leadId] || "";
     setBusy(true); setErr("");
     try {
@@ -3382,6 +3673,19 @@ function EmailCampaignTab({ baseId, campaign, leads, prefilledLeadId }) {
 
   const regenerateAll = async () => {
     if (!bulkFeedback.trim()) { setErr("Write some feedback first (e.g. 'make it shorter', 'less salesy')"); return; }
+    if (!activeOffer) { setErr("Active offer is missing — go back to Step 2 and pick one"); return; }
+    if (!senderProfile) { setErr("Sender profile is missing — set it in Step 2"); return; }
+    // Cost guard: regenerating all leads costs money. Warn for large batches.
+    const count = generated.length;
+    const seqLen = sequenceLength || 1;
+    // Rough estimate: ~1500 input tokens (cached) + ~500 output per email × seqLen
+    // Sonnet 4.6: $3/M input, $15/M output. With caching, input ~$0.30/M effective.
+    const estInputTokens = count * 1500;
+    const estOutputTokens = count * 500 * seqLen;
+    const estCost = (estInputTokens / 1_000_000 * 0.30) + (estOutputTokens / 1_000_000 * 15);
+    if (count > 10) {
+      if (!confirm(`Regenerate ALL ${count} email${count === 1 ? "" : "s"} with this feedback?\n\nFeedback: "${bulkFeedback.slice(0, 100)}${bulkFeedback.length > 100 ? "..." : ""}"\n\nEstimated cost: ~$${estCost.toFixed(2)}\n\nIf you only want to apply feedback to specific leads, use the per-lead "Regenerate" button instead.`)) return;
+    }
     setGenerating(true); setErr("");
     try {
       const f = activeOffer.fields || {};
@@ -3394,12 +3698,19 @@ function EmailCampaignTab({ baseId, campaign, leads, prefilledLeadId }) {
         sequenceLength,
       };
       const out = [];
+      let regenFailed = 0;
       for (const g of generated) {
         const r2 = await ec("regenerate_email", { leadId: g.leadId, config, factors, feedback: bulkFeedback });
-        out.push(r2.ok ? r2 : g);
+        if (r2.ok) {
+          out.push(r2);
+        } else {
+          regenFailed++;
+          out.push(g); // keep original on failure
+        }
       }
       setGenerated(out);
       setBulkFeedback("");
+      if (regenFailed > 0) setErr(`⚠️ ${regenFailed} of ${generated.length} regenerations failed — those kept their previous version`);
     } catch (e) { setErr(e.message); }
     setGenerating(false);
   };
@@ -3431,12 +3742,20 @@ function EmailCampaignTab({ baseId, campaign, leads, prefilledLeadId }) {
 
   useEffect(() => { if (slKeyRef.current && step === 5) loadSlData(); }, [step]);
 
-  const launchCampaign = async () => {
+  const launchCampaign = async (overrides = {}) => {
     const validEmails = generated.filter(g => g.ok && g.email);
+    const failedGen = generated.filter(g => !g.ok);
+    const noEmail = generated.filter(g => g.ok && !g.email);
     if (validEmails.length === 0) { setErr("No valid emails to launch"); return; }
     if (slMode === "new" && !slCampaignName) { setErr("Campaign name required"); return; }
     if (slMode === "new" && slMailboxIds.size === 0) { setErr("Pick at least one mailbox"); return; }
-    if (!confirm(`Launch ${validEmails.length} emails via Smartlead?\n\nMode: ${slMode === "new" ? `New campaign "${slCampaignName}"` : "Add to existing"}\nMailboxes: ${slMailboxIds.size}\nSequence: ${sequenceLength} step${sequenceLength!==1?"s":""}\n${activateOnLaunch ? "⚠️ Will ACTIVATE & start sending" : "Will create as DRAFT"}`)) return;
+
+    // Build a transparent pre-launch summary
+    const droppedNote = (failedGen.length || noEmail.length)
+      ? `\n\n⚠️ DROPPED (won't be sent):\n• ${failedGen.length} generation failure${failedGen.length === 1 ? "" : "s"}\n• ${noEmail.length} missing email address${noEmail.length === 1 ? "" : "es"}`
+      : "";
+    const confirmMsg = `Launch ${validEmails.length} of ${generated.length} emails via Smartlead?\n\nMode: ${slMode === "new" ? `New campaign "${slCampaignName}"` : `Add to existing campaign ${slExistingCampaign}`}\nMailboxes: ${slMailboxIds.size}\nSequence: ${sequenceLength} step${sequenceLength !== 1 ? "s" : ""}\n${activateOnLaunch ? "⚠️ Will ACTIVATE & start sending" : "Will create as DRAFT (you must activate manually in Smartlead)"}${droppedNote}`;
+    if (!overrides.skipConfirm && !confirm(confirmMsg)) return;
 
     setLaunching(true); setErr(""); setLaunchResult(null);
     try {
@@ -3451,10 +3770,32 @@ function EmailCampaignTab({ baseId, campaign, leads, prefilledLeadId }) {
         generatedEmails: validEmails,
         sequenceConfig: { length: sequenceLength, delays },
         activate: activateOnLaunch,
+        allowSequenceMismatch: overrides.allowSequenceMismatch || false,
+        allowPlaceholderMismatch: overrides.allowPlaceholderMismatch || false,
       });
+
+      // Backend may return requiresConfirmation when launching into existing campaign with mismatches
+      if (r.requiresConfirmation) {
+        const proceed = confirm(`⚠️ ${r.error}\n\nProceed anyway? (Some emails may not send correctly.)`);
+        setLaunching(false);
+        if (proceed) {
+          // Re-launch with the appropriate override flag
+          const newOverrides = { ...overrides, skipConfirm: true };
+          if (r.placeholderIssues) newOverrides.allowPlaceholderMismatch = true;
+          if (typeof r.existingSeqCount === "number") newOverrides.allowSequenceMismatch = true;
+          return launchCampaign(newOverrides);
+        }
+        setErr("Launch cancelled");
+        return;
+      }
+
       setLaunchResult(r);
-      if (r.ok) setStep(6);
-      else setErr(r.error || "Launch failed");
+      if (r.ok) {
+        setStep(6);
+        if (r.warning) setErr(r.warning); // surface activation warnings prominently
+      } else {
+        setErr(r.error || "Launch failed");
+      }
     } catch (e) { setErr(e.message); }
     setLaunching(false);
   };
@@ -3694,8 +4035,34 @@ function EmailCampaignTab({ baseId, campaign, leads, prefilledLeadId }) {
         <div style={{fontSize:11,color:"var(--t2)",lineHeight:1.6}}>Each lead got a personalized email. To improve all of them at once, write feedback below and click Regenerate All. To improve just one, use the per-lead feedback box.</div>
       </div>
 
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
-        <div style={{fontSize:11,color:"var(--t2)"}}>{generated.filter(g=>g.ok).length}/{generated.length} successful</div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:8}}>
+        <div style={{fontSize:11,color:"var(--t2)"}}>
+          <strong style={{color:"var(--grn)"}}>{generated.filter(g=>g.ok&&g.email).length}</strong> ready
+          {generated.filter(g=>!g.ok).length > 0 && <> · <strong style={{color:"var(--red)"}}>{generated.filter(g=>!g.ok).length}</strong> failed</>}
+          {generated.filter(g=>g.ok&&!g.email).length > 0 && <> · <strong style={{color:"var(--amb)"}}>{generated.filter(g=>g.ok&&!g.email).length}</strong> no email</>}
+          <> / {generated.length} total</>
+        </div>
+        {generated.filter(g=>!g.ok).length > 0 && (
+          <button className="btn btn-s" disabled={generating} onClick={async()=>{
+            const failed = generated.filter(g=>!g.ok);
+            if (!confirm(`Retry generation for ${failed.length} failed lead${failed.length===1?"":"s"}?`)) return;
+            setGenerating(true);
+            try {
+              const f = activeOffer.fields || {};
+              const config = { senderProfile, purpose: f["Offer Description"] || "", ctaLink: f["CTA Link"] || "", ctaPurpose: f["CTA Purpose"] || "", referenceEmail: referenceEmail || "", sequenceLength };
+              const out = [...generated];
+              for (const g of failed) {
+                const r2 = await ec("regenerate_email", { leadId: g.leadId, config, factors, feedback: "" });
+                if (r2.ok) {
+                  const idx = out.findIndex(x => x.leadId === g.leadId);
+                  if (idx >= 0) out[idx] = r2;
+                }
+              }
+              setGenerated(out);
+            } catch (e) { setErr(e.message); }
+            setGenerating(false);
+          }}>{generating?"⏳":"🔁 Retry Failed"}</button>
+        )}
       </div>
 
       {/* Bulk regen */}

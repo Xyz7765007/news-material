@@ -321,19 +321,68 @@ async function aiPersonalizeMessage(template, lead, signal, companyName) {
 
   const f = lead.fields || lead;
   const names = deriveNames(f);
+
+  // Detect rich engagement context (GA, prior interactions, etc.)
+  const gaScore = Number(f["GA Engagement Score"] || 0);
+  const gaSessions = Number(f["GA Sessions"] || 0);
+  const gaViews = Number(f["GA Views"] || 0);
+  const gaLastVisit = f["GA Last Visit"] || "";
+  const gaEngagementTime = Number(f["GA Engagement Time"] || 0);
+  const hasGAContext = gaScore > 0 || gaSessions > 0 || signal;
+
   const openai = new OpenAI({ apiKey: OPENAI_KEY });
   try {
+    // Different prompting strategy depending on context richness
+    const systemPrompt = hasGAContext ? `You are personalizing a LinkedIn connection request.
+
+IMPORTANT — when the lead has visited our website (engagement signal present):
+- The opener MUST reference their specific behavior (e.g., "saw you've been digging into [topic]", "noticed you spent time on our [page]")
+- DO NOT use the generic template opener if the engagement data tells a more specific story
+- Be specific, not vague: "5 sessions exploring our pricing page" beats "you've been looking around"
+- Sound human, not creepy — frame it as helpful follow-up, not surveillance
+
+Rules:
+1. Treat the template as a STARTING POINT — adapt it to fit the engagement signal naturally
+2. Replace ALL merge fields like {first_name}, {company}, {title}
+3. NO curly braces in output
+4. If a field is empty, rewrite naturally (don't say "at " or "in your role as ")
+5. Keep under 280 characters (LinkedIn limit is 300)
+6. Return ONLY the message text — no preamble, quotes, or markdown` : `Personalize this LinkedIn message for the specific lead.
+
+Rules:
+1. Keep the same structure and intent as the template
+2. Replace ALL merge fields like {first_name}, {company}, {title}
+3. NO curly braces in output
+4. If a field is empty, rewrite naturally
+5. Make it natural and conversational
+6. Return ONLY the message text — no preamble, quotes, or markdown`;
+
+    // Build a richer context block
+    const ctxLines = [
+      `Name: ${names.full || "Unknown"}`,
+      `First name: ${names.first || "(unknown)"}`,
+      `Title: ${f.Title || "(unknown)"}`,
+      `Company: ${f.Company || companyName || "(unknown)"}`,
+    ];
+    if (signal) ctxLines.push(`Signal/context: ${signal}`);
+    if (hasGAContext && gaScore > 0) {
+      const tier = gaScore >= 51 ? "🔥 Hot" : gaScore >= 21 ? "⚡ Interested" : "👀 Warm";
+      ctxLines.push(`\n— Website Engagement Data —`);
+      ctxLines.push(`Engagement tier: ${tier} (score ${gaScore}/100)`);
+      if (gaSessions > 0) ctxLines.push(`Sessions: ${gaSessions}`);
+      if (gaViews > 0) ctxLines.push(`Pageviews: ${gaViews}`);
+      if (gaEngagementTime > 0) {
+        const t = gaEngagementTime >= 60 ? `${Math.floor(gaEngagementTime/60)}m ${Math.floor(gaEngagementTime%60)}s` : `${Math.floor(gaEngagementTime)}s`;
+        ctxLines.push(`Time on site: ${t}`);
+      }
+      if (gaLastVisit) ctxLines.push(`Last visit: ${gaLastVisit}`);
+    }
+
     const c = await openai.chat.completions.create({
-      model: "gpt-5.4-mini", temperature: 0.5, max_tokens: 300,
+      model: "gpt-5.4-mini", temperature: 0.6, max_tokens: 300,
       messages: [
-        { role: "system", content: `Personalize this LinkedIn message for the specific lead. Rules:
-1. Keep the same structure and intent as the template.
-2. Replace ALL merge field placeholders like {first_name}, {company}, {title} with the actual data.
-3. Do NOT include any curly braces {...} in your output — every placeholder must be filled.
-4. If a field is empty, rewrite the sentence naturally (don't say "at " or "your role as ").
-5. Make it natural and conversational.
-6. Return ONLY the final message text — no preamble, no quotes, no markdown.` },
-        { role: "user", content: `Template:\n${template}\n\nLead data:\nName: ${names.full || "Unknown"}\nFirst name: ${names.first || "(unknown)"}\nTitle: ${f.Title || "(unknown)"}\nCompany: ${f.Company || companyName || "(unknown)"}\nSignal: ${signal || "(none)"}` },
+        { role: "system", content: systemPrompt },
+        { role: "user", content: `Template:\n${template}\n\nLead data:\n${ctxLines.join("\n")}` },
       ],
     });
     const aiMsg = c.choices[0]?.message?.content?.trim();
@@ -345,10 +394,125 @@ async function aiPersonalizeMessage(template, lead, signal, companyName) {
       console.warn("[MERGE] AI returned message with unresolved fields, falling back:", v.error, "AI output:", aiMsg.slice(0, 100));
       return deterministic;
     }
+    // Length safety: if AI exceeded the LinkedIn limit, fall back
+    if (aiMsg.length > 295) {
+      console.warn(`[MERGE] AI message too long (${aiMsg.length} chars), falling back to deterministic`);
+      return deterministic;
+    }
     return aiMsg;
   } catch (e) {
     console.error("[MERGE] AI personalization failed:", e.message);
     return deterministic;
+  }
+}
+
+// ─── REPLY INTENT CLASSIFICATION ────────────────────────────
+// Takes a reply message and returns:
+//   intent: interested | objection | referral | not_interested | out_of_office | auto_reply | unclear
+//   urgency: high | medium | low
+//   summary: 1-line summary of what they said
+//   suggested_action: 1 short sentence on what to do next
+//   confidence: 0-100 (how confident the classifier is)
+async function classifyReplyIntent(replyText, context = {}) {
+  if (!replyText || !replyText.trim()) {
+    return { intent: "unclear", urgency: "low", summary: "Empty reply", suggested_action: "Wait for follow-up", confidence: 0 };
+  }
+  if (!OPENAI_KEY) {
+    return { intent: "unclear", urgency: "low", summary: "(classifier disabled — OPENAI_API_KEY missing)", suggested_action: "Review manually", confidence: 0, error: "OPENAI_API_KEY not set" };
+  }
+
+  // Quick local heuristics for obvious cases (saves LLM cost + latency)
+  const lower = replyText.toLowerCase();
+  const hasOOOPattern = /(out of (the )?office|out of office|on vacation|on leave|on annual leave|away until|will be back|maternity|paternity|bereavement|holiday|automatic reply|auto[- ]?reply|out till|out from|currently out|away from my desk)/i.test(replyText);
+  // Don't shortcut OOO if the reply is long — could be a real reply mentioning OOO casually
+  if (hasOOOPattern && replyText.length < 600) {
+    return {
+      intent: "out_of_office",
+      urgency: "low",
+      summary: "Out of office auto-reply",
+      suggested_action: "Pause sequence, retry after they're back. Check message body for return date.",
+      confidence: 90,
+      method: "heuristic",
+    };
+  }
+
+  const openai = new OpenAI({ apiKey: OPENAI_KEY });
+  const ctxLine = [];
+  if (context.leadName) ctxLine.push(`Lead: ${context.leadName}`);
+  if (context.leadTitle) ctxLine.push(`Title: ${context.leadTitle}`);
+  if (context.leadCompany) ctxLine.push(`Company: ${context.leadCompany}`);
+  if (context.priorMessage) ctxLine.push(`\nWhat WE sent them:\n${String(context.priorMessage).slice(0, 500)}`);
+
+  try {
+    const c = await openai.chat.completions.create({
+      model: "gpt-5.4-mini",
+      temperature: 0.1, // low temp — classification needs determinism
+      max_tokens: 250,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: `You classify replies to outbound B2B sales messages. Return JSON only.
+
+Categories (pick ONE for "intent"):
+- "interested": expresses interest, asks a question, requests info, wants to chat / book a call
+- "objection": engaging but with a concern (price, timing, fit, "send me more", "later", "not now")
+- "referral": pointing you to someone else who handles this
+- "not_interested": clear no, unsubscribe, "not the right person", "remove me"
+- "out_of_office": auto-reply about being away (NOT a manual reply that mentions vacation in passing)
+- "auto_reply": other automated replies (delivery confirmations, ticket systems, no-reply bounces)
+- "unclear": neutral acknowledgment, brief reply that doesn't reveal intent, ambiguous
+
+For "urgency":
+- "high": explicit ask to talk, hot interest, time-sensitive
+- "medium": questions, objections that need a response within a day
+- "low": polite no, OOO, FYI replies
+
+Return JSON: {
+  "intent": "<one of above>",
+  "urgency": "high|medium|low",
+  "summary": "<1 sentence — what they said in their own context>",
+  "suggested_action": "<1 sentence — concrete next step for the SDR>",
+  "confidence": <0-100 integer — how confident you are>,
+  "key_quote": "<optional: 5-15 word direct quote that drove the classification>"
+}`
+        },
+        {
+          role: "user",
+          content: `${ctxLine.length > 0 ? ctxLine.join("\n") + "\n\n" : ""}=== THEIR REPLY ===\n${replyText.slice(0, 2000)}`
+        },
+      ],
+    });
+
+    const raw = c.choices?.[0]?.message?.content || "{}";
+    let parsed;
+    try { parsed = JSON.parse(raw); }
+    catch (e) {
+      console.error("[CLASSIFY] JSON parse failed. Raw:", raw.slice(0, 200));
+      return { intent: "unclear", urgency: "low", summary: "Classifier returned invalid JSON", suggested_action: "Review manually", confidence: 0, error: "parse_failed" };
+    }
+
+    // Validate intent value
+    const validIntents = ["interested", "objection", "referral", "not_interested", "out_of_office", "auto_reply", "unclear"];
+    if (!validIntents.includes(parsed.intent)) {
+      console.warn(`[CLASSIFY] Got unexpected intent "${parsed.intent}", normalizing to unclear`);
+      parsed.intent = "unclear";
+    }
+    const validUrgency = ["high", "medium", "low"];
+    if (!validUrgency.includes(parsed.urgency)) parsed.urgency = "medium";
+
+    return {
+      intent: parsed.intent,
+      urgency: parsed.urgency,
+      summary: String(parsed.summary || "").slice(0, 200),
+      suggested_action: String(parsed.suggested_action || "").slice(0, 200),
+      confidence: Math.max(0, Math.min(100, Number(parsed.confidence) || 50)),
+      key_quote: parsed.key_quote ? String(parsed.key_quote).slice(0, 150) : null,
+      method: "ai",
+    };
+  } catch (e) {
+    console.error("[CLASSIFY] OpenAI call failed:", e.message);
+    return { intent: "unclear", urgency: "low", summary: "Classification failed", suggested_action: "Review manually", confidence: 0, error: e.message };
   }
 }
 
@@ -1268,23 +1432,148 @@ export async function POST(request) {
 
         let repliesFound = 0;
         const replied = [];
+        const classifyEnabled = body.classify !== false; // default ON
         for (const item of items) {
           const f = item.fields || {};
           const chatId = f["Unipile Chat ID"];
-          const didReply = await hasLeadReplied(chatId, accountId);
-          if (didReply) {
-            await atUpdate(baseId, "Outreach", [{ id: item.id, fields: {
-              Status: "replied",
-              "Replied At": new Date().toISOString(),
-              "Next Action Date": "",
-              Notes: "Lead replied — DM sequence stopped",
-            }}]);
-            repliesFound++;
-            replied.push(f.Name || f["LinkedIn URL"] || item.id);
+          // Fetch messages so we can both detect reply AND classify the latest one in one call
+          const msgRes = await getChatMessages(chatId, accountId);
+          if (!msgRes.ok) {
+            console.warn(`[check_replies] Couldn't fetch messages for chat ${chatId}`);
+            await new Promise(r => setTimeout(r, 300));
+            continue;
           }
+          const messages = msgRes.data?.items || msgRes.data?.messages || [];
+          // Find latest message from THEM (is_sender = false/0 means from lead)
+          const theirMessages = messages.filter(m => m.is_sender === false || m.is_sender === 0);
+          if (theirMessages.length === 0) {
+            await new Promise(r => setTimeout(r, 300));
+            continue;
+          }
+          // Their latest reply text
+          const latestReply = theirMessages[theirMessages.length - 1];
+          const replyText = latestReply?.text || latestReply?.body || latestReply?.content || "";
+          // What we sent them last (most recent OUR message)
+          const ourMessages = messages.filter(m => m.is_sender === true || m.is_sender === 1);
+          const priorMessage = ourMessages.length > 0 ? (ourMessages[ourMessages.length - 1]?.text || ourMessages[ourMessages.length - 1]?.body || "") : "";
+
+          // Classify
+          let classification = null;
+          if (classifyEnabled && replyText.trim()) {
+            classification = await classifyReplyIntent(replyText, {
+              leadName: f.Name || "",
+              leadTitle: f.Title || "",
+              leadCompany: f.Company || "",
+              priorMessage,
+            });
+          }
+
+          // Build the Airtable update — include classification fields if we got them
+          const updateFields = {
+            Status: "replied",
+            "Replied At": new Date().toISOString(),
+            "Next Action Date": "",
+            Notes: classification
+              ? `Lead replied [${classification.intent} · ${classification.urgency}]: ${classification.summary}`
+              : "Lead replied — DM sequence stopped",
+          };
+          if (classification) {
+            updateFields["Reply Intent"] = classification.intent;
+            updateFields["Reply Urgency"] = classification.urgency;
+            updateFields["Reply Summary"] = classification.summary;
+            updateFields["Reply Suggested Action"] = classification.suggested_action;
+            updateFields["Reply Confidence"] = classification.confidence;
+            if (replyText) updateFields["Reply Text"] = replyText.slice(0, 5000);
+          }
+
+          // Auto-create missing fields on first 422
+          const tryUpdate = async (attempt = 0) => {
+            try {
+              await atUpdate(baseId, "Outreach", [{ id: item.id, fields: updateFields }]);
+              return true;
+            } catch (e) {
+              if (attempt < 3 && e.message && (e.message.includes("UNKNOWN_FIELD_NAME") || e.message.includes("INVALID_VALUE_FOR_COLUMN"))) {
+                const m = e.message.match(/[Uu]nknown field name:?\s+\\?"([^"\\]+)\\?"/) || e.message.match(/Field\s+\\?"([^"\\]+)\\?"/);
+                const badField = m ? m[1] : null;
+                if (badField) {
+                  console.log(`[check_replies] Auto-creating field "${badField}"`);
+                  try {
+                    const tablesRes = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables`, { headers: atHdr });
+                    if (tablesRes.ok) {
+                      const { tables } = await tablesRes.json();
+                      const t = tables.find(t => t.name === "Outreach");
+                      if (t) {
+                        const fieldType = badField === "Reply Confidence" ? "number" : "singleLineText";
+                        const opts = fieldType === "number" ? { precision: 0 } : undefined;
+                        const createBody = { name: badField, type: fieldType };
+                        if (opts) createBody.options = opts;
+                        await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables/${t.id}/fields`, {
+                          method: "POST", headers: atHdr, body: JSON.stringify(createBody),
+                        });
+                        await new Promise(r => setTimeout(r, 1500));
+                        return tryUpdate(attempt + 1);
+                      }
+                    }
+                  } catch (createErr) { console.error("[check_replies] Field create failed:", createErr.message); }
+                  // Field create failed — strip it and retry
+                  delete updateFields[badField];
+                  return tryUpdate(attempt + 1);
+                }
+              }
+              console.error("[check_replies] Airtable update failed:", e.message);
+              return false;
+            }
+          };
+          await tryUpdate();
+
+          repliesFound++;
+          replied.push({
+            name: f.Name || f["LinkedIn URL"] || item.id,
+            intent: classification?.intent || null,
+            urgency: classification?.urgency || null,
+            summary: classification?.summary || null,
+          });
           await new Promise(r => setTimeout(r, 300)); // rate limit
         }
         return NextResponse.json({ checked: items.length, repliesFound, replied });
+      }
+
+      // Standalone: classify a single reply on demand (no Airtable side effects)
+      // Useful for: pasting a manually-received reply, classifying email replies from Smartlead webhook, debugging
+      case "classify_reply_text": {
+        const { replyText, leadName, leadTitle, leadCompany, priorMessage } = body;
+        if (!replyText) return NextResponse.json({ error: "replyText required" }, { status: 400 });
+        const result = await classifyReplyIntent(replyText, { leadName, leadTitle, leadCompany, priorMessage });
+        return NextResponse.json({ ok: true, ...result });
+      }
+
+      // Re-classify a stored Outreach record's reply (without re-fetching from LinkedIn)
+      case "reclassify_reply": {
+        if (!baseId || !body.outreachId) return NextResponse.json({ error: "baseId and outreachId required" }, { status: 400 });
+        const recRes = await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Outreach")}/${body.outreachId}`, { headers: atHdr });
+        if (!recRes.ok) return NextResponse.json({ error: `Outreach record not found (${recRes.status})` }, { status: 404 });
+        const rec = await recRes.json();
+        const f = rec.fields || {};
+        const replyText = f["Reply Text"] || body.replyText || "";
+        if (!replyText) return NextResponse.json({ error: "No reply text on record. Pass replyText in body, or run check_replies to fetch from LinkedIn." }, { status: 400 });
+        const classification = await classifyReplyIntent(replyText, {
+          leadName: f.Name || "",
+          leadTitle: f.Title || "",
+          leadCompany: f.Company || "",
+          priorMessage: body.priorMessage || "",
+        });
+        try {
+          await atUpdate(baseId, "Outreach", [{ id: body.outreachId, fields: {
+            "Reply Intent": classification.intent,
+            "Reply Urgency": classification.urgency,
+            "Reply Summary": classification.summary,
+            "Reply Suggested Action": classification.suggested_action,
+            "Reply Confidence": classification.confidence,
+          }}]);
+        } catch (e) {
+          return NextResponse.json({ ok: true, classification, warning: "Classification done but Airtable write failed: " + e.message });
+        }
+        return NextResponse.json({ ok: true, classification });
       }
 
       case "process_queue": {
