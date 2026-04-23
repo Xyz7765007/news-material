@@ -613,27 +613,28 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       const d = await hsAPI("push_tasks", { tasks: mapped, config, baseId: bid });
       console.log("[pushToHubSpot] response:", d);
       let toast = "";
-      if (d.created > 0 || d.updated > 0) {
+      if (d.error) {
+        toast = `❌ ${d.error}`;
+      } else if (d.created > 0 || d.updated > 0) {
         const parts = [];
         if (d.created > 0) parts.push(`✅ ${d.created} created`);
-        if (d.updated > 0) parts.push(`🔄 ${d.updated} updated`);
+        if (d.updated > 0) parts.push(`🔄 ${d.updated} updated (body refreshed in HubSpot)`);
         if (d.skipped > 0) parts.push(`⏭️ ${d.skipped} skipped`);
         if (typeof d.associated === "number" && d.associated > 0) parts.push(`🔗 ${d.associated} linked to contacts`);
         if (typeof d.notAssociated === "number" && d.notAssociated > 0) parts.push(`⚠️ ${d.notAssociated} unlinked (contact not in HubSpot)`);
         if (d.airtableSynced) parts.push(`💾 ${d.airtableSynced} IDs saved to Airtable`);
-        if (d.errors?.length) parts.push(`❌ ${d.errors.length} errors`);
+        if (d.errors?.length) parts.push(`❌ ${d.errors.length} errors: ${d.errors[0]?.slice(0, 100)}`);
         toast = parts.join(" · ");
       } else if (d.skipped > 0) {
-        toast = `⏭️ All ${d.skipped} tasks were already pushed — skipped (use 'Force recreate' to override)`;
+        toast = `⏭️ All ${d.skipped} tasks were skipped (mode=skip_existing). Use 'Smart' mode to update them.`;
       } else if (d.errors?.length) {
         toast = `❌ Push failed: ${d.errors[0]}`;
-      } else if (d.error) {
-        toast = `❌ ${d.error}`;
       } else {
-        toast = `⚠️ Response: ${JSON.stringify(d).slice(0, 200)}`;
+        // Nothing created, nothing updated, nothing skipped, no errors — something's off
+        toast = `⚠️ HubSpot accepted the request but reported 0 changes. Likely cause: no tasks in selection. Sent ${mapped.length}, breakdown: ${withHubspotId} updates / ${willCreate} new. Response: ${JSON.stringify(d).slice(0, 200)}`;
       }
       setHsMsg(toast);
-      setTimeout(() => setHsMsg(""), 20000);
+      setTimeout(() => setHsMsg(""), 30000);
 
       // Refresh tasks so UI reflects the new HubSpot Task IDs
       if (d.airtableSynced > 0) {
