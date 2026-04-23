@@ -3519,7 +3519,8 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
 function LinkedInPostsTab({ baseId, campaign, leads }) {
   const [selectedLeadIds, setSelectedLeadIds] = useState(new Set());
   const [selectedCompanies, setSelectedCompanies] = useState(new Set());
-  const [selectMode, setSelectMode] = useState("all"); // "all" | "specific" | "by_company"
+  const [selectedCampaignTags, setSelectedCampaignTags] = useState(new Set());
+  const [selectMode, setSelectMode] = useState("all"); // "all" | "specific" | "by_company" | "by_campaign_tag"
   const [scoreThreshold, setScoreThreshold] = useState(70);
   const [daysBack, setDaysBack] = useState(7);
   const [taskRuleName, setTaskRuleName] = useState("LinkedIn Post Engagement");
@@ -3611,11 +3612,56 @@ function LinkedInPostsTab({ baseId, campaign, leads }) {
   const selectAllCompanies = () => setSelectedCompanies(new Set(visibleCompanies.map(c => c.company)));
   const selectNoCompanies = () => setSelectedCompanies(new Set());
 
-  // Resolve selected companies to the underlying lead IDs for backend
   const leadIdsFromSelectedCompanies = () => {
     const ids = [];
     for (const c of companyList) {
       if (selectedCompanies.has(c.company)) ids.push(...c.leadIds);
+    }
+    return ids;
+  };
+
+  // Campaign tag grouping — for "by campaign" selection mode.
+  // Leads carry a Campaign field (single-select in Airtable) like "Veloka", "Crunchbase Campaign",
+  // "SaasBhoomi + Bangalore ICP", etc. This groups leads by that tag.
+  // Falls back to multiple likely field names since naming may vary by base.
+  const getLeadCampaignTag = (l) => {
+    const f = l.fields || {};
+    const raw = f.Campaign || f["Campaign Tag"] || f["Campaign Source"] || f.Source || f.Tag;
+    if (Array.isArray(raw)) return raw[0] || "— no tag —";
+    return (raw && String(raw).trim()) || "— no tag —";
+  };
+  const leadsByCampaignTag = linkedinLeads.reduce((acc, l) => {
+    const tag = getLeadCampaignTag(l);
+    if (!acc[tag]) acc[tag] = [];
+    acc[tag].push(l);
+    return acc;
+  }, {});
+  const campaignTagList = Object.entries(leadsByCampaignTag)
+    .map(([tag, leads]) => ({ tag, count: leads.length, leadIds: leads.map(l => l.id) }))
+    .sort((a, b) => {
+      // "— no tag —" always last, otherwise alphabetical
+      if (a.tag === "— no tag —") return 1;
+      if (b.tag === "— no tag —") return -1;
+      return a.tag.localeCompare(b.tag);
+    });
+  const visibleCampaignTags = searchLeads
+    ? campaignTagList.filter(c => c.tag.toLowerCase().includes(searchLeads.toLowerCase()))
+    : campaignTagList;
+
+  const toggleCampaignTag = (tag) => {
+    setSelectedCampaignTags(prev => {
+      const n = new Set(prev);
+      if (n.has(tag)) n.delete(tag); else n.add(tag);
+      return n;
+    });
+  };
+  const selectAllCampaignTags = () => setSelectedCampaignTags(new Set(visibleCampaignTags.map(c => c.tag)));
+  const selectNoCampaignTags = () => setSelectedCampaignTags(new Set());
+
+  const leadIdsFromSelectedCampaignTags = () => {
+    const ids = [];
+    for (const c of campaignTagList) {
+      if (selectedCampaignTags.has(c.tag)) ids.push(...c.leadIds);
     }
     return ids;
   };
@@ -3632,6 +3678,9 @@ function LinkedInPostsTab({ baseId, campaign, leads }) {
     } else if (selectMode === "by_company") {
       leadIds = leadIdsFromSelectedCompanies();
       if (leadIds.length === 0) { setErr("Select at least one company or switch to 'all leads'"); return; }
+    } else if (selectMode === "by_campaign_tag") {
+      leadIds = leadIdsFromSelectedCampaignTags();
+      if (leadIds.length === 0) { setErr("Select at least one campaign tag or switch to 'all leads'"); return; }
     }
 
     setScanning(true);
@@ -3752,20 +3801,60 @@ function LinkedInPostsTab({ baseId, campaign, leads }) {
         {/* Lead selection mode */}
         <div className="ig">
           <div className="il">Leads to Scan</div>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:10}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:8,marginBottom:10}}>
             <div onClick={()=>setSelectMode("all")} style={{padding:12,border:"1px solid "+(selectMode==="all"?"var(--acc)":"var(--bdr)"),background:selectMode==="all"?"var(--acc-d)":"var(--card)",borderRadius:6,cursor:"pointer"}}>
-              <div style={{fontSize:11,fontWeight:600,color:selectMode==="all"?"var(--acc)":"var(--t1)"}}>🌐 All campaign leads</div>
-              <div style={{fontSize:10,color:"var(--t3)",marginTop:3}}>{linkedinLeads.length} leads with LinkedIn URL · out of {(leads||[]).length} total</div>
+              <div style={{fontSize:11,fontWeight:600,color:selectMode==="all"?"var(--acc)":"var(--t1)"}}>🌐 All leads</div>
+              <div style={{fontSize:10,color:"var(--t3)",marginTop:3}}>{linkedinLeads.length} with LinkedIn · of {(leads||[]).length} total</div>
+            </div>
+            <div onClick={()=>setSelectMode("by_campaign_tag")} style={{padding:12,border:"1px solid "+(selectMode==="by_campaign_tag"?"var(--acc)":"var(--bdr)"),background:selectMode==="by_campaign_tag"?"var(--acc-d)":"var(--card)",borderRadius:6,cursor:"pointer"}}>
+              <div style={{fontSize:11,fontWeight:600,color:selectMode==="by_campaign_tag"?"var(--acc)":"var(--t1)"}}>🏷 By campaign tag</div>
+              <div style={{fontSize:10,color:"var(--t3)",marginTop:3}}>{selectedCampaignTags.size} tag{selectedCampaignTags.size!==1?"s":""} selected · {campaignTagList.length} total tags</div>
             </div>
             <div onClick={()=>setSelectMode("by_company")} style={{padding:12,border:"1px solid "+(selectMode==="by_company"?"var(--acc)":"var(--bdr)"),background:selectMode==="by_company"?"var(--acc-d)":"var(--card)",borderRadius:6,cursor:"pointer"}}>
-              <div style={{fontSize:11,fontWeight:600,color:selectMode==="by_company"?"var(--acc)":"var(--t1)"}}>🏢 By company / account</div>
-              <div style={{fontSize:10,color:"var(--t3)",marginTop:3}}>{selectedCompanies.size} {selectedCompanies.size===1?"company":"companies"} selected · {companyList.length} total accounts</div>
+              <div style={{fontSize:11,fontWeight:600,color:selectMode==="by_company"?"var(--acc)":"var(--t1)"}}>🏢 By company</div>
+              <div style={{fontSize:10,color:"var(--t3)",marginTop:3}}>{selectedCompanies.size} selected · {companyList.length} accounts</div>
             </div>
             <div onClick={()=>setSelectMode("specific")} style={{padding:12,border:"1px solid "+(selectMode==="specific"?"var(--acc)":"var(--bdr)"),background:selectMode==="specific"?"var(--acc-d)":"var(--card)",borderRadius:6,cursor:"pointer"}}>
-              <div style={{fontSize:11,fontWeight:600,color:selectMode==="specific"?"var(--acc)":"var(--t1)"}}>🎯 Selected leads only</div>
+              <div style={{fontSize:11,fontWeight:600,color:selectMode==="specific"?"var(--acc)":"var(--t1)"}}>🎯 Specific leads</div>
               <div style={{fontSize:10,color:"var(--t3)",marginTop:3}}>{selectedLeadIds.size} lead{selectedLeadIds.size!==1?"s":""} selected</div>
             </div>
           </div>
+
+          {selectMode==="by_campaign_tag" && (
+            <div style={{border:"1px solid var(--bdr)",borderRadius:6,overflow:"hidden"}}>
+              <div style={{padding:"8px 10px",background:"var(--hover)",display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+                <input type="text" placeholder="Search campaign tags..." value={searchLeads} onChange={e=>setSearchLeads(e.target.value)} style={{flex:1,padding:"4px 8px",fontSize:11,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:4,color:"var(--t1)"}}/>
+                <button className="btn btn-s" onClick={selectAllCampaignTags} style={{fontSize:10}}>Select all visible</button>
+                <button className="btn btn-s" onClick={selectNoCampaignTags} style={{fontSize:10}}>Clear</button>
+              </div>
+              <div style={{padding:"6px 10px",fontSize:10,color:"var(--t3)",borderBottom:"1px solid var(--bdr)",background:"var(--card)"}}>
+                {selectedCampaignTags.size > 0 && <>Selected: {selectedCampaignTags.size} {selectedCampaignTags.size===1?"tag":"tags"} · <strong style={{color:"var(--t1)"}}>{leadIdsFromSelectedCampaignTags().length} leads</strong> will be scanned</>}
+                {selectedCampaignTags.size === 0 && "Reads the Campaign field on each Lead (fallback: Campaign Tag / Campaign Source / Source / Tag). Tick one or more tags below."}
+              </div>
+              <div style={{maxHeight:320,overflowY:"auto"}}>
+                {visibleCampaignTags.length === 0 && (
+                  <div style={{padding:20,textAlign:"center",fontSize:11,color:"var(--t3)"}}>
+                    No campaign tags found. Make sure your Leads table has a field called "Campaign" (or "Campaign Tag" / "Source") with values set.
+                  </div>
+                )}
+                {visibleCampaignTags.slice(0, 200).map(c => {
+                  const sel = selectedCampaignTags.has(c.tag);
+                  const isNoTag = c.tag === "— no tag —";
+                  return (
+                    <div key={c.tag} onClick={()=>toggleCampaignTag(c.tag)} style={{padding:"8px 10px",display:"flex",alignItems:"center",gap:10,borderTop:"1px solid var(--bdr)",cursor:"pointer",background:sel?"var(--acc-d)":"transparent"}}>
+                      <input type="checkbox" checked={sel} onChange={()=>{}} onClick={e=>e.stopPropagation()} style={{margin:0}}/>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:11,fontWeight:500,color:isNoTag?"var(--t3)":"var(--t1)",fontStyle:isNoTag?"italic":"normal"}}>{c.tag}</div>
+                        <div style={{fontSize:9,color:"var(--t3)"}}>{c.count} lead{c.count!==1?"s":""} with LinkedIn URL</div>
+                      </div>
+                      <span style={{fontSize:10,color:"var(--t3)",fontFamily:"'JetBrains Mono',monospace"}}>{c.count}</span>
+                    </div>
+                  );
+                })}
+                {visibleCampaignTags.length > 200 && <div style={{padding:10,textAlign:"center",fontSize:10,color:"var(--t3)",borderTop:"1px solid var(--bdr)"}}>Showing first 200 of {visibleCampaignTags.length}. Use search to narrow.</div>}
+              </div>
+            </div>
+          )}
 
           {selectMode==="by_company" && (
             <div style={{border:"1px solid var(--bdr)",borderRadius:6,overflow:"hidden"}}>
