@@ -660,25 +660,38 @@ async function findOrphanedTasks(apiKey, baseId, opts = {}) {
     }
 
     // B/C) Find all matching airtableTaskMap entries
-    // EXACT: `${company} — ${taskRule}` (case-insensitive)
-    // FUZZY: subject contains company AND combined contains full lead name (case-insensitive, word-boundary safe)
+    // PRIORITY:
+    //   1. Exact subject match + lead name explicitly in body (DISAMBIGUATES multi-employee companies)
+    //   2. Exact subject match alone (only useful when 1 candidate)
+    //   3. Fuzzy (company in subject + full name word-boundary in body)
+
+    // Extract "Lead: [Name]" from body if present (most reliable disambiguator for GA tasks)
+    const leadLineMatch = body.match(/^Lead:\s*(.+?)$/mi);
+    const leadNameFromBody = leadLineMatch ? leadLineMatch[1].trim().toLowerCase() : null;
+
     const exactMatches = [];
     const fuzzyMatches = [];
     const subjectLower = subject.toLowerCase();
 
     for (const [key, info] of Object.entries(airtableTaskMap)) {
-      if (info.ambiguous) continue; // skip multiple airtable tasks with same company|lead
+      if (info.ambiguous) continue;
       const company = info.company.toLowerCase();
       const leadName = info.leadName.toLowerCase();
-      // Guard against dangerously short lead names (< 4 chars) — don't fuzzy-match those
       if (leadName.length < 4) continue;
 
       const taskRuleForMatch = (info.taskRule || "Task").toLowerCase();
       const expectedSubject = `${company} — ${taskRuleForMatch}`.trim();
-      if (subjectLower === expectedSubject) {
-        exactMatches.push({ key, info });
-      } else {
-        // Word-boundary match to avoid "Sam" matching "Sample"
+      const subjectMatches = subjectLower === expectedSubject;
+
+      // If we extracted a Lead: line from body, that's a strong disambiguator
+      if (leadNameFromBody && subjectMatches && leadNameFromBody === leadName) {
+        // PERFECT match: subject AND explicit lead name from body agree
+        exactMatches.push({ key, info, confidence: "perfect" });
+      } else if (subjectMatches && !leadNameFromBody) {
+        // Subject matches, no lead line in body — this is the pre-fix behavior (use with candidate-count check)
+        exactMatches.push({ key, info, confidence: "subject_only" });
+      } else if (!subjectMatches) {
+        // Fuzzy: word-boundary name match + company in subject
         const leadNameRegex = new RegExp(`\\b${leadName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
         const companyInSubject = company.length >= 3 && subjectLower.includes(company);
         const leadInCombined = leadNameRegex.test(combinedLower);
@@ -688,15 +701,30 @@ async function findOrphanedTasks(apiKey, baseId, opts = {}) {
       }
     }
 
-    if (exactMatches.length === 1) {
-      orphanToMatch[orphanId] = { method: MATCH_METHOD.EXACT_SUBJECT, airtableTaskKey: exactMatches[0].key, email: exactMatches[0].info.email };
-    } else if (exactMatches.length > 1) {
-      // Ambiguous exact match — check if they all resolve to SAME email (e.g. same person, two tasks)
-      const uniqueEmails = [...new Set(exactMatches.map(m => m.info.email))];
+    // Decide match method — prefer the most confident single match
+    const perfectMatches = exactMatches.filter(m => m.confidence === "perfect");
+    const subjectOnlyMatches = exactMatches.filter(m => m.confidence === "subject_only");
+
+    if (perfectMatches.length === 1) {
+      // Best case: subject + body lead name both matched exactly one candidate
+      orphanToMatch[orphanId] = { method: MATCH_METHOD.EXACT_SUBJECT, airtableTaskKey: perfectMatches[0].key, email: perfectMatches[0].info.email };
+    } else if (perfectMatches.length > 1) {
+      // Multiple perfect matches — should be rare but could happen if Leads table has dupes
+      const uniqueEmails = [...new Set(perfectMatches.map(m => m.info.email))];
       if (uniqueEmails.length === 1) {
-        orphanToMatch[orphanId] = { method: MATCH_METHOD.EXACT_SUBJECT, airtableTaskKey: exactMatches[0].key, email: uniqueEmails[0] };
+        orphanToMatch[orphanId] = { method: MATCH_METHOD.EXACT_SUBJECT, airtableTaskKey: perfectMatches[0].key, email: uniqueEmails[0] };
       } else {
-        orphanToMatch[orphanId] = { method: MATCH_METHOD.AMBIGUOUS, reason: `Subject "${subject}" matches ${exactMatches.length} Airtable tasks with different emails` };
+        orphanToMatch[orphanId] = { method: MATCH_METHOD.AMBIGUOUS, reason: `Subject + body match ${perfectMatches.length} Airtable tasks with different emails (duplicate leads in your Leads table?)` };
+      }
+    } else if (subjectOnlyMatches.length === 1) {
+      // Subject matched uniquely, no body lead name to verify
+      orphanToMatch[orphanId] = { method: MATCH_METHOD.EXACT_SUBJECT, airtableTaskKey: subjectOnlyMatches[0].key, email: subjectOnlyMatches[0].info.email };
+    } else if (subjectOnlyMatches.length > 1) {
+      const uniqueEmails = [...new Set(subjectOnlyMatches.map(m => m.info.email))];
+      if (uniqueEmails.length === 1) {
+        orphanToMatch[orphanId] = { method: MATCH_METHOD.EXACT_SUBJECT, airtableTaskKey: subjectOnlyMatches[0].key, email: uniqueEmails[0] };
+      } else {
+        orphanToMatch[orphanId] = { method: MATCH_METHOD.AMBIGUOUS, reason: `Subject "${subject}" matches ${subjectOnlyMatches.length} Airtable tasks with different emails and body has no "Lead:" line to disambiguate` };
       }
     } else if (fuzzyMatches.length === 1) {
       orphanToMatch[orphanId] = { method: MATCH_METHOD.FUZZY, airtableTaskKey: fuzzyMatches[0].key, email: fuzzyMatches[0].info.email };
