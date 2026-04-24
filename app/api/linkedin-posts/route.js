@@ -914,6 +914,7 @@ async function runLinkedInPostScan({
   taskRuleName = "LinkedIn Post Engagement",
   systemPromptOverride,
   resume = false, // if true, skip leads that already appear in progress.completed
+  timeBudgetMs = 270_000, // 270s default for UI runs; cron passes 25_000 for fast returns
 }) {
   const startedAt = new Date().toISOString();
   const cutoffMs = Date.now() - (daysBack * 24 * 60 * 60 * 1000);
@@ -1027,22 +1028,28 @@ async function runLinkedInPostScan({
   // Fluid Compute on Hobby now supports 300s. Leave 30s safety margin for final writes.
   // The scan self-terminates with status=running so Resume picks up cleanly.
   const scanStartMs = Date.now();
-  const maxBudgetMs = 270_000; // 270s = 4.5min — 30s safety on 300s fluid compute limit
+  const maxBudgetMs = timeBudgetMs;
   const shouldStopForTime = () => (Date.now() - scanStartMs) > maxBudgetMs;
 
   // Process each lead
   for (let i = 0; i < leads.length; i++) {
     // Check for user-triggered stop — re-read progress state before each lead.
-    // This adds an Airtable read per lead but gives the user a reliable stop mechanism.
-    if (i % 3 === 0) { // Only check every 3 leads to avoid hammering Airtable
-      try {
-        const currentProgress = await readProgress(campaignAirtableId);
-        if (currentProgress?.stopped_by_user) {
-          console.log(`[linkedin-posts] Scan stopped by user at lead ${i}/${leads.length}`);
-          return progress; // exit immediately, don't overwrite stopped state
-        }
-      } catch {}
-    }
+    // Adds one Airtable read per lead (~50ms) but makes the Stop button feel instant
+    // instead of having a 30s lag waiting for the i%3 cadence.
+    try {
+      const currentProgress = await readProgress(campaignAirtableId);
+      if (currentProgress?.stopped_by_user) {
+        console.log(`[linkedin-posts] Scan stopped by user at lead ${i}/${leads.length}`);
+        // Merge the stopped state back into our in-memory progress and persist
+        progress.status = "complete";
+        progress.phase = "done";
+        progress.stopped_by_user = true;
+        progress.ended_at = new Date().toISOString();
+        progress.last_log = `⛔ Scan stopped by user at ${progress.leads_done}/${leads.length} leads.`;
+        await writeProgress(campaignAirtableId, progress);
+        return progress;
+      }
+    } catch {}
 
     // Bail out gracefully if we're about to hit Vercel's timeout.
     // Progress is already persisted after every lead — user hits Resume to continue.
@@ -1240,8 +1247,13 @@ async function runLinkedInPostScan({
       const todayStr = new Date().toISOString().slice(0, 10);
       const nowISO = new Date().toISOString();
       const records = taskWorthy.map(sp => {
-        // Build a transparent Signal that shows the SDR exactly why this post passed
+        const postUrl = sp.post.url || "";
+        // Build a transparent Signal that shows the SDR exactly why this post passed.
+        // Put the post URL at the TOP so it's always visible even if a dedicated URL field
+        // doesn't exist in the user's Tasks table.
         const signalParts = [
+          postUrl ? `🔗 ${postUrl}` : null,
+          postUrl ? `` : null,
           `📝 ${sp.structured_sentence}`,
           ``,
           `💬 Suggested comment: ${sp.suggested_comment}`,
@@ -1256,11 +1268,11 @@ async function runLinkedInPostScan({
           `   • Post type: ${sp.post_type}`,
           `   • Pre-filter category: ${sp.category}${sp.penalty !== 0 ? ` (penalty: ${sp.penalty})` : ""}`,
           sp.sanity_flags?.length ? `   • Sanity flags: ${sp.sanity_flags.join(", ")}` : null,
-        ].filter(Boolean);
+        ].filter(v => v !== null && v !== undefined);
 
         return {
           fields: {
-            Name: leadName,                          // Primary field in user's Tasks table
+            Name: leadName,
             Company: leadCompany,
             "Task Rule": taskRuleName,
             Score: sp.adjusted_score,
@@ -1270,7 +1282,9 @@ async function runLinkedInPostScan({
             "LinkedIn URL": f["LinkedIn URL"] || f["Linkedin URL"] || "",
             Phone: f.Phone || "",
             Signal: signalParts.join("\n"),
-            URL: sp.post.url,
+            URL: postUrl,              // canonical post URL field
+            "Post URL": postUrl,       // alt name — some schemas use this
+            "Signal URL": postUrl,     // alt name — some schemas use this
             Source: "LinkedIn Posts (RapidAPI)",
             "Task Type": "linkedin_engagement",
             Date: todayStr,
@@ -1592,14 +1606,19 @@ export async function GET(request) {
     const daysBack = typeof prior.days_back === "number" ? prior.days_back : 7;
     const ruleName = prior.task_rule_name || taskRuleName;
 
+    // Use a SHORT time budget (25s) when called from cron so cron-job.org's 30s HTTP
+    // timeout doesn't register as "Failed" on every tick. Processes ~3 leads per call.
+    // Over 30 min of 1-per-minute cron = ~90 leads processed via cron alone.
+    // The UI-triggered run (270s budget) handles most of the work up front.
     const result = await runLinkedInPostScan({
       baseId, campaignAirtableId,
-      leadIds: null, // resume uses the original lead set (filtered by completed_lead_ids internally)
+      leadIds: null,
       scoreThreshold,
       daysBack,
       taskRuleName: ruleName,
       systemPromptOverride: prior.system_prompt_override || null,
       resume: true,
+      timeBudgetMs: 25_000,
     });
 
     return NextResponse.json({
