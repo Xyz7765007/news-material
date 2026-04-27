@@ -4313,8 +4313,9 @@ function TriggersTab({ baseId, campaign }) {
   const [triggers, setTriggers] = useState([]);
   const [sourceFilter, setSourceFilter] = useState("all"); // all | Unipile | GA | LinkedIn Posts (RapidAPI)
   const [windowDays, setWindowDays] = useState(7);
-  const [polling, setPolling] = useState(false);
-  const [pollResult, setPollResult] = useState(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshResult, setRefreshResult] = useState(null);
+  const [lastRefreshed, setLastRefreshed] = useState(null);
   const [err, setErr] = useState("");
 
   const upiAPI = async (action, body = {}) => {
@@ -4351,14 +4352,18 @@ function TriggersTab({ baseId, campaign }) {
     loadTriggers();
   }, [baseId, windowDays]);
 
-  const runPoll = async () => {
-    setPolling(true); setPollResult(null);
+  // Manual refresh — pulls fresh data from Unipile (profile views, reactions),
+  // creates tasks for any new events, then reloads the triggers list.
+  // No cron polling — this only runs when user clicks the button.
+  const refreshFromUnipile = async () => {
+    setRefreshing(true); setRefreshResult(null); setErr("");
     try {
       const r = await upiAPI("manual_poll");
-      setPollResult(r);
+      setRefreshResult(r);
+      setLastRefreshed(new Date());
       await loadTriggers();
     } catch (e) { setErr(e.message); }
-    setPolling(false);
+    setRefreshing(false);
   };
 
   // Group triggers by source for the dashboard cards
@@ -4382,15 +4387,26 @@ function TriggersTab({ baseId, campaign }) {
     linkedin_engagement: "📝 LinkedIn Post Score",
   };
 
+  // Format "X min ago" for the last refresh timestamp
+  const formatAgo = (date) => {
+    if (!date) return null;
+    const sec = Math.floor((Date.now() - date.getTime()) / 1000);
+    if (sec < 10) return "just now";
+    if (sec < 60) return `${sec}s ago`;
+    if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
+    return `${Math.floor(sec / 3600)}h ago`;
+  };
+
   return (<div>
     <div className="ph">
       <div>
         <div className="pt">🔥 Triggers</div>
-        <div className="pd">Unified live feed of buying signals across Unipile, GA, and LinkedIn Posts</div>
+        <div className="pd">Buying signals from Unipile, GA, and LinkedIn Posts. Webhooks fire automatically — refresh manually for profile views & reactions.</div>
       </div>
-      <div style={{display:"flex",gap:8}}>
-        <button className="btn btn-s" onClick={loadTriggers} disabled={loading}>{loading ? "Loading..." : "↻ Refresh"}</button>
-        <button className="btn btn-p" onClick={runPoll} disabled={polling}>{polling ? "Polling..." : "🔄 Poll Unipile Now"}</button>
+      <div style={{display:"flex",gap:8,alignItems:"center"}}>
+        {lastRefreshed && <span style={{fontSize:10,color:"var(--t3)"}}>Refreshed {formatAgo(lastRefreshed)}</span>}
+        <button className="btn btn-s" onClick={loadTriggers} disabled={loading}>{loading ? "..." : "↻ Reload feed"}</button>
+        <button className="btn btn-p" onClick={refreshFromUnipile} disabled={refreshing}>{refreshing ? "⏳ Pulling from Unipile..." : "🔄 Refresh from Unipile"}</button>
       </div>
     </div>
 
@@ -4401,28 +4417,28 @@ function TriggersTab({ baseId, campaign }) {
       <div style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,marginBottom:14}}>
         <div style={{display:"flex",gap:24,flexWrap:"wrap",alignItems:"center",fontSize:11,color:"var(--t2)"}}>
           <div><span style={{color:"var(--t3)"}}>Unipile:</span> <strong style={{color:status.unipile_connected?"var(--grn)":"var(--red)"}}>{status.unipile_connected ? "✓ Connected" : "✗ Not connected"}</strong></div>
-          <div><span style={{color:"var(--t3)"}}>Accounts:</span> <strong style={{color:"var(--t1)"}}>{status.accounts_count || 0}</strong></div>
+          <div><span style={{color:"var(--t3)"}}>LinkedIn accounts:</span> <strong style={{color:"var(--t1)"}}>{status.accounts_count || 0}</strong></div>
           <div><span style={{color:"var(--t3)"}}>Leads indexed:</span> <strong style={{color:"var(--t1)"}}>{status.leads_indexed || 0}</strong></div>
         </div>
         {status.webhook_url && (
           <details style={{marginTop:10,fontSize:10,color:"var(--t3)"}}>
-            <summary style={{cursor:"pointer"}}>📡 Webhook setup (paste this URL into Unipile)</summary>
+            <summary style={{cursor:"pointer"}}>📡 Webhook setup (one-time, paste URL into Unipile)</summary>
             <div style={{marginTop:8,padding:10,background:"var(--hover)",borderRadius:4,fontFamily:"'JetBrains Mono',monospace",wordBreak:"break-all",color:"var(--t2)"}}>{status.webhook_url}</div>
-            <div style={{marginTop:6,fontSize:10}}>Replace YOUR_CRON_SECRET with your CRON_SECRET env var. Configure in Unipile → Webhooks → New webhook for events: <code>message.received</code>, <code>users.relations.created</code>, <code>post.commented</code></div>
+            <div style={{marginTop:6,fontSize:10}}>Replace YOUR_CRON_SECRET with your CRON_SECRET env var. In Unipile dashboard → Webhooks → New webhook for events: <code>message.received</code>, <code>users.relations.created</code>, <code>post.commented</code>. Once set, these triggers fire automatically — no need to click refresh for them.</div>
           </details>
         )}
       </div>
     )}
 
-    {pollResult && (
-      <div style={{padding:12,background:pollResult.ok?"rgba(93,168,122,.08)":"rgba(239,68,68,.08)",border:"1px solid "+(pollResult.ok?"var(--grn)":"var(--red)"),borderRadius:6,marginBottom:14,fontSize:11,color:"var(--t2)"}}>
-        {pollResult.ok ? (
+    {refreshResult && (
+      <div style={{padding:12,background:refreshResult.ok?"rgba(93,168,122,.08)":"rgba(239,68,68,.08)",border:"1px solid "+(refreshResult.ok?"var(--grn)":"var(--red)"),borderRadius:6,marginBottom:14,fontSize:11,color:"var(--t2)"}}>
+        {refreshResult.ok ? (
           <div>
-            ✅ Poll complete — {pollResult.accounts_checked} accounts checked, {pollResult.profile_views_processed} profile views, {pollResult.reactions_processed} reactions, {pollResult.tasks_created} new tasks ({pollResult.skipped_dupes} duplicates skipped).
-            {pollResult.errors?.length > 0 && <div style={{marginTop:6,color:"var(--amb)"}}>⚠ {pollResult.errors.length} errors during poll</div>}
+            ✅ Refreshed — {refreshResult.accounts_checked} accounts checked, {refreshResult.profile_views_processed} profile views and {refreshResult.reactions_processed} reactions seen, {refreshResult.tasks_created} new triggers ({refreshResult.skipped_dupes} dupes skipped).
+            {refreshResult.errors?.length > 0 && <div style={{marginTop:6,color:"var(--amb)"}}>⚠ {refreshResult.errors.length} errors during refresh — check Vercel logs</div>}
           </div>
         ) : (
-          <div>❌ {pollResult.error || "Poll failed"}</div>
+          <div>❌ {refreshResult.error || "Refresh failed"}</div>
         )}
       </div>
     )}

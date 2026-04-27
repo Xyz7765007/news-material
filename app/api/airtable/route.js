@@ -615,44 +615,108 @@ async function runTopXScoring(baseId, rule) {
   if (!records.length) return { error: `No ${table.toLowerCase()} found`, tasks: [] };
 
   // ─── Step 1: Weighted numeric scoring (skipped if no fields) ──
-  // Precompute field stats ONCE (not per-record — was O(n²) before)
+  // Each field is normalized differently based on type:
+  //   - boolean-ish ("True"/"False"/"Yes"/"No"/"Not Sure"): True=1, Not Sure=0.5, False=0
+  //   - numeric: parsed as float, normalized against actual observed min/max
+  //   - text/multiselect: returns null, contributes 0 to the score (warned in editor)
   const totalWeight = scoringFields.reduce((sum, sf) => sum + (sf.weight || 0), 0);
   const fieldStats = {};
-  for (const sf of scoringFields) {
-    const values = records.map(r => parseFloat(r.fields?.[sf.field]) || 0);
-    fieldStats[sf.field] = { min: Math.min(...values, 0), max: Math.max(...values, 1) };
+
+  function extractFieldValue(rawValue) {
+    if (rawValue === null || rawValue === undefined || rawValue === "") return null;
+    if (rawValue === true) return 1;
+    if (rawValue === false) return 0;
+    // Airtable arrays (multiselect, lookup, linked records) — not currently scorable
+    if (Array.isArray(rawValue)) return null;
+    if (typeof rawValue === "object") return null;
+    const asString = String(rawValue).trim().toLowerCase();
+    if (asString === "true" || asString === "yes" || asString === "y") return 1;
+    if (asString === "false" || asString === "no" || asString === "n") return 0;
+    if (asString === "not sure" || asString === "maybe" || asString === "unknown") return 0.5;
+    const num = parseFloat(rawValue);
+    return isNaN(num) ? null : num;
   }
+
+  // Stack-safe min/max — `Math.min(...arr)` throws RangeError above ~80k args.
+  // For our typical sizes (1k-10k records) this is fine, but no reason to risk it.
+  function safeMinMax(arr) {
+    let min = Infinity, max = -Infinity;
+    for (const v of arr) { if (v < min) min = v; if (v > max) max = v; }
+    return { min, max };
+  }
+
+  for (const sf of scoringFields) {
+    const values = records.map(r => extractFieldValue(r.fields?.[sf.field])).filter(v => v !== null);
+    if (values.length === 0) {
+      fieldStats[sf.field] = { min: 0, max: 1, allEmpty: true };
+      continue;
+    }
+    const isBoolean = values.every(v => v === 0 || v === 0.5 || v === 1);
+    if (isBoolean) {
+      fieldStats[sf.field] = { min: 0, max: 1, isBoolean: true };
+    } else {
+      const { min, max } = safeMinMax(values);
+      fieldStats[sf.field] = { min, max };
+    }
+  }
+
   const scored = records.map(r => {
     const fields = r.fields || {};
     let cs = 0;
     if (scoringFields.length > 0) {
       for (const sf of scoringFields) {
         const w = totalWeight > 0 ? (sf.weight || 0) / totalWeight : 1 / scoringFields.length;
-        const raw = parseFloat(fields[sf.field]) || 0;
+        const raw = extractFieldValue(fields[sf.field]);
         const st = fieldStats[sf.field];
+        if (raw === null || st.allEmpty) continue; // explicit no-contribution
         const range = st.max - st.min;
         cs += (range > 0 ? ((raw - st.min) / range) * 100 : 0) * w;
       }
     }
-    return { record: r, numericScore: Math.round(cs), name: fields.Name || fields.Company || "Unknown" };
+    // Capture both potential lead identifiers — used downstream for task creation
+    const leadName = fields.Name || fields["Full Name"] || fields.Company || "Unknown";
+    const leadCompany = fields.Company || fields.Account || "";
+    return { record: r, numericScore: Math.round(cs), name: leadName, company: leadCompany };
   });
 
   // ─── Step 2: AI scoring (only if prompt provided + OpenAI key) ──
   const hasNumeric = scoringFields.length > 0;
   let useAI = scoringPrompt && OPENAI_KEY;
-  if (useAI) {
-    scored.sort((a, b) => b.numericScore - a.numericScore);
 
-    // Score ALL records — use larger batches (15) for pure AI to keep cost reasonable
-    // 1000 leads / 15 per batch = ~67 API calls × ~$0.001 = ~$0.07
-    // When blended (has numeric fields), only AI-score the top 3x since numeric pre-filters
+  // When sending records to AI, only include fields that matter: scoring-target fields,
+  // identifiers (Name, Title, Company), and any field referenced by name in the prompt.
+  // Sending all 30+ Airtable fields wastes tokens and confuses the AI.
+  function pickRelevantFields(fields) {
+    const keep = new Set([
+      "Name", "Full Name", "Title", "Lead Title", "Company", "Account", "Industry",
+      "Email", "LinkedIn URL", "Linkedin URL", "Phone",
+    ]);
+    // Add explicitly-weighted fields
+    for (const sf of scoringFields) keep.add(sf.field);
+    // Add fields whose name appears verbatim in the user's prompt
+    if (scoringPrompt) {
+      for (const fname of Object.keys(fields)) {
+        if (scoringPrompt.includes(fname)) keep.add(fname);
+      }
+    }
+    const out = {};
+    for (const [k, v] of Object.entries(fields)) {
+      if (keep.has(k) && v !== null && v !== undefined) out[k] = v;
+    }
+    return out;
+  }
+
+  if (useAI) {
+    // Sort with deterministic tie-break by name so re-running yields stable output
+    scored.sort((a, b) => (b.numericScore - a.numericScore) || a.name.localeCompare(b.name));
+
     const candidateCount = hasNumeric
       ? Math.min(scored.length, topN * 3)
-      : scored.length; // ← pure AI: score EVERYTHING
+      : scored.length;
     const candidates = scored.slice(0, candidateCount);
     const rest = scored.slice(candidateCount);
 
-    const BATCH = hasNumeric ? 5 : 15; // larger batches for pure AI (cheaper, faster)
+    const BATCH = hasNumeric ? 5 : 15;
 
     try {
       const openai = new OpenAI({ apiKey: OPENAI_KEY });
@@ -661,13 +725,12 @@ async function runTopXScoring(baseId, rule) {
         const batch = candidates.slice(i, i + BATCH);
         if (i % (BATCH * 10) === 0 || i === 0) console.log(`[TOP-X] Progress: ${i}/${candidates.length} scored...`);
         const recordSummaries = batch.map((item, idx) => {
-          const f = item.record.fields || {};
-          // Show ALL fields including zeros — AI needs to see "Engagement: 0" not just omit it
-          const maxFieldLen = BATCH > 10 ? 80 : 150;
+          const f = pickRelevantFields(item.record.fields || {});
+          // Per-field budget: 250 chars (was 80) — enough to preserve URLs and short bios
           const dataStr = Object.entries(f)
-            .filter(([_, v]) => v !== null && v !== undefined)
             .map(([k, v]) => {
-              const val = v === "" ? "(empty)" : String(v).slice(0, maxFieldLen);
+              const valStr = Array.isArray(v) ? v.join(", ") : String(v);
+              const val = valStr === "" ? "(empty)" : valStr.slice(0, 250);
               return `${k}: ${val}`;
             })
             .join(" | ");
@@ -696,23 +759,38 @@ Return ONLY JSON: [{"idx":0,"score":85,"reason":"max 15 words explaining which d
         const text = completion.choices[0]?.message?.content || "[]";
         const cleaned = text.replace(/```json\n?|```/g, "").trim();
         try {
-          const aiScores = JSON.parse(cleaned);
+          let aiScores = JSON.parse(cleaned);
+          if (!Array.isArray(aiScores)) {
+            aiScores = aiScores.results || aiScores.scores || aiScores.data || [];
+          }
+          if (!Array.isArray(aiScores)) {
+            console.warn("[TOP-X] AI did not return an array, got:", typeof aiScores, JSON.stringify(aiScores).slice(0, 200));
+            aiScores = [];
+          }
           for (const as of aiScores) {
-            if (as.idx !== undefined && as.score !== undefined && batch[as.idx]) {
-              batch[as.idx].aiScore = Math.max(0, Math.min(100, Math.round(as.score)));
-              batch[as.idx].aiReason = (as.reason || as.tier || "").slice(0, 100);
+            if (as && as.idx !== undefined && as.score !== undefined && batch[as.idx]) {
+              const s = parseInt(as.score);
+              if (!isNaN(s)) {
+                batch[as.idx].aiScore = Math.max(0, Math.min(100, s));
+                batch[as.idx].aiReason = (as.reason || as.tier || "").slice(0, 100);
+              }
             }
           }
         } catch (parseErr) {
-          // Attempt to recover truncated JSON — extract what we can
           console.warn("AI scoring parse error, attempting recovery:", parseErr.message);
           try {
-            // Find all complete objects in truncated JSON
-            const objMatches = cleaned.matchAll(/\{"idx"\s*:\s*(\d+)\s*,\s*"score"\s*:\s*(\d+)/g);
-            for (const m of objMatches) {
-              const idx = parseInt(m[1]);
-              const score = parseInt(m[2]);
-              if (batch[idx]) {
+            const orderA = cleaned.matchAll(/\{[^{}]*?"idx"\s*:\s*(\d+)[^{}]*?"score"\s*:\s*(\d+)/g);
+            for (const m of orderA) {
+              const idx = parseInt(m[1]); const score = parseInt(m[2]);
+              if (batch[idx] && !isNaN(score)) {
+                batch[idx].aiScore = Math.max(0, Math.min(100, score));
+                batch[idx].aiReason = "AI scored (partial recovery)";
+              }
+            }
+            const orderB = cleaned.matchAll(/\{[^{}]*?"score"\s*:\s*(\d+)[^{}]*?"idx"\s*:\s*(\d+)/g);
+            for (const m of orderB) {
+              const score = parseInt(m[1]); const idx = parseInt(m[2]);
+              if (batch[idx] && !isNaN(score) && batch[idx].aiScore === undefined) {
                 batch[idx].aiScore = Math.max(0, Math.min(100, score));
                 batch[idx].aiReason = "AI scored (partial recovery)";
               }
@@ -729,10 +807,9 @@ Return ONLY JSON: [{"idx":0,"score":85,"reason":"max 15 words explaining which d
         console.log(`[TOP-X] Retrying ${unscored.length} unscored records individually`);
         for (const item of unscored) {
           try {
-            const f = item.record.fields || {};
+            const f = pickRelevantFields(item.record.fields || {});
             const dataStr = Object.entries(f)
-              .filter(([_, v]) => v !== null && v !== undefined)
-              .map(([k, v]) => `${k}: ${v === "" ? "(empty)" : String(v).slice(0, 200)}`)
+              .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(", ") : (v === "" ? "(empty)" : String(v).slice(0, 300))}`)
               .join(" | ");
             const retry = await openai.chat.completions.create({
               model: "gpt-5.4-mini", temperature: 0.2, max_completion_tokens: 200,
@@ -751,7 +828,6 @@ Return ONLY JSON: [{"idx":0,"score":85,"reason":"max 15 words explaining which d
         }
       }
 
-      // Final score: if numeric fields exist, blend 40% numeric + 60% AI. Otherwise pure AI.
       const aiScoredCount = candidates.filter(item => item.aiScore !== undefined).length;
       console.log(`[TOP-X] AI scored ${aiScoredCount}/${candidates.length} records successfully`);
       for (const item of candidates) {
@@ -760,12 +836,13 @@ Return ONLY JSON: [{"idx":0,"score":85,"reason":"max 15 words explaining which d
             ? Math.round(item.numericScore * 0.4 + item.aiScore * 0.6)
             : item.aiScore;
         } else {
+          // AI failed for this record. In pure-AI mode, no numeric score exists, so it
+          // stays at 0 and gets pushed to bottom — better than artificially boosting it.
           item.compositeScore = item.numericScore;
+          item.aiFailed = true;
         }
       }
-      // Non-candidates keep numeric score (won't make top N anyway)
       rest.forEach(item => { item.compositeScore = item.numericScore; });
-      // Recombine and re-sort
       scored.length = 0;
       scored.push(...candidates, ...rest);
     } catch (e) {
@@ -777,27 +854,59 @@ Return ONLY JSON: [{"idx":0,"score":85,"reason":"max 15 words explaining which d
     scored.forEach(item => { item.compositeScore = item.numericScore; });
   }
 
-  scored.sort((a, b) => b.compositeScore - a.compositeScore);
+  // Final sort with deterministic tie-break
+  scored.sort((a, b) => (b.compositeScore - a.compositeScore) || a.name.localeCompare(b.name));
+
   const fieldList = scoringFields.map(sf => sf.field).join(", ");
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const nowISO = new Date().toISOString();
+
   const tasks = scored.slice(0, topN).map(item => {
     const score = parseInt(item.compositeScore) || 0;
     const aiScore = parseInt(item.aiScore) || 0;
     const numScore = parseInt(item.numericScore) || 0;
+    const f = item.record.fields || {};
+
+    // Build a transparent Signal showing how this score was derived
+    const signalLines = [];
+    if (item.aiReason) {
+      signalLines.push(`💡 ${item.aiReason}`);
+      signalLines.push(`📊 Score: ${score}/100 (${hasNumeric ? `numeric ${numScore} blended with AI ${aiScore}` : `AI ${aiScore}`})`);
+    } else if (item.aiFailed) {
+      signalLines.push(`⚠️ AI scoring failed — ranked by ${hasNumeric ? "numeric score" : "position"}: ${score}/100`);
+    } else if (hasNumeric) {
+      signalLines.push(`📊 Score: ${score}/100 (weighted by ${fieldList})`);
+    } else {
+      signalLines.push(`📊 Score: ${score}/100`);
+    }
+    if (scoringFields.length > 0) {
+      const breakdown = scoringFields.map(sf => {
+        const raw = f[sf.field];
+        const display = raw === undefined || raw === null || raw === "" ? "(empty)" : String(raw).slice(0, 60);
+        return `   • ${sf.field} (${sf.weight}%): ${display}`;
+      });
+      signalLines.push(``, `📋 Field values:`, ...breakdown);
+    }
+
+    // Task fields. The Tasks table in the user's master base uses "Name" as the primary
+    // field (see chat from 2026-04-23 19:00 — confirmed schema). Putting lead name here
+    // and company in "Company" — DON'T accidentally write the lead's name to Company.
     return {
-      Company: item.name,
+      Name: item.name,                              // primary — the lead OR the account name
+      Company: scanTarget === "accounts" ? item.name : item.company,
       "Task Rule": rule.name || "Top X",
       Score: Math.max(0, Math.min(100, score)),
-      "Scan Target": scanTarget,
-      Signal: item.aiReason
-        ? `AI: ${item.aiReason} (${hasNumeric ? "numeric: " + numScore + ", " : ""}AI: ${aiScore})`
-        : hasNumeric
-          ? `Ranked by weighted score${fieldList ? " (" + fieldList + ")" : ""}: ${numScore}/100`
-          : `AI score pending — record included by position`,
+      "Scan Target": item.name,                     // for backwards compat with existing Tasks records
+      "Lead Title": f.Title || f["Lead Title"] || "",
+      Email: f.Email || "",
+      "LinkedIn URL": f["LinkedIn URL"] || f["Linkedin URL"] || "",
+      Phone: f.Phone || "",
+      Signal: signalLines.join("\n"),
       Source: useAI ? "Top X + AI Scoring" : "Top X Scoring",
-      URL: "",
+      URL: f["LinkedIn URL"] || f["Linkedin URL"] || "",
       "Task Type": "top_x",
-      Date: new Date().toISOString().slice(0, 10),
-      Created: new Date().toISOString(),
+      Date: todayStr,
+      Created: nowISO,
     };
   });
   return { tasks, totalRecords: records.length, topN, aiScored: !!useAI };
