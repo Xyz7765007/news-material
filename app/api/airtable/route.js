@@ -1020,6 +1020,7 @@ CRITICAL RULES:
 6. Be CONCRETE. Don't write "title contains finance-related keywords" — list the actual keywords: ["CFO", "Finance", "Controller", "Treasurer"].
 7. For numeric ranges, use the exact bounds the user gave. If they say "between 200 and 2000", use min:200 max:2000.
 8. case_sensitive defaults to false.
+9. CROSS-REFERENCE: When the user message includes an "Account fields" section, you MAY reference account-level fields by prefixing with "Account." (e.g. field "Account.Decentralized" or "Account.Industry"). Only do this when the user's prompt clearly references account-level criteria. The lead-account match is automatic via domain/website/LinkedIn URL.
 
 Return only the JSON. No explanations outside the "notes" field.`;
 
@@ -1041,16 +1042,38 @@ async function compileTopXRules(baseId, { prompt, scanTarget }) {
     return { error: `Could not read schema for ${tableName} table. Check Airtable token has schema:read scope.` };
   }
 
+  // Cross-reference: if scanning Leads, also pull Accounts schema so the AI can write
+  // rules that reference Account.X fields. The user's prompt may say things like
+  // "score high if account is decentralized" — we need the Accounts schema available
+  // for the AI to know what fields exist.
+  let accountFieldDefs = [];
+  let accountSampleRecords = [];
+  if (scanTarget !== "accounts") {
+    try {
+      [accountFieldDefs, accountSampleRecords] = await Promise.all([
+        getTableFields(baseId, "Accounts"),
+        listRecords(baseId, "Accounts", { maxRecords: 10 }),
+      ]);
+    } catch (e) {
+      console.warn("[compile] Could not load Accounts schema for cross-reference:", e.message);
+    }
+  }
+
   // Format the schema for the AI: name + type + sample values seen
-  const schemaLines = fieldDefs.map(fd => {
-    const samples = sampleRecords
+  const formatSchemaLines = (defs, samples, prefix = "") => defs.map(fd => {
+    const sampleVals = samples
       .map(r => r.fields?.[fd.name])
       .filter(v => v !== undefined && v !== null && v !== "")
       .slice(0, 3)
       .map(v => Array.isArray(v) ? `[${v.join(", ")}]` : String(v).slice(0, 60));
-    const samplesStr = samples.length ? ` — examples: ${samples.join(" | ")}` : "";
-    return `- ${fd.name} (${fd.type})${samplesStr}`;
+    const samplesStr = sampleVals.length ? ` — examples: ${sampleVals.join(" | ")}` : "";
+    return `- ${prefix}${fd.name} (${fd.type})${samplesStr}`;
   }).join("\n");
+
+  const schemaLines = formatSchemaLines(fieldDefs, sampleRecords);
+  const accountSchemaLines = accountFieldDefs.length > 0
+    ? formatSchemaLines(accountFieldDefs, accountSampleRecords, "Account.")
+    : "";
 
   try {
     const openai = new OpenAI({ apiKey: OPENAI_KEY });
@@ -1058,13 +1081,23 @@ async function compileTopXRules(baseId, { prompt, scanTarget }) {
     // for higher-quality field extraction and less hallucination of non-existent
     // field names. Cost is ~$0.03 per compile call, vs ~$0.005 with mini.
     // Mini works too if cost is critical, but mistakes cascade across all records.
+    const userMessageParts = [
+      `Available fields in ${tableName} table:\n${schemaLines}`,
+    ];
+    if (accountSchemaLines) {
+      userMessageParts.push(
+        `\n\nCROSS-REFERENCE: This is a Lead scan. You can ALSO reference Account-level fields by prefixing with "Account.". The lead's matching account is found via domain/website/LinkedIn URL. Available Account fields:\n${accountSchemaLines}\n\nWhen the user's prompt references account-level criteria (e.g. "if the company is decentralized", "if the account has high revenue"), use rules with field names like "Account.Decentralized" or "Account.Revenue".`
+      );
+    }
+    userMessageParts.push(`\n\nUser's scoring prompt:\n"""\n${prompt}\n"""\n\nCompile this to executable rules.`);
+
     const completion = await openai.chat.completions.create({
       model: "gpt-5.4",
       temperature: 0.1, // very low — we want consistent rules
       max_completion_tokens: 4000,
       messages: [
         { role: "system", content: COMPILE_SYSTEM_PROMPT },
-        { role: "user", content: `Available fields in ${tableName} table:\n${schemaLines}\n\nUser's scoring prompt:\n"""\n${prompt}\n"""\n\nCompile this to executable rules.` },
+        { role: "user", content: userMessageParts.join("") },
       ],
     });
 
@@ -1077,20 +1110,33 @@ async function compileTopXRules(baseId, { prompt, scanTarget }) {
       return { error: `AI returned invalid JSON: ${e.message}`, raw: cleaned.slice(0, 500) };
     }
 
-    // Validate the shape — if the AI hallucinated a non-existent field, flag it
+    // Validate the shape — if the AI hallucinated a non-existent field, flag it.
+    // Account.X fields validate against the Accounts schema; bare names against the lead/account scan target.
     const validFieldNames = new Set(fieldDefs.map(f => f.name));
+    const validAccountFieldNames = new Set(accountFieldDefs.map(f => f.name));
     const warnings = [];
     if (!Array.isArray(compiled.rules)) {
       return { error: "Compiled output missing 'rules' array", raw: cleaned.slice(0, 500) };
     }
-    for (const rule of compiled.rules) {
-      if (rule.field && !validFieldNames.has(rule.field)) {
-        warnings.push(`Rule "${rule.description || rule.id}" references unknown field "${rule.field}"`);
+    const checkFieldName = (fieldName, ruleLabel) => {
+      if (!fieldName) return;
+      if (fieldName.startsWith("Account.")) {
+        const realName = fieldName.slice("Account.".length);
+        if (validAccountFieldNames.size === 0) {
+          warnings.push(`${ruleLabel} references "${fieldName}" but Accounts schema isn't available — rule will not match anything`);
+        } else if (!validAccountFieldNames.has(realName)) {
+          warnings.push(`${ruleLabel} references unknown account field "${realName}"`);
+        }
+      } else if (!validFieldNames.has(fieldName)) {
+        warnings.push(`${ruleLabel} references unknown field "${fieldName}"`);
       }
+    };
+    for (const rule of compiled.rules) {
+      checkFieldName(rule.field, `Rule "${rule.description || rule.id}"`);
     }
     if (compiled.fuzzy_check?.fields_to_read) {
       for (const f of compiled.fuzzy_check.fields_to_read) {
-        if (!validFieldNames.has(f)) warnings.push(`Fuzzy check references unknown field "${f}"`);
+        checkFieldName(f, `Fuzzy check`);
       }
     }
 
@@ -1229,21 +1275,52 @@ function executeCompiledRule(rule, fieldValue) {
   }
 }
 
-function applyCompiledRules(records, compiled) {
+function applyCompiledRules(records, compiled, accountIndex = null) {
   const rules = compiled?.rules || [];
   const maxScore = compiled?.max_possible_score || 100;
+  // Track cross-reference matching for the response
+  let leadsMatched = 0;
+  let leadsUnmatched = 0;
+
   return records.map(r => {
     const fields = r.fields || {};
     let score = 0;
     const matched = [];
+
+    // Cross-reference: find matching account if any rule references Account.* fields
+    let accountFields = null;
+    let accountMatchInfo = null;
+    if (accountIndex && accountIndex.hasAccountRules) {
+      const acct = lookupAccountForLead(fields, accountIndex);
+      if (acct) {
+        accountFields = acct.account.fields || {};
+        accountMatchInfo = { matched: true, accountName: accountFields.Name, matchKey: acct.matchedBy };
+        leadsMatched++;
+      } else {
+        accountMatchInfo = { matched: false };
+        leadsUnmatched++;
+      }
+    }
+
     for (const rule of rules) {
-      const fv = fields[rule.field];
+      // Resolve field reference: "Account.X" pulls from accountFields, otherwise from lead
+      const fieldName = rule.field || "";
+      let fv;
+      if (fieldName.startsWith("Account.")) {
+        const realFieldName = fieldName.slice("Account.".length);
+        // If this lead has no matching account, the field is "no value" — contributes 0,
+        // matches is_empty, fails everything else. Better than penalizing unmapped leads.
+        fv = accountFields ? accountFields[realFieldName] : undefined;
+      } else {
+        fv = fields[fieldName];
+      }
       const result = executeCompiledRule(rule, fv);
       if (result.matched) {
         score += result.score;
-        matched.push({ rule_id: rule.id, description: rule.description, contribution: result.score });
+        matched.push({ rule_id: rule.id, description: rule.description, contribution: result.score, source: fieldName.startsWith("Account.") ? "account" : "lead" });
       }
     }
+
     // Clamp to 0-100 (allow rules to over-allocate, then we clip)
     const clamped = Math.max(0, Math.min(100, Math.round(score)));
     const leadName = fields.Name || fields["Full Name"] || fields.Company || "Unknown";
@@ -1255,8 +1332,139 @@ function applyCompiledRules(records, compiled) {
       matchedRules: matched,
       name: leadName,
       company: leadCompany,
+      accountMatch: accountMatchInfo,
     };
   });
+}
+
+// Cross-reference helper: extract domain/website/linkedin keys from a record's fields.
+// Multiple keys per record because we try domain first, fall back to LinkedIn URL.
+// Normalization is critical here — get any of these wrong and matching silently fails:
+//   - domains: lowercase, no http(s)://, no www., no trailing slash, no path
+//   - linkedin URLs: same, but keep the /company/<slug> path since that's the identity
+function extractCompanyKeys(fields) {
+  const keys = { domain: null, linkedinUrl: null };
+
+  // Try Domain field first, then derive from Website, then from Email
+  const domainCandidate = fields.Domain || fields["Domain"] || "";
+  const websiteCandidate = fields.Website || fields["Website"] || fields["Company Website"] || "";
+  const emailCandidate = fields.Email || "";
+
+  if (domainCandidate) {
+    keys.domain = normalizeDomain(domainCandidate);
+  } else if (websiteCandidate) {
+    keys.domain = normalizeDomain(websiteCandidate);
+  } else if (emailCandidate) {
+    // Extract domain from email: john@acme.com → acme.com
+    // Skip personal email providers (gmail, yahoo, outlook, etc.) — those don't map to a B2B account
+    const atIdx = emailCandidate.lastIndexOf("@");
+    if (atIdx > 0) {
+      const emailDomain = emailCandidate.slice(atIdx + 1).toLowerCase().trim();
+      if (!isPersonalEmailDomain(emailDomain)) {
+        keys.domain = emailDomain;
+      }
+    }
+  }
+
+  // LinkedIn URL — could be in either "Company LinkedIn", "LinkedIn URL", or "Linkedin URL" fields.
+  // For Accounts table, "LinkedIn URL" is the company's. For Leads, it's usually the person's,
+  // but some imports populate "Company LinkedIn" separately.
+  const liCandidate = fields["Company LinkedIn"] || fields["Company LinkedIn URL"] || "";
+  if (liCandidate) {
+    keys.linkedinUrl = normalizeCompanyLinkedIn(liCandidate);
+  }
+
+  return keys;
+}
+
+// For Accounts: their "LinkedIn URL" field IS the company LinkedIn (different from Leads).
+// Separate function so we don't accidentally pull a lead's personal LinkedIn for Account matching.
+function extractAccountKeys(fields) {
+  const keys = { domain: null, linkedinUrl: null };
+  if (fields.Domain) keys.domain = normalizeDomain(fields.Domain);
+  else if (fields.Website || fields["Company Website"]) {
+    keys.domain = normalizeDomain(fields.Website || fields["Company Website"]);
+  }
+  // Account.LinkedIn URL is the company's
+  const li = fields["LinkedIn URL"] || fields["Linkedin URL"] || fields["Company LinkedIn"] || "";
+  if (li) keys.linkedinUrl = normalizeCompanyLinkedIn(li);
+  return keys;
+}
+
+function normalizeDomain(input) {
+  if (!input) return null;
+  let s = String(input).toLowerCase().trim();
+  // Strip protocol
+  s = s.replace(/^https?:\/\//, "");
+  // Strip www.
+  s = s.replace(/^www\./, "");
+  // Strip path / query / hash — only keep the host
+  s = s.split("/")[0].split("?")[0].split("#")[0];
+  // Strip trailing dot
+  s = s.replace(/\.$/, "");
+  // Strip port if any
+  s = s.split(":")[0];
+  return s || null;
+}
+
+function normalizeCompanyLinkedIn(input) {
+  if (!input) return null;
+  let s = String(input).toLowerCase().trim();
+  s = s.replace(/^https?:\/\//, "").replace(/^www\./, "");
+  // Keep the path because /company/<slug> IS the identity
+  s = s.replace(/\/$/, "").replace(/\?.*/, "").replace(/#.*/, "");
+  // Extract just the /company/<slug> portion to avoid LinkedIn vanity URL drift
+  const m = s.match(/linkedin\.com\/(company|school)\/([^\/]+)/);
+  if (m) return `linkedin.com/${m[1]}/${m[2]}`;
+  return s;
+}
+
+// Domains that are personal email providers — never match these to B2B accounts
+const PERSONAL_EMAIL_DOMAINS = new Set([
+  "gmail.com", "yahoo.com", "yahoo.co.uk", "outlook.com", "hotmail.com", "icloud.com",
+  "live.com", "aol.com", "protonmail.com", "proton.me", "msn.com", "ymail.com",
+  "me.com", "mac.com", "googlemail.com", "rediffmail.com", "zoho.com",
+]);
+function isPersonalEmailDomain(d) { return PERSONAL_EMAIL_DOMAINS.has(d); }
+
+// Build account index: maps that let us look up an account by any of its keys in O(1)
+function buildAccountIndex(accounts, hasAccountRules) {
+  const byDomain = new Map();
+  const byLinkedIn = new Map();
+  for (const acct of accounts) {
+    const keys = extractAccountKeys(acct.fields || {});
+    if (keys.domain && !byDomain.has(keys.domain)) byDomain.set(keys.domain, acct);
+    if (keys.linkedinUrl && !byLinkedIn.has(keys.linkedinUrl)) byLinkedIn.set(keys.linkedinUrl, acct);
+  }
+  return { byDomain, byLinkedIn, totalAccounts: accounts.length, hasAccountRules };
+}
+
+// Try domain match first (most reliable), fall back to LinkedIn URL match
+function lookupAccountForLead(leadFields, accountIndex) {
+  const leadKeys = extractCompanyKeys(leadFields);
+  if (leadKeys.domain && accountIndex.byDomain.has(leadKeys.domain)) {
+    return { account: accountIndex.byDomain.get(leadKeys.domain), matchedBy: "domain" };
+  }
+  if (leadKeys.linkedinUrl && accountIndex.byLinkedIn.has(leadKeys.linkedinUrl)) {
+    return { account: accountIndex.byLinkedIn.get(leadKeys.linkedinUrl), matchedBy: "linkedin" };
+  }
+  return null;
+}
+
+// Detect whether any rule in the compiled set references Account.* fields.
+// Used to skip the account fetch entirely when no rules need it.
+function compiledRulesReferenceAccounts(compiled) {
+  if (!compiled?.rules) return false;
+  for (const rule of compiled.rules) {
+    if (rule.field && rule.field.startsWith("Account.")) return true;
+  }
+  // Also check fuzzy_check.fields_to_read
+  if (compiled.fuzzy_check?.fields_to_read) {
+    for (const f of compiled.fuzzy_check.fields_to_read) {
+      if (typeof f === "string" && f.startsWith("Account.")) return true;
+    }
+  }
+  return false;
 }
 
 // Smart-compile mode runner: scores deterministically + optionally runs AI fuzzy adjustment
@@ -1276,14 +1484,70 @@ async function runTopXSmartCompile(baseId, rule, compiled) {
     };
   }
 
-  const records = await listRecords(baseId, table);
+  // Cross-reference: if any rule references Account.* fields, fetch accounts and build index.
+  // Only meaningful when scanning Leads (Account-scan aggregates are a separate future feature).
+  let accountIndex = null;
+  let crossRefStats = null;
+  let accountsLoadError = null;
+  const needsAccounts = scanTarget === "leads" && compiledRulesReferenceAccounts(compiled);
+  let recordsListMs = 0;
+  let accountsListMs = 0;
+
+  const tFetch0 = Date.now();
+  const records = scanTarget === "accounts"
+    ? await listRecords(baseId, "Accounts")
+    : await listRecords(baseId, "Leads");
+  recordsListMs = Date.now() - tFetch0;
   if (!records.length) return { error: `No ${table.toLowerCase()} found`, tasks: [] };
+
+  if (needsAccounts) {
+    const tAcct0 = Date.now();
+    try {
+      const accounts = await listRecords(baseId, "Accounts");
+      accountsListMs = Date.now() - tAcct0;
+      accountIndex = buildAccountIndex(accounts, true);
+      console.log(`[TOP-X-SMART] Built account index: ${accountIndex.totalAccounts} accounts, ${accountIndex.byDomain.size} domain keys, ${accountIndex.byLinkedIn.size} LinkedIn keys`);
+    } catch (e) {
+      // Accounts table missing or inaccessible. Log and continue without cross-reference.
+      // Account.X rules will contribute 0 across the board, but the run won't fail.
+      console.warn(`[TOP-X-SMART] Could not load Accounts table (${e.message}). Account.X rules will not match.`);
+      accountIndex = null;
+      accountsLoadError = e.message;
+    }
+  }
 
   // Step 1: Deterministic scoring across ALL records (zero AI calls)
   const t0 = Date.now();
-  const scored = applyCompiledRules(records, compiled);
+  const scored = applyCompiledRules(records, compiled, accountIndex);
   const deterministicMs = Date.now() - t0;
   console.log(`[TOP-X-SMART] Scored ${scored.length} records deterministically in ${deterministicMs}ms`);
+
+  // If cross-reference was active, compute match coverage stats
+  if (accountIndex) {
+    const matched = scored.filter(s => s.accountMatch?.matched).length;
+    const unmatched = scored.length - matched;
+    crossRefStats = {
+      enabled: true,
+      total_leads: scored.length,
+      matched_to_account: matched,
+      unmatched: unmatched,
+      match_rate_pct: scored.length > 0 ? Math.round((matched / scored.length) * 100) : 0,
+      total_accounts_indexed: accountIndex.totalAccounts,
+    };
+    console.log(`[TOP-X-SMART] Cross-reference match: ${matched}/${scored.length} leads (${crossRefStats.match_rate_pct}%)`);
+  } else if (needsAccounts) {
+    // Rules wanted account context but we couldn't load Accounts. Surface clearly.
+    crossRefStats = {
+      enabled: true,
+      failed: true,
+      error: accountsLoadError || "Accounts table not loaded — Account.* rules contributed 0 to all leads",
+      total_leads: scored.length,
+      matched_to_account: 0,
+      unmatched: scored.length,
+      match_rate_pct: 0,
+      total_accounts_indexed: 0,
+    };
+  }
 
   // Step 2: Sort by deterministic score (with stable tie-break by name)
   scored.sort((a, b) => (b.deterministicScore - a.deterministicScore) || a.name.localeCompare(b.name));
@@ -1372,15 +1636,37 @@ async function runTopXSmartCompile(baseId, rule, compiled) {
   const nowISO = new Date().toISOString();
   const tasks = scored.slice(0, topN).map(item => {
     const f = item.record.fields || {};
-    const ruleBreakdown = item.matchedRules.length > 0
-      ? item.matchedRules.map(m => `   ✓ ${m.description}: +${m.contribution}`).join("\n")
-      : "   (no rules matched)";
+    // Split matched rules by source so the user can see which contributions came from
+    // the lead's own data vs the cross-referenced account
+    const leadMatches = item.matchedRules.filter(m => m.source !== "account");
+    const accountMatches = item.matchedRules.filter(m => m.source === "account");
+
+    const buildLines = (label, list) => list.length === 0
+      ? null
+      : [`${label}`, ...list.map(m => `   ✓ ${m.description}: ${m.contribution >= 0 ? "+" : ""}${m.contribution}`)];
+
     const signalLines = [
       `📊 Score: ${item.finalScore}/100 (deterministic: ${item.deterministicScore}${item.fuzzyAdjustment ? `, fuzzy adj: ${item.fuzzyAdjustment > 0 ? "+" : ""}${item.fuzzyAdjustment}` : ""})`,
       ``,
-      `📋 Matched rules:`,
-      ruleBreakdown,
     ];
+
+    // Lead-side rules
+    const leadLines = buildLines("📋 Lead-side rules matched:", leadMatches);
+    if (leadLines) signalLines.push(...leadLines);
+    else if (item.matchedRules.length === 0) signalLines.push("📋 No rules matched.");
+
+    // Account-side rules — only shown if cross-reference was used
+    if (accountMatches.length > 0) {
+      const acctName = item.accountMatch?.accountName || "(unknown)";
+      const matchKey = item.accountMatch?.matchKey || "?";
+      signalLines.push(``, `🏢 Account: ${acctName} (matched by ${matchKey})`);
+      const acctLines = buildLines(`Account-side rules matched:`, accountMatches);
+      if (acctLines) signalLines.push(...acctLines.slice(1)); // skip "matched:" duplicate
+    } else if (item.accountMatch && !item.accountMatch.matched && accountIndex) {
+      // Cross-reference enabled but this lead didn't match an account
+      signalLines.push(``, `⚠️ No account matched (rules referencing Account.* contributed 0)`);
+    }
+
     if (item.fuzzyReason) signalLines.push(``, `🤖 Fuzzy check: ${item.fuzzyReason}`);
 
     return {
@@ -1409,11 +1695,14 @@ async function runTopXSmartCompile(baseId, rule, compiled) {
     aiScored: fuzzyApiCalls > 0,
     smartCompile: {
       deterministic_ms: deterministicMs,
+      records_list_ms: recordsListMs,
+      accounts_list_ms: accountsListMs,
       fuzzy_api_calls: fuzzyApiCalls,
       fuzzy_adjusted_count: fuzzyAdjusted,
       fuzzy_skipped: fuzzySkipped, // borderline candidates we didn't AI-check (cost cap)
       total_rules_applied: compiled?.rules?.length || 0,
     },
+    crossRef: crossRefStats,
   };
 }
 

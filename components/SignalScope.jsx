@@ -138,6 +138,8 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const [editRule, setEditRule] = useState(null); // unified rule editor — signal or top_x
   const [filter, setFilter] = useState({src:"all",target:"all",q:"",from:"",to:"",datePreset:"all"});
   const [csvModal, setCsvModal] = useState(null);
+  const [csvUploadResult, setCsvUploadResult] = useState(null); // { msg, isError } — shows for ~8s after upload
+  const [csvPrepping, setCsvPrepping] = useState(false); // shows toast "Preparing CSV upload..." while we fetch fresh records
   const [setupStatus, setSetupStatus] = useState(null);
   const [availableFields, setAvailableFields] = useState({ Accounts: [], Leads: [] });
   const [showAddCampaign, setShowAddCampaign] = useState(false);
@@ -288,8 +290,16 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         at("get_fields","Accounts",{},bid).catch(() => ({ fields: [] })),
         at("get_fields","Leads",{},bid).catch(() => ({ fields: [] })),
       ]);
-      setAvailableFields({ Accounts: af.fields || [], Leads: lf.fields || [] });
-    } catch (e) { console.error(e); }
+      const fresh = { Accounts: af.fields || [], Leads: lf.fields || [] };
+      setAvailableFields(fresh);
+      // Also return the fresh data so callers can use it immediately —
+      // setAvailableFields is async, so the closure that called us still
+      // sees the OLD state until React re-renders. This avoids that race.
+      return fresh;
+    } catch (e) {
+      console.error(e);
+      return { Accounts: [], Leads: [] };
+    }
   };
 
   const del = async (table, ids, setter) => { try{await at("delete",table,{recordIds:ids},bid);setter(p=>p.filter(r=>!ids.includes(r.id)))} catch(e){console.error(e)} };
@@ -778,12 +788,14 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     Leads: { Name:["name","full name","contact name","contact","person","lead name","full_name","contact_name","lead_name"],Email:["email","email address","work email","business email","e-mail","mail","email_address","work_email"],Title:["title","job title","position","role","designation","current title","job_title","jobtitle"],"First Name":["first name","first_name","firstname","given name","fname"],"Last Name":["last name","last_name","lastname","surname","family name","lname"],Company:["company","organization","employer","company name","org","account name","company_name","account_name"],"LinkedIn URL":["linkedin","linkedin url","linkedin profile","profile url","li url","linkedin_url","linkedinurl","linkedin profile url"],"Company LinkedIn URL":["company linkedin url","company_linkedin_url","company linkedin"],Phone:["phone","phone number","direct phone","mobile","cell","telephone","work phone","phone_number","direct_phone","mobile phone"],Website:["website","domain","company website","company_website","company domain","site","web"],City:["city","lead city","company city"],State:["state","lead state","company state","province","region"],Country:["country","lead country","company country"],"Annual Revenue":["annual revenue","annual_revenue","revenue"],"Total Funding":["total funding","total_funding","funding"],"# Employees":["# employees","employees","employee count","headcount","company size","number of employees"],"Custom Code":["custom code","customcode","custom_code","tracking code","tracking_code","trackingcode","utm code","utm_code","utm campaign","utm_campaign","session campaign id","session_campaign_id","campaign id","campaign_id","code","short code","unique code"] },
   };
 
-  const autoDetect = (headers, table) => {
+  const autoDetect = (headers, table, freshRecords = null, freshMeta = null) => {
     const aliases = FIELD_ALIASES[table] || {};
-    // Get fields from Airtable metadata
-    const metaFields = (availableFields[table] || []).map(f => f.name || f);
-    // Also get fields from loaded records as fallback (always up-to-date)
-    const recordSource = table === "Accounts" ? accounts : table === "Leads" ? leads : [];
+    // Get fields from Airtable metadata. Prefer freshMeta if given to avoid React state lag.
+    const metaSource = freshMeta || availableFields;
+    const metaFields = (metaSource[table] || []).map(f => f.name || f);
+    // Also get fields from loaded records as fallback. Prefer freshRecords if given
+    // (handleCSVFile passes the just-fetched records to avoid stale React state).
+    const recordSource = freshRecords || (table === "Accounts" ? accounts : table === "Leads" ? leads : []);
     const recordFields = [...new Set(recordSource.flatMap(r => Object.keys(r.fields || {})))];
     // Combine both — metadata + record fields
     const existingFields = [...new Set([...metaFields, ...recordFields])];
@@ -808,45 +820,89 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     return m;
   };
 
-  const handleCSVFile = (file, table, setter) => {
-    fetchAvailableFields();
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const text = e.target.result;
-      // Proper CSV parse — handles multi-line quoted fields, escaped quotes
-      const parseFullCSV = (csv) => {
-        const rows = []; let row = []; let cell = ""; let inQ = false;
-        for (let i = 0; i < csv.length; i++) {
-          const c = csv[i];
-          if (inQ) {
-            if (c === '"') {
-              if (csv[i + 1] === '"') { cell += '"'; i++; } // escaped quote
-              else inQ = false; // end quote
-            } else { cell += c; }
-          } else {
-            if (c === '"') { inQ = true; }
-            else if (c === ',') { row.push(cell.trim()); cell = ""; }
-            else if (c === '\n' || c === '\r') {
-              if (c === '\r' && csv[i + 1] === '\n') i++; // skip \r\n
-              row.push(cell.trim()); cell = "";
-              if (row.some(c => c)) rows.push(row);
-              row = [];
-            } else { cell += c; }
-          }
-        }
-        // Last cell/row
-        row.push(cell.trim());
-        if (row.some(c => c)) rows.push(row);
-        return rows;
-      };
+  // Normalize a field value for comparison. Handles strings, numbers, arrays, null.
+  // Critical for matching CSV uploads against existing Airtable records, where the
+  // existing field might be a number ("12345"), array (lookup field returns ["foo"]),
+  // or have weird whitespace. Without this, .toLowerCase() crashes silently.
+  const normalizeForMatch = (v) => {
+    if (v === null || v === undefined) return "";
+    let s;
+    if (Array.isArray(v)) {
+      // Lookup/multiselect — join, but if it's a single-value lookup, just take that
+      s = v.length === 1 ? String(v[0]) : v.join(",");
+    } else if (typeof v === "object") {
+      // Linked records etc — try id then name, else fail
+      s = v.id || v.name || "";
+    } else {
+      s = String(v);
+    }
+    // Lowercase, trim, collapse internal whitespace (handles non-breaking spaces too)
+    return s.toLowerCase().replace(/\s+/g, " ").trim();
+  };
 
-      const allRows = parseFullCSV(text);
-      if (allRows.length < 2) return;
-      const headers = allRows[0];
-      const dataRows = allRows.slice(1).filter(r => r.length >= 2 && r.some(c => c)); // need at least 2 non-empty cells
-      setCsvModal({ table, setter, headers, rows: dataRows, mappings: autoDetect(headers, table), mode: "create", matchField: "Name", campaignTag: camp?.name || "", newCampaignTag: "" });
-    };
-    reader.readAsText(file);
+  const handleCSVFile = async (file, table, setter) => {
+    setCsvPrepping(true); // local indicator — doesn't blank the whole tab like setLoading does
+    try {
+      // Fetch fresh schema BEFORE showing the modal — so newly-created custom fields
+      // get auto-detected on this upload, not the next one. Was fire-and-forget before.
+      // We capture the returned value because setAvailableFields is async — the React state
+      // won't be updated until next render, but we need fresh fields RIGHT NOW for autoDetect.
+      const freshMeta = await fetchAvailableFields();
+      // Also fetch fresh records, so the match-existing flow has up-to-date data.
+      // Without this, if records were imported in a previous session and state was reset,
+      // every row would be miscategorized as "unmatched" → created as new.
+      let freshRecords = table === "Accounts" ? accounts : leads;
+      try {
+        const r = await at("list", table, {}, bid);
+        freshRecords = r.records || [];
+        setter(freshRecords);
+      } catch (e) {
+        console.warn(`Could not refresh ${table} before CSV upload, using cached state (${freshRecords.length} records)`);
+      }
+
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const text = e.target.result;
+        // Proper CSV parse — handles multi-line quoted fields, escaped quotes
+        const parseFullCSV = (csv) => {
+          const rows = []; let row = []; let cell = ""; let inQ = false;
+          for (let i = 0; i < csv.length; i++) {
+            const c = csv[i];
+            if (inQ) {
+              if (c === '"') {
+                if (csv[i + 1] === '"') { cell += '"'; i++; } // escaped quote
+                else inQ = false; // end quote
+              } else { cell += c; }
+            } else {
+              if (c === '"') { inQ = true; }
+              else if (c === ',') { row.push(cell.trim()); cell = ""; }
+              else if (c === '\n' || c === '\r') {
+                if (c === '\r' && csv[i + 1] === '\n') i++; // skip \r\n
+                row.push(cell.trim()); cell = "";
+                if (row.some(c => c)) rows.push(row);
+                row = [];
+              } else { cell += c; }
+            }
+          }
+          // Last cell/row
+          row.push(cell.trim());
+          if (row.some(c => c)) rows.push(row);
+          return rows;
+        };
+
+        const allRows = parseFullCSV(text);
+        if (allRows.length < 2) { setCsvPrepping(false); return; }
+        const headers = allRows[0];
+        const dataRows = allRows.slice(1).filter(r => r.length >= 2 && r.some(c => c)); // need at least 2 non-empty cells
+        setCsvModal({ table, setter, headers, rows: dataRows, mappings: autoDetect(headers, table, freshRecords, freshMeta), mode: "create", matchField: "Name", campaignTag: camp?.name || "", newCampaignTag: "", existingCount: freshRecords.length });
+        setCsvPrepping(false); // modal is up, user takes over
+      };
+      reader.onerror = () => { setCsvPrepping(false); console.error("CSV read error"); };
+      reader.readAsText(file);
+    } catch (e) {
+      console.error("CSV prep failed:", e);
+      setCsvPrepping(false);
+    }
   };
 
   const uploadMappedCSV = async () => {
@@ -864,26 +920,49 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     if (!recs.length) { setCsvModal(null); return; }
 
     try {
-      setLoading(true); setCsvModal(null);
+      // Use local prepping state instead of global setLoading. Global setLoading hides the
+      // entire tab (because every tab has `tab===X && !loading && (...)`), which makes the
+      // user think their data disappeared during a slow upload.
+      setCsvPrepping(true);
+      setCsvModal(null);
 
       if (mode === "update" && matchField) {
         // ─── Partial update: match by field, update existing records ───
+        // Use fresh state — handleCSVFile refreshed this just before showing the modal.
         const existing = table === "Accounts" ? accounts : leads;
+
+        // Pre-build a normalized lookup map. O(N) once, O(1) lookups instead of O(M*N).
+        // Also lets us detect duplicate match values in the existing data (which would
+        // cause non-deterministic behavior — first-found wins).
+        const existingByMatch = new Map();
+        const dupKeys = [];
+        for (const e of existing) {
+          const key = normalizeForMatch(e.fields?.[matchField]);
+          if (!key) continue; // skip records with no value in match field
+          if (existingByMatch.has(key)) dupKeys.push(key);
+          else existingByMatch.set(key, e);
+        }
+        if (dupKeys.length > 0) {
+          console.warn(`[CSV Update] ${dupKeys.length} duplicate ${matchField} values in existing data — first-found wins for matching`);
+        }
+
         const matched = [];
         const unmatched = [];
+        const skippedNoMatchValue = [];
 
         for (const rec of recs) {
-          const matchVal = (rec[matchField] || "").toLowerCase().trim();
-          if (!matchVal) { unmatched.push(rec); continue; }
-          const found = existing.find(e => {
-            const existVal = (e.fields?.[matchField] || "").toLowerCase().trim();
-            return existVal === matchVal;
-          });
+          const matchVal = normalizeForMatch(rec[matchField]);
+          if (!matchVal) {
+            // This row has no value in the match field. Don't silently create — flag it.
+            skippedNoMatchValue.push(rec);
+            continue;
+          }
+          const found = existingByMatch.get(matchVal);
           if (found) {
             // Build update payload — only include non-match fields (new data)
             const updates = {};
             for (const [k, v] of Object.entries(rec)) {
-              if (k !== matchField && v) updates[k] = v;
+              if (k !== matchField && v !== undefined && v !== "") updates[k] = v;
             }
             if (Object.keys(updates).length > 0) {
               matched.push({ id: found.id, fields: updates });
@@ -894,30 +973,56 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         }
 
         // Update matched records
+        let updateErrors = [];
         if (matched.length > 0) {
-          const res = await at("update", table, { records: matched }, bid);
-          // Merge updated fields into local state
-          const updatedMap = {};
-          (res.records || []).forEach(r => { updatedMap[r.id] = r; });
-          setter(p => p.map(r => updatedMap[r.id] ? { ...r, fields: { ...r.fields, ...updatedMap[r.id].fields } } : r));
+          try {
+            const res = await at("update", table, { records: matched }, bid);
+            const updatedMap = {};
+            (res.records || []).forEach(r => { updatedMap[r.id] = r; });
+            setter(p => p.map(r => updatedMap[r.id] ? { ...r, fields: { ...r.fields, ...updatedMap[r.id].fields } } : r));
+          } catch (e) {
+            updateErrors.push(e.message);
+          }
         }
 
         // Create unmatched as new records (if any)
+        let createErrors = [];
         if (unmatched.length > 0) {
-          const res = await at("create", table, { records: unmatched }, bid);
-          setter(p => [...p, ...(res.records || [])]);
+          try {
+            const res = await at("create", table, { records: unmatched }, bid);
+            setter(p => [...p, ...(res.records || [])]);
+          } catch (e) {
+            createErrors.push(e.message);
+          }
         }
 
-        console.log(`[CSV Update] ${matched.length} updated, ${unmatched.length} created new`);
+        // Tell the user what happened — was failing silently before
+        const summary = [];
+        if (matched.length > 0) summary.push(`${matched.length} updated`);
+        if (unmatched.length > 0) summary.push(`${unmatched.length} created (no match by ${matchField})`);
+        if (skippedNoMatchValue.length > 0) summary.push(`${skippedNoMatchValue.length} skipped (blank ${matchField} field)`);
+        if (updateErrors.length > 0) summary.push(`UPDATE FAILED: ${updateErrors[0]}`);
+        if (createErrors.length > 0) summary.push(`CREATE FAILED: ${createErrors[0]}`);
+        const msg = `CSV ${mode}: ${summary.join(", ")}`;
+        console.log(`[CSV Update]`, msg);
+        // Inline notification — show for 8 sec so user has time to read
+        setCsvUploadResult({ msg, isError: updateErrors.length + createErrors.length > 0 });
+        setTimeout(() => setCsvUploadResult(null), 8000);
       } else {
         // ─── Normal create ───
         const res = await at("create", table, { records: recs }, bid);
         setter(p => [...p, ...(res.records || [])]);
+        setCsvUploadResult({ msg: `CSV create: ${recs.length} new ${table.toLowerCase()} created`, isError: false });
+        setTimeout(() => setCsvUploadResult(null), 6000);
       }
 
       fetchAvailableFields();
-    } catch (e) { console.error("Upload failed:", e); }
-    setLoading(false);
+    } catch (e) {
+      console.error("Upload failed:", e);
+      setCsvUploadResult({ msg: `Upload failed: ${e.message}`, isError: true });
+      setTimeout(() => setCsvUploadResult(null), 8000);
+    }
+    setCsvPrepping(false);
   };
 
   // ─── Filtered tasks (used by export + task tab) ─────────────
@@ -1107,6 +1212,19 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         if (sc.fuzzy_skipped > 0) parts.push(`⚠ ${sc.fuzzy_skipped} borderline skipped (cost cap)`);
         compileLabel = ` [smart: ${parts.join(", ")}]`;
       }
+      // Cross-reference coverage — show match rate so user knows if account joining actually worked
+      let crossRefLabel = "";
+      if (res.crossRef?.enabled) {
+        const cr = res.crossRef;
+        if (cr.failed) {
+          crossRefLabel = ` ⚠ XREF FAILED: ${cr.error} — Account.* rules contributed 0`;
+        } else {
+          crossRefLabel = ` [xref: ${cr.matched_to_account}/${cr.total_leads} leads matched (${cr.match_rate_pct}%) to ${cr.total_accounts_indexed} accounts]`;
+          if (cr.match_rate_pct < 60) {
+            crossRefLabel += ` ⚠ low match rate — check that Domain/Website/LinkedIn fields are populated`;
+          }
+        }
+      }
       // Legacy cap warning — only shows when pure-AI mode hit the 600-record cap
       let legacyWarning = "";
       if (res.legacy?.skipped_at_cap > 0) {
@@ -1121,7 +1239,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
           unique.forEach(t => taskSeenRef.current.add(taskFingerprint(t)));
           const cr = await at("create", "Tasks", { records: unique }, bid);
           setTasks(p => [...(cr.records || []), ...p]);
-          setScanText(`✅ ${unique.length} tasks${aiLabel}${compileLabel} from top ${res.topN}/${res.totalRecords}${duped > 0 ? ` (${duped} dupes skipped)` : ""}${legacyWarning}`);
+          setScanText(`✅ ${unique.length} tasks${aiLabel}${compileLabel}${crossRefLabel} from top ${res.topN}/${res.totalRecords}${duped > 0 ? ` (${duped} dupes skipped)` : ""}${legacyWarning}`);
         } else {
           setScanText(`✅ All ${res.tasks.length} tasks already exist (no new tasks)`);
         }
@@ -2377,7 +2495,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     </div>
   )}
 
-  {editRule!==null&&<RuleEditor rule={editRule} onSave={saveRule} onClose={()=>setEditRule(null)} availableFields={availableFields}/>}
+  {editRule!==null&&<RuleEditor rule={editRule} onSave={saveRule} onClose={()=>setEditRule(null)} availableFields={availableFields} baseId={bid}/>}
   {showExportModal&&<ExportModal tasks={selCount>0?fTasks.filter(t=>selectedTasks.has(t.id)):fTasks} accounts={accounts} leads={leads} onClose={()=>setShowExportModal(false)}/>}
   {enrichModal&&<EnrichModal mode={enrichModal.mode} tasks={tasks} rules={rules} fTasks={fTasks} selectedTasks={selectedTasks} onEnrich={enrichTasks} onPush={pushToHubSpot} enrichResults={enrichResults} enrichLoading={enrichLoading} hsConnected={hsConnected} hsOwners={hsOwners} hsLoading={hsLoading} onClose={()=>{setEnrichModal(null);setEnrichResults([])}}/>}
   {manualModal&&<ManualOutreachModal leads={leads} rules={rules} linkedinAccount={linkedinAccount} outreachAPI={outreachAPI} onClose={()=>setManualModal(null)} baseId={bid}/>}
@@ -2617,6 +2735,19 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     </div>
   )}
 
+  {/* CSV upload prep indicator — shows during fetch-fresh-records prep AND during upload */}
+  {csvPrepping&&(<div style={{position:"fixed",top:20,right:20,zIndex:9998,padding:12,maxWidth:340,background:"rgba(91,143,212,.95)",color:"white",borderRadius:8,fontSize:11,boxShadow:"0 4px 12px rgba(0,0,0,.3)"}}>
+    ⏳ Working on CSV — fetching latest records and applying changes...
+  </div>)}
+
+  {/* CSV upload result toast — shows match/create counts after upload */}
+  {csvUploadResult&&(<div style={{position:"fixed",top:20,right:20,zIndex:9999,padding:14,maxWidth:480,background:csvUploadResult.isError?"rgba(239,68,68,.95)":"rgba(93,168,122,.95)",color:"white",borderRadius:8,fontSize:12,boxShadow:"0 4px 12px rgba(0,0,0,.3)",lineHeight:1.4}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10}}>
+      <div>{csvUploadResult.isError?"❌ ":"✅ "}{csvUploadResult.msg}</div>
+      <button onClick={()=>setCsvUploadResult(null)} style={{background:"transparent",border:"none",color:"white",cursor:"pointer",fontSize:14,padding:0,lineHeight:1}}>✕</button>
+    </div>
+  </div>)}
+
   {/* CSV MODAL */}
   {csvModal&&(<div className="modal-o" onClick={e=>e.target===e.currentTarget&&setCsvModal(null)}><div className="modal" style={{maxWidth:700}}>
   <div className="modal-h"><span style={{fontWeight:600}}>Map CSV → {csvModal.table}</span><button className="btn btn-s" onClick={()=>setCsvModal(null)}>✕</button></div>
@@ -2656,6 +2787,58 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         <span style={{color:"var(--t2)",marginLeft:4}}>({(csvModal.table==="Accounts"?accounts:leads).length} existing records to match against)</span>
       )}
     </div>
+
+    {/* PRE-FLIGHT PREVIEW: how many CSV rows will actually match? Catches the "I picked
+        update but everything created new" failure mode BEFORE the user clicks Upload. */}
+    {(() => {
+      const existing = csvModal.table === "Accounts" ? accounts : leads;
+      const matchField = csvModal.matchField;
+      const existingByMatch = new Map();
+      for (const e of existing) {
+        const key = normalizeForMatch(e.fields?.[matchField]);
+        if (key && !existingByMatch.has(key)) existingByMatch.set(key, e);
+      }
+      // Find which CSV column maps to the matchField
+      const csvCol = Object.entries(csvModal.mappings).find(([_, v]) => v === matchField)?.[0];
+      const csvColIdx = csvCol ? csvModal.headers.indexOf(csvCol) : -1;
+      let willUpdate = 0, willCreate = 0, willSkipBlank = 0;
+      if (csvColIdx >= 0) {
+        for (const row of csvModal.rows) {
+          const val = normalizeForMatch(row[csvColIdx]);
+          if (!val) willSkipBlank++;
+          else if (existingByMatch.has(val)) willUpdate++;
+          else willCreate++;
+        }
+      }
+      const total = willUpdate + willCreate + willSkipBlank;
+      const updatePct = total > 0 ? Math.round((willUpdate / total) * 100) : 0;
+      const showWarning = total > 0 && willUpdate === 0;
+      const showLowMatch = total > 0 && willUpdate > 0 && updatePct < 30;
+      return (
+        <div style={{marginTop:8,padding:8,borderRadius:4,fontSize:10,
+          background: showWarning ? "rgba(239,68,68,.08)" : showLowMatch ? "rgba(191,163,90,.08)" : "rgba(93,168,122,.08)",
+          border: "1px solid " + (showWarning ? "var(--red)" : showLowMatch ? "var(--amb)" : "rgba(93,168,122,.3)")}}>
+          <div style={{fontWeight:600,marginBottom:4,color:showWarning?"var(--red)":showLowMatch?"var(--amb)":"var(--grn)"}}>
+            🔍 Preview: {willUpdate} will be updated, {willCreate} will be created new{willSkipBlank>0?`, ${willSkipBlank} will be skipped (blank ${matchField})`:""}
+          </div>
+          {showWarning && (
+            <div style={{color:"var(--t2)"}}>
+              ⚠️ Zero matches. Possible causes: (1) {matchField} not mapped in your CSV, (2) values differ in case/whitespace, (3) your existing records have empty {matchField} field. Pick a different match field or check your data.
+            </div>
+          )}
+          {showLowMatch && (
+            <div style={{color:"var(--t2)"}}>
+              ⚠️ Low match rate ({updatePct}%). If you expected most rows to update, double-check the {matchField} field on both sides.
+            </div>
+          )}
+          {!showWarning && !showLowMatch && willUpdate > 0 && (
+            <div style={{color:"var(--t3)"}}>
+              ✓ Match rate looks healthy. Click Upload to apply.
+            </div>
+          )}
+        </div>
+      );
+    })()}
   </div>)}
 
   {/* Campaign Tag */}
@@ -6175,7 +6358,7 @@ function AddCampaignModal({ onSave, onClose }) {
 // ═══════════════════════════════════════════════════════════════
 // UNIFIED RULE EDITOR — task type picker at top, form adapts
 // ═══════════════════════════════════════════════════════════════
-function RuleEditor({rule,onSave,onClose,availableFields}){
+function RuleEditor({rule,onSave,onClose,availableFields,baseId}){
   const isTopX = rule.taskType === "top_x";
   const isOutreach = rule.taskType === "linkedin_outreach";
   const [mode, setMode] = useState(isOutreach ? "outreach" : isTopX ? "top_x" : "signal");
@@ -6351,7 +6534,7 @@ function RuleEditor({rule,onSave,onClose,availableFields}){
             try {
               const res = await fetch("/api/airtable", {
                 method:"POST", headers:{"Content-Type":"application/json"},
-                body: JSON.stringify({ action:"compile_topx_rules", baseId: rule.baseId || undefined, prompt: f.scoringPrompt, scanTarget: f.scanTarget }),
+                body: JSON.stringify({ action:"compile_topx_rules", baseId: baseId || rule.baseId || undefined, prompt: f.scoringPrompt, scanTarget: f.scanTarget }),
               });
               const d = await res.json();
               if (d.error) { setCompileErr(d.error); }
@@ -6431,15 +6614,33 @@ function RuleEditor({rule,onSave,onClose,availableFields}){
             {/* Quick rule summary for non-JSON-readers */}
             <div style={{marginTop:10,padding:10,background:"var(--hover)",borderRadius:4,fontSize:10,color:"var(--t2)",lineHeight:1.6}}>
               <div style={{fontWeight:600,marginBottom:4,color:"var(--t1)"}}>📊 Rule summary</div>
-              {(f.compiledRules.rules || []).map((r,i)=>(
-                <div key={i} style={{marginBottom:3}}>
-                  <span style={{color:r.score_contribution >= 0 ? "var(--grn)" : "var(--red)"}}>
-                    {r.score_contribution >= 0 ? "+" : ""}{r.score_contribution}
-                  </span>
-                  {" "}<span style={{color:"var(--t3)"}}>if</span> <strong>{r.field}</strong> {r.operator} {r.values ? r.values.slice(0,3).join(", ") + (r.values.length>3?"...":"") : r.value || (r.min!==undefined?`${r.min}-${r.max}`:"")}
-                  {r.partial_credit && <span style={{color:"var(--t3)"}}> (partial: {Object.entries(r.partial_credit).map(([k,v])=>`${k}=${v}`).join(", ")})</span>}
-                </div>
-              ))}
+              {(() => {
+                const rules = f.compiledRules.rules || [];
+                const hasAccountRules = rules.some(r => r.field?.startsWith("Account."));
+                return (<>
+                  {hasAccountRules && (
+                    <div style={{marginBottom:8,padding:6,background:"rgba(91,143,212,.08)",borderRadius:3,fontSize:10,color:"var(--blu)"}}>
+                      🔗 This rule cross-references Accounts. Leads will be matched to accounts by domain → website → company LinkedIn. Match coverage shown in scan result.
+                    </div>
+                  )}
+                  {rules.map((r,i)=>{
+                    const isAccount = r.field?.startsWith("Account.");
+                    return (
+                      <div key={i} style={{marginBottom:3}}>
+                        <span style={{color:r.score_contribution >= 0 ? "var(--grn)" : "var(--red)"}}>
+                          {r.score_contribution >= 0 ? "+" : ""}{r.score_contribution}
+                        </span>
+                        {" "}<span style={{color:"var(--t3)"}}>if</span>{" "}
+                        {isAccount && <span style={{padding:"1px 4px",background:"rgba(91,143,212,.15)",color:"var(--blu)",borderRadius:2,fontSize:9,marginRight:3}}>ACCT</span>}
+                        <strong>{isAccount ? r.field.slice("Account.".length) : r.field}</strong>{" "}
+                        {r.operator}{" "}
+                        {r.values ? r.values.slice(0,3).join(", ") + (r.values.length>3?"...":"") : r.value || (r.min!==undefined?`${r.min}-${r.max}`:"")}
+                        {r.partial_credit && <span style={{color:"var(--t3)"}}> (partial: {Object.entries(r.partial_credit).map(([k,v])=>`${k}=${v}`).join(", ")})</span>}
+                      </div>
+                    );
+                  })}
+                </>);
+              })()}
               {f.compiledRules.fuzzy_check?.enabled && (
                 <div style={{marginTop:6,paddingTop:6,borderTop:"1px solid var(--bdr)"}}>
                   <span style={{color:"var(--pur)"}}>🤖 Fuzzy AI check</span> on borderline candidates ({f.compiledRules.fuzzy_check.trigger_when_deterministic_score_between?.[0] || 40}-{f.compiledRules.fuzzy_check.trigger_when_deterministic_score_between?.[1] || 80}): {f.compiledRules.fuzzy_check.criterion?.slice(0,120)}
