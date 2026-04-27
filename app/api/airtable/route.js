@@ -1,6 +1,15 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 
+// 5-minute timeout: required for Top X scans on large lead lists (5K-10K records).
+// At 10K leads:
+//   - listRecords pagination: ~15-20s
+//   - Smart Compile deterministic scoring: <1s
+//   - Optional fuzzy AI on borderline candidates: 10-30s
+//   - Tasks creation: 1-2s
+// Total well under 300s. Default Vercel function timeout (10s) was guaranteed to fail.
+export const maxDuration = 300;
+
 const API_KEY = process.env.AIRTABLE_API_KEY;
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 const MASTER_BASE_ID = process.env.AIRTABLE_BASE_ID; // master base — stores Campaigns registry
@@ -49,7 +58,22 @@ async function listRecords(baseId, table, params = {}) {
     const url = offset
       ? `${baseUrl(baseId)}/${encodeURIComponent(table)}?${qs.toString()}&offset=${offset}`
       : `${baseUrl(baseId)}/${encodeURIComponent(table)}?${qs.toString()}`;
-    const res = await fetch(url, { headers: authHdr });
+
+    // Airtable rate limit: 5 req/sec per base. With 100 paginated calls for 10K records,
+    // we shouldn't hit this naturally (sequential), but if other API calls are happening
+    // in parallel we might. Retry on 429 with exponential backoff.
+    let res;
+    let attempt = 0;
+    const maxAttempts = 4;
+    while (attempt < maxAttempts) {
+      res = await fetch(url, { headers: authHdr });
+      if (res.status !== 429) break;
+      const backoffMs = Math.min(30000, 1000 * Math.pow(2, attempt)); // 1s, 2s, 4s, 8s, capped at 30s
+      console.warn(`[listRecords] 429 rate limit on ${table}, retrying in ${backoffMs}ms (attempt ${attempt + 1}/${maxAttempts})`);
+      await new Promise(r => setTimeout(r, backoffMs));
+      attempt++;
+    }
+
     if (!res.ok) {
       const err = await res.text();
       console.error(`LIST ${table} error:`, err);
@@ -73,6 +97,7 @@ const FIELD_TYPE_MAP = {
   "Description": { type: "multilineText" },
   "Scoring Prompt": { type: "multilineText" },
   "Scoring Fields": { type: "multilineText" },
+  "Compiled Rules JSON": { type: "multilineText" },
   "Outreach Config": { type: "multilineText" },
   "Keywords": { type: "multilineText" },
   "Job Title Keywords": { type: "multilineText" },
@@ -706,15 +731,32 @@ async function runTopXScoring(baseId, rule) {
     return out;
   }
 
+  // Track these outside the useAI block so they're in scope at the final return.
+  // Default values for the case where AI scoring isn't used at all.
+  let skippedAtCap = 0;
+  let actualCandidateCount = 0;
+
   if (useAI) {
     // Sort with deterministic tie-break by name so re-running yields stable output
     scored.sort((a, b) => (b.numericScore - a.numericScore) || a.name.localeCompare(b.name));
 
+    // Hard cap on pure-AI mode: 600 records (40 batches × ~3s each = ~120s wall clock).
+    // Above this, even with 300s budget, Vercel would timeout. The legacy path was never
+    // designed for 5K-10K records — Smart Compile is the answer for that scale.
+    // For hybrid mode (numeric + AI), we already cap at topN * 3, so this only affects pure-AI.
+    const PURE_AI_HARD_CAP = 600;
     const candidateCount = hasNumeric
       ? Math.min(scored.length, topN * 3)
-      : scored.length;
+      : Math.min(scored.length, PURE_AI_HARD_CAP);
+    actualCandidateCount = candidateCount;
     const candidates = scored.slice(0, candidateCount);
     const rest = scored.slice(candidateCount);
+    skippedAtCap = (!hasNumeric && scored.length > PURE_AI_HARD_CAP)
+      ? scored.length - PURE_AI_HARD_CAP
+      : 0;
+    if (skippedAtCap > 0) {
+      console.warn(`[TOP-X] Pure-AI mode capped at ${PURE_AI_HARD_CAP} records (skipped ${skippedAtCap}). Use Smart Compile for full coverage.`);
+    }
 
     const BATCH = hasNumeric ? 5 : 15;
 
@@ -909,11 +951,472 @@ Return ONLY JSON: [{"idx":0,"score":85,"reason":"max 15 words explaining which d
       Created: nowISO,
     };
   });
-  return { tasks, totalRecords: records.length, topN, aiScored: !!useAI };
+  return {
+    tasks,
+    totalRecords: records.length,
+    topN,
+    aiScored: !!useAI,
+    legacy: {
+      skipped_at_cap: skippedAtCap,
+      cap_reason: skippedAtCap > 0
+        ? `Legacy AI-per-record mode capped at ${actualCandidateCount} records (Vercel timeout risk). Enable Smart Compile to score all ${records.length} records.`
+        : null,
+    },
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════
-// GET TABLE FIELDS
+// SMART COMPILE: extract structured rules from a natural-language scoring prompt
+// so we can score thousands of leads deterministically without per-record AI calls.
+// ═══════════════════════════════════════════════════════════════
+
+// JSON Schema reference for the AI compiler. Kept inline so we can paste it in the prompt.
+// Operators chosen to be minimal-but-complete for B2B lead scoring:
+//   - equals / not_equals: exact match on string or number
+//   - contains_any_of / contains_all_of / not_contains: substring or set ops on text
+//   - between / gt / gte / lt / lte: numeric range checks
+//   - is_empty / is_not_empty: presence checks
+//   - regex: escape hatch for custom matching
+// score_contribution can be negative (penalty rule). partial_credit lets booleans
+// give half-points for "Not Sure"-style middle states.
+const COMPILE_SYSTEM_PROMPT = `You are a B2B lead scoring rule compiler. You take natural-language scoring criteria and convert them into deterministic, executable JSON rules.
+
+Your job is to extract STRUCTURED RULES that JavaScript can execute without further AI calls. The user has 100s-1000s of records and we cannot afford to call AI for each one.
+
+OUTPUT FORMAT — return ONLY this JSON, no markdown, no preamble:
+
+{
+  "rules": [
+    {
+      "id": "r1",
+      "description": "what this rule checks",
+      "field": "EXACT field name from the schema below",
+      "operator": "one of: equals | not_equals | contains_any_of | contains_all_of | not_contains | between | gt | gte | lt | lte | is_empty | is_not_empty | regex",
+      "value": "for equals/not_equals/contains/regex",
+      "values": ["array for contains_any_of/contains_all_of/not_contains"],
+      "min": number, "max": number,
+      "case_sensitive": false,
+      "score_contribution": 25,
+      "partial_credit": {"Not Sure": 12.5}
+    }
+  ],
+  "fuzzy_check": {
+    "enabled": false,
+    "criterion": "natural-language criterion that genuinely needs AI judgment, e.g. 'does the bio suggest interest in X'",
+    "fields_to_read": ["Title", "Headline"],
+    "trigger_when_deterministic_score_between": [40, 80],
+    "max_adjustment": 20
+  },
+  "max_possible_score": 100,
+  "notes": "any caveats or assumptions you made"
+}
+
+CRITICAL RULES:
+1. ONLY use field names that appear in the schema. If the user references a field that doesn't exist, OMIT that rule and add a note.
+2. score_contribution values across all positive rules should add up to roughly 100 (the max possible score). If user defines tiers (e.g. "80-100 = ..."), pick contributions that produce those tiers when rules combine.
+3. score_contribution can be NEGATIVE for penalty rules (e.g. "subtract 50 if already a customer").
+4. fuzzy_check should be enabled ONLY when criteria genuinely need text interpretation (e.g. "headline suggests interest in X", "title sounds related to finance"). If user's criteria are all explicit field comparisons, set fuzzy_check.enabled to false.
+5. If a boolean field has a "Not Sure" middle state, use partial_credit to give half points.
+6. Be CONCRETE. Don't write "title contains finance-related keywords" — list the actual keywords: ["CFO", "Finance", "Controller", "Treasurer"].
+7. For numeric ranges, use the exact bounds the user gave. If they say "between 200 and 2000", use min:200 max:2000.
+8. case_sensitive defaults to false.
+
+Return only the JSON. No explanations outside the "notes" field.`;
+
+async function compileTopXRules(baseId, { prompt, scanTarget }) {
+  if (!OPENAI_KEY) return { error: "OPENAI_API_KEY not set in Vercel env" };
+  if (!prompt || !prompt.trim()) return { error: "Prompt required" };
+
+  const tableName = scanTarget === "accounts" ? "Accounts" : "Leads";
+  // Pull schema + 10 sample records. At 5K-10K record scale, the AI compiler benefits
+  // from seeing more variety — Title, Industry, etc. often have 20+ distinct values,
+  // and 3 samples can mislead rule extraction. Use maxRecords param so we don't pull
+  // the full table just to take 10.
+  const [fieldDefs, sampleRecords] = await Promise.all([
+    getTableFields(baseId, tableName),
+    listRecords(baseId, tableName, { maxRecords: 10 }),
+  ]);
+
+  if (!fieldDefs.length) {
+    return { error: `Could not read schema for ${tableName} table. Check Airtable token has schema:read scope.` };
+  }
+
+  // Format the schema for the AI: name + type + sample values seen
+  const schemaLines = fieldDefs.map(fd => {
+    const samples = sampleRecords
+      .map(r => r.fields?.[fd.name])
+      .filter(v => v !== undefined && v !== null && v !== "")
+      .slice(0, 3)
+      .map(v => Array.isArray(v) ? `[${v.join(", ")}]` : String(v).slice(0, 60));
+    const samplesStr = samples.length ? ` — examples: ${samples.join(" | ")}` : "";
+    return `- ${fd.name} (${fd.type})${samplesStr}`;
+  }).join("\n");
+
+  try {
+    const openai = new OpenAI({ apiKey: OPENAI_KEY });
+    // The compiler runs ONCE per rule (cached after that). Use the flagship model
+    // for higher-quality field extraction and less hallucination of non-existent
+    // field names. Cost is ~$0.03 per compile call, vs ~$0.005 with mini.
+    // Mini works too if cost is critical, but mistakes cascade across all records.
+    const completion = await openai.chat.completions.create({
+      model: "gpt-5.4",
+      temperature: 0.1, // very low — we want consistent rules
+      max_completion_tokens: 4000,
+      messages: [
+        { role: "system", content: COMPILE_SYSTEM_PROMPT },
+        { role: "user", content: `Available fields in ${tableName} table:\n${schemaLines}\n\nUser's scoring prompt:\n"""\n${prompt}\n"""\n\nCompile this to executable rules.` },
+      ],
+    });
+
+    const text = completion.choices[0]?.message?.content || "{}";
+    const cleaned = text.replace(/```json\n?|```/g, "").trim();
+    let compiled;
+    try {
+      compiled = JSON.parse(cleaned);
+    } catch (e) {
+      return { error: `AI returned invalid JSON: ${e.message}`, raw: cleaned.slice(0, 500) };
+    }
+
+    // Validate the shape — if the AI hallucinated a non-existent field, flag it
+    const validFieldNames = new Set(fieldDefs.map(f => f.name));
+    const warnings = [];
+    if (!Array.isArray(compiled.rules)) {
+      return { error: "Compiled output missing 'rules' array", raw: cleaned.slice(0, 500) };
+    }
+    for (const rule of compiled.rules) {
+      if (rule.field && !validFieldNames.has(rule.field)) {
+        warnings.push(`Rule "${rule.description || rule.id}" references unknown field "${rule.field}"`);
+      }
+    }
+    if (compiled.fuzzy_check?.fields_to_read) {
+      for (const f of compiled.fuzzy_check.fields_to_read) {
+        if (!validFieldNames.has(f)) warnings.push(`Fuzzy check references unknown field "${f}"`);
+      }
+    }
+
+    compiled.compiled_at = new Date().toISOString();
+    compiled.version = 1;
+
+    // Sanity-check score contributions. If the AI over-allocated (e.g., 5 rules each
+    // worth 30 = max 150), records will cluster at 100 and lose differentiation.
+    // Normalize back down so total positive contributions equal max_possible_score.
+    const positiveTotal = (compiled.rules || [])
+      .filter(r => (r.score_contribution || 0) > 0)
+      .reduce((s, r) => s + r.score_contribution, 0);
+    const maxScore = compiled.max_possible_score || 100;
+    if (positiveTotal > maxScore * 1.2) {
+      const factor = maxScore / positiveTotal;
+      console.log(`[TOP-X-COMPILE] Positive contributions summed to ${positiveTotal}, normalizing by factor ${factor.toFixed(2)}`);
+      for (const rule of compiled.rules) {
+        if ((rule.score_contribution || 0) > 0) {
+          rule.score_contribution = Math.round(rule.score_contribution * factor);
+        }
+        // Scale partial credit values too
+        if (rule.partial_credit) {
+          for (const k of Object.keys(rule.partial_credit)) {
+            rule.partial_credit[k] = Math.round(rule.partial_credit[k] * factor);
+          }
+        }
+      }
+      warnings.push(`Normalized score contributions (was sum=${positiveTotal}, now ~${maxScore})`);
+    }
+
+    return { ok: true, compiled, warnings, schema_used: fieldDefs };
+  } catch (e) {
+    return { error: `Compile failed: ${e.message}` };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// RULE EXECUTOR — runs compiled rules against records deterministically.
+// No AI calls. Should handle 10k records in <100ms.
+// ═══════════════════════════════════════════════════════════════
+
+function executeCompiledRule(rule, fieldValue) {
+  // Returns: { matched: bool, score: number } where score is the contribution to add
+  if (fieldValue === undefined || fieldValue === null) {
+    // Empty fields only match is_empty operator
+    if (rule.operator === "is_empty") return { matched: true, score: rule.score_contribution || 0 };
+    if (rule.operator === "is_not_empty") return { matched: false, score: 0 };
+    return { matched: false, score: 0 };
+  }
+
+  // Normalize for comparison
+  const caseSensitive = !!rule.case_sensitive;
+  const stringify = v => Array.isArray(v) ? v.join(", ") : String(v);
+  const fv = stringify(fieldValue);
+  const fvCmp = caseSensitive ? fv : fv.toLowerCase();
+
+  switch (rule.operator) {
+    case "equals": {
+      const target = stringify(rule.value);
+      const targetCmp = caseSensitive ? target : target.toLowerCase();
+      if (fvCmp === targetCmp) return { matched: true, score: rule.score_contribution || 0 };
+      // Check partial credit for boolean middle states
+      if (rule.partial_credit) {
+        for (const [pcVal, pcScore] of Object.entries(rule.partial_credit)) {
+          const pcCmp = caseSensitive ? pcVal : pcVal.toLowerCase();
+          if (fvCmp === pcCmp) return { matched: true, score: pcScore };
+        }
+      }
+      return { matched: false, score: 0 };
+    }
+    case "not_equals": {
+      const target = stringify(rule.value);
+      const targetCmp = caseSensitive ? target : target.toLowerCase();
+      return { matched: fvCmp !== targetCmp, score: fvCmp !== targetCmp ? (rule.score_contribution || 0) : 0 };
+    }
+    case "contains_any_of": {
+      if (!Array.isArray(rule.values)) return { matched: false, score: 0 };
+      for (const v of rule.values) {
+        const vCmp = caseSensitive ? String(v) : String(v).toLowerCase();
+        if (fvCmp.includes(vCmp)) return { matched: true, score: rule.score_contribution || 0 };
+      }
+      return { matched: false, score: 0 };
+    }
+    case "contains_all_of": {
+      if (!Array.isArray(rule.values)) return { matched: false, score: 0 };
+      for (const v of rule.values) {
+        const vCmp = caseSensitive ? String(v) : String(v).toLowerCase();
+        if (!fvCmp.includes(vCmp)) return { matched: false, score: 0 };
+      }
+      return { matched: true, score: rule.score_contribution || 0 };
+    }
+    case "not_contains": {
+      if (!Array.isArray(rule.values)) {
+        const v = stringify(rule.value);
+        const vCmp = caseSensitive ? v : v.toLowerCase();
+        return { matched: !fvCmp.includes(vCmp), score: !fvCmp.includes(vCmp) ? (rule.score_contribution || 0) : 0 };
+      }
+      for (const v of rule.values) {
+        const vCmp = caseSensitive ? String(v) : String(v).toLowerCase();
+        if (fvCmp.includes(vCmp)) return { matched: false, score: 0 };
+      }
+      return { matched: true, score: rule.score_contribution || 0 };
+    }
+    case "between": {
+      const num = parseFloat(fv);
+      if (isNaN(num)) return { matched: false, score: 0 };
+      const inRange = num >= rule.min && num <= rule.max;
+      return { matched: inRange, score: inRange ? (rule.score_contribution || 0) : 0 };
+    }
+    case "gt": case "gte": case "lt": case "lte": {
+      const num = parseFloat(fv);
+      const target = parseFloat(rule.value);
+      if (isNaN(num) || isNaN(target)) return { matched: false, score: 0 };
+      const ok = rule.operator === "gt" ? num > target
+              : rule.operator === "gte" ? num >= target
+              : rule.operator === "lt" ? num < target
+              : num <= target;
+      return { matched: ok, score: ok ? (rule.score_contribution || 0) : 0 };
+    }
+    case "is_empty": {
+      const isE = !fv || fv === "";
+      return { matched: isE, score: isE ? (rule.score_contribution || 0) : 0 };
+    }
+    case "is_not_empty": {
+      const isNE = !!fv && fv !== "";
+      return { matched: isNE, score: isNE ? (rule.score_contribution || 0) : 0 };
+    }
+    case "regex": {
+      try {
+        const re = new RegExp(rule.value, caseSensitive ? "" : "i");
+        return { matched: re.test(fv), score: re.test(fv) ? (rule.score_contribution || 0) : 0 };
+      } catch { return { matched: false, score: 0 }; }
+    }
+    default:
+      return { matched: false, score: 0 };
+  }
+}
+
+function applyCompiledRules(records, compiled) {
+  const rules = compiled?.rules || [];
+  const maxScore = compiled?.max_possible_score || 100;
+  return records.map(r => {
+    const fields = r.fields || {};
+    let score = 0;
+    const matched = [];
+    for (const rule of rules) {
+      const fv = fields[rule.field];
+      const result = executeCompiledRule(rule, fv);
+      if (result.matched) {
+        score += result.score;
+        matched.push({ rule_id: rule.id, description: rule.description, contribution: result.score });
+      }
+    }
+    // Clamp to 0-100 (allow rules to over-allocate, then we clip)
+    const clamped = Math.max(0, Math.min(100, Math.round(score)));
+    const leadName = fields.Name || fields["Full Name"] || fields.Company || "Unknown";
+    const leadCompany = fields.Company || fields.Account || "";
+    return {
+      record: r,
+      deterministicScore: clamped,
+      rawScore: score, // before clamp, useful for debugging
+      matchedRules: matched,
+      name: leadName,
+      company: leadCompany,
+    };
+  });
+}
+
+// Smart-compile mode runner: scores deterministically + optionally runs AI fuzzy adjustment
+// on borderline candidates. Total AI calls scale with O(1) for compile + O(N/15) for fuzzy
+// (where N is candidates in the borderline window), instead of O(records/15).
+async function runTopXSmartCompile(baseId, rule, compiled) {
+  const scanTarget = rule.scanTarget || "leads";
+  const topN = rule.topN || 10;
+  const table = scanTarget === "accounts" ? "Accounts" : "Leads";
+
+  // Validate compiled input — fail loudly rather than silently returning alphabetical
+  // top 10 when rules are empty/broken
+  if (!compiled || !Array.isArray(compiled.rules) || compiled.rules.length === 0) {
+    return {
+      error: "Smart Compile is enabled but no rules are compiled. Click 'Compile to Rules' first, or disable Smart Compile to use the legacy AI-per-record path.",
+      tasks: [],
+    };
+  }
+
+  const records = await listRecords(baseId, table);
+  if (!records.length) return { error: `No ${table.toLowerCase()} found`, tasks: [] };
+
+  // Step 1: Deterministic scoring across ALL records (zero AI calls)
+  const t0 = Date.now();
+  const scored = applyCompiledRules(records, compiled);
+  const deterministicMs = Date.now() - t0;
+  console.log(`[TOP-X-SMART] Scored ${scored.length} records deterministically in ${deterministicMs}ms`);
+
+  // Step 2: Sort by deterministic score (with stable tie-break by name)
+  scored.sort((a, b) => (b.deterministicScore - a.deterministicScore) || a.name.localeCompare(b.name));
+
+  // Step 3: AI fuzzy adjustment — only for borderline candidates IF fuzzy_check is enabled
+  let fuzzyAdjusted = 0;
+  let fuzzyApiCalls = 0;
+  let fuzzySkipped = 0;
+  const fuzzyCheck = compiled?.fuzzy_check;
+  if (fuzzyCheck?.enabled && fuzzyCheck?.criterion && OPENAI_KEY) {
+    const [winLow, winHigh] = fuzzyCheck.trigger_when_deterministic_score_between || [40, 80];
+    const maxAdj = Math.abs(fuzzyCheck.max_adjustment || 20);
+    // Cap fuzzy AI calls. At 10K leads with a wide [40,80] window, you might have
+    // 5000 borderline candidates — we can't AI-score all of them. Sort by deterministic
+    // score (already done above) and take the top slice closest to the cutoff.
+    // Cap is the larger of (topN * 4) and 100 — covers large topN like 200, but caps
+    // at a reasonable absolute for typical topN=10 cases.
+    const FUZZY_CAP = Math.max(topN * 4, 100);
+    const borderlineCandidates = scored.filter(s => s.deterministicScore >= winLow && s.deterministicScore <= winHigh);
+    // Take the highest-scoring borderlines first — they're closest to the topN cutoff
+    // and most likely to swap with adjustment
+    const candidates = borderlineCandidates.slice(0, FUZZY_CAP);
+    fuzzySkipped = Math.max(0, borderlineCandidates.length - candidates.length);
+
+    if (candidates.length > 0) {
+      console.log(`[TOP-X-SMART] Fuzzy-adjusting ${candidates.length} borderline candidates`);
+      try {
+        const openai = new OpenAI({ apiKey: OPENAI_KEY });
+        const BATCH = 15;
+        const fieldsToRead = fuzzyCheck.fields_to_read || ["Title", "Headline", "About"];
+        for (let i = 0; i < candidates.length; i += BATCH) {
+          const batch = candidates.slice(i, i + BATCH);
+          fuzzyApiCalls++;
+          const summaries = batch.map((item, idx) => {
+            const f = item.record.fields || {};
+            const parts = fieldsToRead.map(fname => {
+              const v = f[fname];
+              if (v === undefined || v === null || v === "") return null;
+              return `${fname}: ${String(Array.isArray(v) ? v.join(", ") : v).slice(0, 300)}`;
+            }).filter(Boolean);
+            return `[${idx}] ${item.name} — ${parts.join(" | ")}`;
+          }).join("\n");
+
+          const completion = await openai.chat.completions.create({
+            model: "gpt-5.4-mini",
+            temperature: 0.2,
+            max_completion_tokens: 1500,
+            messages: [
+              { role: "system", content: `You are a B2B lead scoring fuzzy-check engine. For each record, return an adjustment (-${maxAdj} to +${maxAdj}) based on the criterion. Return ONLY: [{"idx":0,"adjustment":15,"reason":"max 12 words"},...]. No markdown.` },
+              { role: "user", content: `Criterion: ${fuzzyCheck.criterion}\n\nRecords (read ${fieldsToRead.join(", ")}):\n${summaries}` },
+            ],
+          });
+          const text = completion.choices[0]?.message?.content || "[]";
+          const cleaned = text.replace(/```json\n?|```/g, "").trim();
+          try {
+            let adjustments = JSON.parse(cleaned);
+            if (!Array.isArray(adjustments)) adjustments = adjustments.results || adjustments.adjustments || [];
+            for (const adj of adjustments) {
+              if (adj && adj.idx !== undefined && adj.adjustment !== undefined && batch[adj.idx]) {
+                const a = Math.max(-maxAdj, Math.min(maxAdj, parseFloat(adj.adjustment)));
+                if (!isNaN(a)) {
+                  batch[adj.idx].fuzzyAdjustment = a;
+                  batch[adj.idx].fuzzyReason = (adj.reason || "").slice(0, 100);
+                  fuzzyAdjusted++;
+                }
+              }
+            }
+          } catch (e) {
+            console.warn("[TOP-X-SMART] Fuzzy parse failed:", e.message);
+          }
+        }
+      } catch (e) {
+        console.error("[TOP-X-SMART] Fuzzy AI call failed, using deterministic only:", e.message);
+      }
+    }
+  }
+
+  // Step 4: Compute final scores (deterministic + fuzzy adjustment) and re-sort
+  for (const s of scored) {
+    s.finalScore = Math.max(0, Math.min(100, s.deterministicScore + (s.fuzzyAdjustment || 0)));
+  }
+  scored.sort((a, b) => (b.finalScore - a.finalScore) || a.name.localeCompare(b.name));
+
+  // Step 5: Build top N tasks
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const nowISO = new Date().toISOString();
+  const tasks = scored.slice(0, topN).map(item => {
+    const f = item.record.fields || {};
+    const ruleBreakdown = item.matchedRules.length > 0
+      ? item.matchedRules.map(m => `   ✓ ${m.description}: +${m.contribution}`).join("\n")
+      : "   (no rules matched)";
+    const signalLines = [
+      `📊 Score: ${item.finalScore}/100 (deterministic: ${item.deterministicScore}${item.fuzzyAdjustment ? `, fuzzy adj: ${item.fuzzyAdjustment > 0 ? "+" : ""}${item.fuzzyAdjustment}` : ""})`,
+      ``,
+      `📋 Matched rules:`,
+      ruleBreakdown,
+    ];
+    if (item.fuzzyReason) signalLines.push(``, `🤖 Fuzzy check: ${item.fuzzyReason}`);
+
+    return {
+      Name: item.name,
+      Company: scanTarget === "accounts" ? item.name : item.company,
+      "Task Rule": rule.name || "Top X (Smart)",
+      Score: item.finalScore,
+      "Scan Target": item.name,
+      "Lead Title": f.Title || f["Lead Title"] || "",
+      Email: f.Email || "",
+      "LinkedIn URL": f["LinkedIn URL"] || f["Linkedin URL"] || "",
+      Phone: f.Phone || "",
+      Signal: signalLines.join("\n"),
+      Source: fuzzyApiCalls > 0 ? "Top X Smart (Rules + AI)" : "Top X Smart (Rules)",
+      URL: f["LinkedIn URL"] || f["Linkedin URL"] || "",
+      "Task Type": "top_x",
+      Date: todayStr,
+      Created: nowISO,
+    };
+  });
+
+  return {
+    tasks,
+    totalRecords: records.length,
+    topN,
+    aiScored: fuzzyApiCalls > 0,
+    smartCompile: {
+      deterministic_ms: deterministicMs,
+      fuzzy_api_calls: fuzzyApiCalls,
+      fuzzy_adjusted_count: fuzzyAdjusted,
+      fuzzy_skipped: fuzzySkipped, // borderline candidates we didn't AI-check (cost cap)
+      total_rules_applied: compiled?.rules?.length || 0,
+    },
+  };
+}
+
 // ═══════════════════════════════════════════════════════════════
 
 async function getTableFields(baseId, tableName) {
@@ -1222,7 +1725,26 @@ export async function POST(request) {
       }
       case "run_topx": {
         if (!rule) return NextResponse.json({ error: "rule required" }, { status: 400 });
+        // If rule has Smart Compile enabled and a fresh compiled JSON, use that path.
+        // Otherwise fall through to the legacy per-record AI scoring.
+        if (rule.useSmartCompile && rule.compiledRules) {
+          const result = await runTopXSmartCompile(baseId, rule, rule.compiledRules);
+          return NextResponse.json(result);
+        }
         const result = await runTopXScoring(baseId, rule);
+        return NextResponse.json(result);
+      }
+      case "compile_topx_rules": {
+        // Body shape: { prompt, scanTarget }
+        if (!body.prompt) return NextResponse.json({ error: "prompt required" }, { status: 400 });
+        const result = await compileTopXRules(baseId, { prompt: body.prompt, scanTarget: body.scanTarget || "leads" });
+        return NextResponse.json(result);
+      }
+      case "run_topx_smart": {
+        // Body shape: { rule, compiledRules } — caller passes the (possibly user-edited) compiled JSON
+        if (!rule) return NextResponse.json({ error: "rule required" }, { status: 400 });
+        if (!body.compiledRules) return NextResponse.json({ error: "compiledRules required" }, { status: 400 });
+        const result = await runTopXSmartCompile(baseId, rule, body.compiledRules);
         return NextResponse.json(result);
       }
       default:

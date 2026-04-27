@@ -1039,7 +1039,11 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     if (rule.taskType === "linkedin_outreach") {
       fields = { Name: rule.name, Description: rule.description || "", "Task Type": "linkedin_outreach", "Outreach Config": JSON.stringify(rule.outreachConfig || {}) };
     } else if (rule.taskType === "top_x") {
-      fields = { Name: rule.name, Description: rule.description || "", "Task Type": "top_x", "Scan Target": rule.scanTarget || "leads", "Top N": rule.topN || 10, "Scoring Fields": JSON.stringify(rule.scoringFields || []), "Scoring Prompt": rule.scoringPrompt || "", Ease: rule.ease || "Medium", Strength: rule.strength || "Strong" };
+      fields = { Name: rule.name, Description: rule.description || "", "Task Type": "top_x", "Scan Target": rule.scanTarget || "leads", "Top N": rule.topN || 10, "Scoring Fields": JSON.stringify(rule.scoringFields || []), "Scoring Prompt": rule.scoringPrompt || "", Ease: rule.ease || "Medium", Strength: rule.strength || "Strong",
+        "Smart Compile": rule.smartCompile ? "true" : "false",
+        "Compiled Rules JSON": rule.compiledRules ? JSON.stringify(rule.compiledRules) : "",
+        "Compiled At": rule.compiledAt || "",
+      };
     } else {
       fields = { Name: rule.name, Description: rule.description || "", "Task Type": rule.taskType || "news", "Scan Target": rule.scanTarget || "accounts", Ease: rule.ease || "Medium", Strength: rule.strength || "Medium", Sources: (rule.sources || []).join(", "), Keywords: (rule.keywords || []).join(", "), "Job Title Keywords": (rule.jobTitleKeywords || []).join(", "), "Scoring Prompt": rule.scoringPrompt || "" };
     }
@@ -1064,14 +1068,50 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
 
   // ─── Run Top X ─────────────────────────────────────────────
   const runTopX = async (rule) => {
-    const hasPrompt = !!(rule.fields?.["Scoring Prompt"] || "").trim();
-    setScanning(true); setScanText(hasPrompt ? "🧠 Running Top X + AI scoring..." : "🎯 Running Top X scoring..."); setScanProg(30);
+    const ruleFields = rule.fields || {};
+    const hasPrompt = !!(ruleFields["Scoring Prompt"] || "").trim();
+    // Smart Compile detection: rule has Smart Compile = true AND compiled rules JSON exists
+    const smartCompileEnabled = ruleFields["Smart Compile"] === "true" || ruleFields["Smart Compile"] === true;
+    let compiledRules = null;
+    if (smartCompileEnabled && ruleFields["Compiled Rules JSON"]) {
+      try { compiledRules = JSON.parse(ruleFields["Compiled Rules JSON"]); }
+      catch (e) { console.warn("Failed to parse compiled rules JSON:", e.message); }
+    }
+    const useSmartCompile = smartCompileEnabled && compiledRules && Array.isArray(compiledRules.rules);
+
+    setScanning(true);
+    setScanText(useSmartCompile ? "⚡ Running Smart Compile (rules)..." : hasPrompt ? "🧠 Running Top X + AI scoring..." : "🎯 Running Top X scoring...");
+    setScanProg(30);
     buildSeenSet();
     try {
-      const sf = JSON.parse(rule.fields?.["Scoring Fields"] || "[]");
-      const res = await at("run_topx", "", { rule: { name: rule.fields?.Name, scanTarget: rule.fields?.["Scan Target"] || "leads", topN: rule.fields?.["Top N"] || 10, scoringFields: sf, scoringPrompt: rule.fields?.["Scoring Prompt"] || "" } }, bid);
+      const sf = JSON.parse(ruleFields["Scoring Fields"] || "[]");
+      const ruleBody = {
+        name: ruleFields.Name,
+        scanTarget: ruleFields["Scan Target"] || "leads",
+        topN: ruleFields["Top N"] || 10,
+        scoringFields: sf,
+        scoringPrompt: ruleFields["Scoring Prompt"] || "",
+        useSmartCompile,
+        compiledRules,
+      };
+      const res = await at("run_topx", "", { rule: ruleBody }, bid);
       setScanProg(70);
       const aiLabel = res.aiScored ? " (AI scored)" : "";
+      // Smart Compile metrics — surface scale info so user can see if fuzzy was capped
+      let compileLabel = "";
+      if (res.smartCompile) {
+        const sc = res.smartCompile;
+        const parts = [];
+        parts.push(`${sc.total_rules_applied} rules in ${sc.deterministic_ms}ms`);
+        if (sc.fuzzy_api_calls > 0) parts.push(`${sc.fuzzy_api_calls} AI calls (${sc.fuzzy_adjusted_count} adjusted)`);
+        if (sc.fuzzy_skipped > 0) parts.push(`⚠ ${sc.fuzzy_skipped} borderline skipped (cost cap)`);
+        compileLabel = ` [smart: ${parts.join(", ")}]`;
+      }
+      // Legacy cap warning — only shows when pure-AI mode hit the 600-record cap
+      let legacyWarning = "";
+      if (res.legacy?.skipped_at_cap > 0) {
+        legacyWarning = ` ⚠ ${res.legacy.skipped_at_cap} records skipped (legacy mode cap). Enable Smart Compile for full coverage.`;
+      }
       if (res.tasks?.length > 0) {
         const unique = res.tasks.filter(t => !isDuplicate(t, tasks));
         const duped = res.tasks.length - unique.length;
@@ -1081,7 +1121,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
           unique.forEach(t => taskSeenRef.current.add(taskFingerprint(t)));
           const cr = await at("create", "Tasks", { records: unique }, bid);
           setTasks(p => [...(cr.records || []), ...p]);
-          setScanText(`✅ ${unique.length} tasks${aiLabel} from top ${res.topN}/${res.totalRecords}${duped > 0 ? ` (${duped} dupes skipped)` : ""}`);
+          setScanText(`✅ ${unique.length} tasks${aiLabel}${compileLabel} from top ${res.topN}/${res.totalRecords}${duped > 0 ? ` (${duped} dupes skipped)` : ""}${legacyWarning}`);
         } else {
           setScanText(`✅ All ${res.tasks.length} tasks already exist (no new tasks)`);
         }
@@ -1984,7 +2024,17 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     <div key={r.id} style={{padding:16,border:"1px solid var(--bdr)",borderRadius:8,background:"var(--card)"}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}><div><div style={{fontSize:14,fontWeight:600}}>{f.Name}</div>{f.Description&&<div style={{fontSize:11,color:"var(--t3)",marginTop:2}}>{f.Description}</div>}</div><div style={{display:"flex",gap:6}}><span className={"chip "+(f["Scan Target"]==="accounts"?"cg":"cp")}>{f["Scan Target"]||"leads"}</span><span className="chip ca">TOP {f["Top N"]||10}</span></div></div>
       <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}}>{sf.map((s,i)=>(<div key={i} style={{padding:"4px 10px",background:"var(--hover)",borderRadius:4,fontSize:10}}><span style={{color:"var(--t1)"}}>{s.field}</span><span style={{color:"var(--acc)",marginLeft:6}}>{s.weight}%</span></div>))}</div>
-      <div style={{display:"flex",gap:6}}><button className="btn btn-p btn-s" onClick={()=>runTopX(r)} disabled={scanning}>{scanning?"Running…":"▶ Run"}</button><button className="btn btn-s" onClick={()=>setEditRule({airtableId:r.id,taskType:"top_x",name:f.Name,description:f.Description||"",scanTarget:f["Scan Target"]||"leads",topN:f["Top N"]||10,scoringFields:sf,ease:f.Ease||"Medium",strength:f.Strength||"Strong",scoringPrompt:f["Scoring Prompt"]||""})}>Edit</button><button className="btn btn-s" onClick={()=>duplicateRule(r)} title="Duplicate"><I.Copy/></button><button className="btn btn-d btn-s" onClick={()=>del("Task Rules",[r.id],setRules)}><I.Trash/></button></div>
+      <div style={{display:"flex",gap:6}}><button className="btn btn-p btn-s" onClick={()=>runTopX(r)} disabled={scanning}>{scanning?"Running…":"▶ Run"}</button><button className="btn btn-s" onClick={()=>{
+        // Parse compiled rules JSON if present
+        let compiledRules = null;
+        try { if (f["Compiled Rules JSON"]) compiledRules = JSON.parse(f["Compiled Rules JSON"]); } catch {}
+        setEditRule({airtableId:r.id,taskType:"top_x",name:f.Name,description:f.Description||"",scanTarget:f["Scan Target"]||"leads",topN:f["Top N"]||10,scoringFields:sf,ease:f.Ease||"Medium",strength:f.Strength||"Strong",scoringPrompt:f["Scoring Prompt"]||"",
+          smartCompile: f["Smart Compile"]==="true"||f["Smart Compile"]===true,
+          compiledRules,
+          compiledAt: f["Compiled At"] || null,
+          baseId: bid,
+        });
+      }}>Edit</button><button className="btn btn-s" onClick={()=>duplicateRule(r)} title="Duplicate"><I.Copy/></button><button className="btn btn-d btn-s" onClick={()=>del("Task Rules",[r.id],setRules)}><I.Trash/></button></div>
     </div>)})}</div>
   </div>)}
   </>}</div>)}
@@ -6132,7 +6182,19 @@ function RuleEditor({rule,onSave,onClose,availableFields}){
 
   // Signal + Top X fields
   const [f,sF]=useState({airtableId:rule.airtableId||null,name:rule.name||"",description:rule.description||"",taskType:rule.taskType||"news",scanTarget:rule.scanTarget||(isTopX?"leads":"accounts"),ease:rule.ease||"Medium",strength:rule.strength||"Medium",sources:rule.sources||["News"],keywords:rule.keywords||[],jobTitleKeywords:rule.jobTitleKeywords||[],scoringPrompt:rule.scoringPrompt||"",
-    topN:rule.topN||10,scoringFields:rule.scoringFields||[]});
+    topN:rule.topN||10,scoringFields:rule.scoringFields||[],
+    smartCompile:rule.smartCompile||false,compiledRules:rule.compiledRules||null,compiledAt:rule.compiledAt||null,compileStatus:rule.compileStatus||"missing"});
+
+  // Smart Compile UI state
+  const [compiling, setCompiling] = useState(false);
+  const [compileErr, setCompileErr] = useState("");
+  const [compileWarnings, setCompileWarnings] = useState([]);
+  const [showCompiledJSON, setShowCompiledJSON] = useState(false);
+  const [editedJSON, setEditedJSON] = useState(""); // raw text in the JSON editor
+  const [jsonParseErr, setJsonParseErr] = useState("");
+  // When prompt changes after compile, mark stale
+  const [lastCompiledPrompt, setLastCompiledPrompt] = useState(rule.scoringPrompt || "");
+  const promptIsStale = f.smartCompile && f.compiledRules && f.scoringPrompt.trim() !== lastCompiledPrompt.trim();
 
   // Outreach config
   const [oc, setOc] = useState(rule.outreachConfig || {
@@ -6252,6 +6314,147 @@ function RuleEditor({rule,onSave,onClose,availableFields}){
       <div>💡 <strong style={{color:"var(--t2)"}}>Tip:</strong> The more specific you are about thresholds and weights, the more consistent the scores. E.g. "Score 90+ if ACV &gt; 8 AND relevance &gt; 7" beats "score high if they look good".</div>
     </div>
     <textarea className="inp ta" value={f.scoringPrompt} onChange={e=>sF(p=>({...p,scoringPrompt:e.target.value}))} placeholder={"Score leads 0-100 based on fit for our product.\n\nScoring tiers:\n• 80-100: High ACV (7+), strong relevance (7+), large teams\n• 60-79: Moderate ACV, good relevance, mid-size teams\n• 40-59: Mixed signals, worth nurturing\n• Below 40: Weak fit, deprioritize\n\nOverride: If relevance < 3, cap at 30. If ACV > 8 AND relevance > 7, add +10 bonus."} style={{minHeight:100,fontSize:11,background:"var(--card)"}}/>
+  </div>
+
+  {/* ─── SMART COMPILE PANEL ───
+      Lets the user opt into the rules-extraction flow. AI reads the prompt once,
+      extracts deterministic rules, then JS scores all records without further AI calls.
+      Vastly cheaper and faster for large lead lists, especially when criteria are pattern-based.
+   */}
+  <div style={{padding:14,border:"1px solid rgba(93,168,122,.25)",borderRadius:8,background:"rgba(93,168,122,.04)",marginTop:14}}>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
+      <div style={{display:"flex",alignItems:"center",gap:8}}>
+        <span>⚡</span>
+        <span style={{fontSize:11,fontWeight:600,color:"var(--grn)"}}>SMART COMPILE</span>
+        <span style={{fontSize:9,color:"var(--t3)",fontWeight:400,padding:"2px 6px",background:"var(--hover)",borderRadius:3}}>BETA</span>
+      </div>
+      <label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",fontSize:11,color:"var(--t2)"}}>
+        <input type="checkbox" checked={f.smartCompile} onChange={e=>sF(p=>({...p,smartCompile:e.target.checked}))}/>
+        Enable for this rule
+      </label>
+    </div>
+    <div style={{fontSize:10,color:"var(--t3)",marginBottom:10,lineHeight:1.5}}>
+      Instead of calling AI on every record, AI reads your prompt <strong>once</strong> and extracts deterministic rules. JS scores all records in milliseconds.
+      Best for large lists (500+) where prompt is mostly pattern-matching. AI fallback handles fuzzy criteria.
+    </div>
+
+    {f.smartCompile && (<>
+      {!f.scoringPrompt.trim() ? (
+        <div style={{fontSize:10,color:"var(--amb)",padding:8,background:"rgba(191,163,90,.08)",borderRadius:4}}>
+          ⚠️ Write your scoring prompt above first, then click Compile.
+        </div>
+      ) : (<>
+        {/* Compile / Recompile button */}
+        <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:10,flexWrap:"wrap"}}>
+          <button className="btn btn-ai btn-s" disabled={compiling||!f.scoringPrompt.trim()} onClick={async()=>{
+            setCompiling(true); setCompileErr(""); setCompileWarnings([]);
+            try {
+              const res = await fetch("/api/airtable", {
+                method:"POST", headers:{"Content-Type":"application/json"},
+                body: JSON.stringify({ action:"compile_topx_rules", baseId: rule.baseId || undefined, prompt: f.scoringPrompt, scanTarget: f.scanTarget }),
+              });
+              const d = await res.json();
+              if (d.error) { setCompileErr(d.error); }
+              else if (d.ok && d.compiled) {
+                sF(p => ({...p, compiledRules: d.compiled, compiledAt: d.compiled.compiled_at, compileStatus: "fresh"}));
+                setLastCompiledPrompt(f.scoringPrompt);
+                setEditedJSON(JSON.stringify(d.compiled, null, 2));
+                setShowCompiledJSON(true);
+                if (d.warnings?.length) setCompileWarnings(d.warnings);
+              }
+            } catch (e) { setCompileErr(e.message); }
+            setCompiling(false);
+          }}>
+            {compiling ? "⏳ Compiling..." : f.compiledRules ? <><I.Sparkle/> Recompile</> : <><I.Sparkle/> Compile to Rules</>}
+          </button>
+          {f.compiledRules && (
+            <button className="btn btn-s" onClick={()=>{
+              setEditedJSON(JSON.stringify(f.compiledRules, null, 2));
+              setShowCompiledJSON(s=>!s);
+            }}>
+              {showCompiledJSON ? "Hide" : "View"} compiled rules ({f.compiledRules.rules?.length || 0})
+            </button>
+          )}
+          {f.compiledAt && (
+            <span style={{fontSize:9,color:"var(--t3)"}}>Compiled {new Date(f.compiledAt).toLocaleString()}</span>
+          )}
+        </div>
+
+        {compileErr && (
+          <div style={{fontSize:10,color:"var(--red)",padding:8,background:"rgba(239,68,68,.08)",borderRadius:4,marginBottom:8}}>
+            ❌ {compileErr}
+          </div>
+        )}
+
+        {compileWarnings.length > 0 && (
+          <div style={{fontSize:10,color:"var(--amb)",padding:8,background:"rgba(191,163,90,.08)",borderRadius:4,marginBottom:8}}>
+            ⚠️ Compile warnings:
+            {compileWarnings.map((w,i)=><div key={i} style={{marginTop:2}}>• {w}</div>)}
+          </div>
+        )}
+
+        {promptIsStale && f.compiledRules && (
+          <div style={{fontSize:10,color:"var(--amb)",padding:8,background:"rgba(191,163,90,.08)",borderRadius:4,marginBottom:8}}>
+            ⚠️ Prompt has changed since last compile. Click Recompile to refresh rules, or run with stale rules.
+          </div>
+        )}
+
+        {/* Compiled rules JSON editor */}
+        {showCompiledJSON && f.compiledRules && (
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:10,color:"var(--t2)",marginBottom:6,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <span>📜 Compiled rules — edit if needed, then save</span>
+              <div style={{display:"flex",gap:6}}>
+                <button className="btn btn-s" onClick={()=>{
+                  try {
+                    const parsed = JSON.parse(editedJSON);
+                    if (!Array.isArray(parsed.rules)) throw new Error("Missing 'rules' array");
+                    sF(p=>({...p, compiledRules: parsed}));
+                    setJsonParseErr("");
+                  } catch (e) { setJsonParseErr(e.message); }
+                }}>Save edits</button>
+                <button className="btn btn-s" onClick={()=>{
+                  setEditedJSON(JSON.stringify(f.compiledRules, null, 2));
+                  setJsonParseErr("");
+                }}>Reset</button>
+              </div>
+            </div>
+            <textarea
+              className="inp ta"
+              value={editedJSON}
+              onChange={e=>setEditedJSON(e.target.value)}
+              style={{minHeight:200,fontSize:10,fontFamily:"'JetBrains Mono',monospace",background:"var(--card)"}}
+              spellCheck={false}
+            />
+            {jsonParseErr && <div style={{fontSize:10,color:"var(--red)",marginTop:4}}>JSON error: {jsonParseErr}</div>}
+
+            {/* Quick rule summary for non-JSON-readers */}
+            <div style={{marginTop:10,padding:10,background:"var(--hover)",borderRadius:4,fontSize:10,color:"var(--t2)",lineHeight:1.6}}>
+              <div style={{fontWeight:600,marginBottom:4,color:"var(--t1)"}}>📊 Rule summary</div>
+              {(f.compiledRules.rules || []).map((r,i)=>(
+                <div key={i} style={{marginBottom:3}}>
+                  <span style={{color:r.score_contribution >= 0 ? "var(--grn)" : "var(--red)"}}>
+                    {r.score_contribution >= 0 ? "+" : ""}{r.score_contribution}
+                  </span>
+                  {" "}<span style={{color:"var(--t3)"}}>if</span> <strong>{r.field}</strong> {r.operator} {r.values ? r.values.slice(0,3).join(", ") + (r.values.length>3?"...":"") : r.value || (r.min!==undefined?`${r.min}-${r.max}`:"")}
+                  {r.partial_credit && <span style={{color:"var(--t3)"}}> (partial: {Object.entries(r.partial_credit).map(([k,v])=>`${k}=${v}`).join(", ")})</span>}
+                </div>
+              ))}
+              {f.compiledRules.fuzzy_check?.enabled && (
+                <div style={{marginTop:6,paddingTop:6,borderTop:"1px solid var(--bdr)"}}>
+                  <span style={{color:"var(--pur)"}}>🤖 Fuzzy AI check</span> on borderline candidates ({f.compiledRules.fuzzy_check.trigger_when_deterministic_score_between?.[0] || 40}-{f.compiledRules.fuzzy_check.trigger_when_deterministic_score_between?.[1] || 80}): {f.compiledRules.fuzzy_check.criterion?.slice(0,120)}
+                </div>
+              )}
+              {f.compiledRules.notes && (
+                <div style={{marginTop:6,paddingTop:6,borderTop:"1px solid var(--bdr)",fontStyle:"italic",color:"var(--t3)"}}>
+                  📝 {f.compiledRules.notes}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </>)}
+    </>)}
   </div>
   </>)}
 
