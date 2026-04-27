@@ -1237,6 +1237,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     null,
     {id:"outreach",label:"💬 LinkedIn Automation",count:null},
     {id:"linkedin_posts",label:"📝 LinkedIn Posts",count:null},
+    {id:"triggers",label:"🔥 Triggers",count:null},
     {id:"email_campaign",label:"📧 Email Campaign",count:null},
     {id:"google_analytics",label:"📊 Google Analytics",count:null},
     {id:"hubspot",label:"🔗 HubSpot",count:null},
@@ -1798,6 +1799,9 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
 
   {/* ════ EMAIL CAMPAIGN ════ */}
   {tab==="email_campaign"&&!loading&&(<EmailCampaignTab baseId={bid} campaign={camp} leads={leads} prefilledLeadId={emailPrefilledLeadId} />)}
+
+  {/* ════ TRIGGERS ════ */}
+  {tab==="triggers"&&!loading&&(<TriggersTab baseId={bid} campaign={camp} />)}
 
   {/* ════ COMING SOON ════ */}
   {tab==="coming_soon"&&(<div>
@@ -4297,6 +4301,190 @@ function LinkedInPostsTab({ baseId, campaign, leads, onCampaignProvisioned }) {
       </div>
     </div>
   );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// TRIGGERS TAB — Unified view of GA + Unipile + LinkedIn Posts triggers
+// ═══════════════════════════════════════════════════════════════
+function TriggersTab({ baseId, campaign }) {
+  const [loading, setLoading] = useState(true);
+  const [status, setStatus] = useState(null);
+  const [triggers, setTriggers] = useState([]);
+  const [sourceFilter, setSourceFilter] = useState("all"); // all | Unipile | GA | LinkedIn Posts (RapidAPI)
+  const [windowDays, setWindowDays] = useState(7);
+  const [polling, setPolling] = useState(false);
+  const [pollResult, setPollResult] = useState(null);
+  const [err, setErr] = useState("");
+
+  const upiAPI = async (action, body = {}) => {
+    const r = await fetch(`/api/unipile-triggers?action=${action}&base=${baseId}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body }),
+    });
+    return r.json();
+  };
+
+  const loadStatus = async () => {
+    try {
+      const r = await fetch(`/api/unipile-triggers?action=status&base=${baseId}`);
+      const d = await r.json();
+      setStatus(d);
+    } catch (e) { setErr(e.message); }
+  };
+
+  const loadTriggers = async () => {
+    setLoading(true);
+    setErr("");
+    try {
+      const since = new Date(Date.now() - windowDays * 86400000).toISOString();
+      const r = await fetch(`/api/unipile-triggers?action=list_triggers&base=${baseId}&since=${encodeURIComponent(since)}`);
+      const d = await r.json();
+      if (d.ok) setTriggers(d.triggers || []);
+      else setErr(d.error || "Failed to load triggers");
+    } catch (e) { setErr(e.message); }
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    loadStatus();
+    loadTriggers();
+  }, [baseId, windowDays]);
+
+  const runPoll = async () => {
+    setPolling(true); setPollResult(null);
+    try {
+      const r = await upiAPI("manual_poll");
+      setPollResult(r);
+      await loadTriggers();
+    } catch (e) { setErr(e.message); }
+    setPolling(false);
+  };
+
+  // Group triggers by source for the dashboard cards
+  const filteredTriggers = sourceFilter === "all"
+    ? triggers
+    : triggers.filter(t => t.task_type?.startsWith(sourceFilter.toLowerCase()));
+
+  const counts = {
+    all: triggers.length,
+    unipile: triggers.filter(t => t.task_type?.startsWith("unipile_")).length,
+    ga: triggers.filter(t => t.task_type?.startsWith("ga_") || t.task_type?.includes("page_view")).length,
+    posts: triggers.filter(t => t.task_type === "linkedin_engagement").length,
+  };
+
+  const triggerTypeLabels = {
+    unipile_message_reply: "📬 DM Reply",
+    unipile_connection_accepted: "🤝 Connection Accepted",
+    unipile_post_comment_on_yours: "💬 Comment on your Post",
+    unipile_post_reaction_on_yours: "👍 Reaction on your Post",
+    unipile_profile_view: "👀 Profile View",
+    linkedin_engagement: "📝 LinkedIn Post Score",
+  };
+
+  return (<div>
+    <div className="ph">
+      <div>
+        <div className="pt">🔥 Triggers</div>
+        <div className="pd">Unified live feed of buying signals across Unipile, GA, and LinkedIn Posts</div>
+      </div>
+      <div style={{display:"flex",gap:8}}>
+        <button className="btn btn-s" onClick={loadTriggers} disabled={loading}>{loading ? "Loading..." : "↻ Refresh"}</button>
+        <button className="btn btn-p" onClick={runPoll} disabled={polling}>{polling ? "Polling..." : "🔄 Poll Unipile Now"}</button>
+      </div>
+    </div>
+
+    {err && <div style={{padding:12,background:"rgba(239,68,68,.08)",border:"1px solid var(--red)",borderRadius:6,color:"var(--red)",marginBottom:12,fontSize:11}}>❌ {err}</div>}
+
+    {/* Status row: account count, lead index size, webhook URL */}
+    {status && (
+      <div style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,marginBottom:14}}>
+        <div style={{display:"flex",gap:24,flexWrap:"wrap",alignItems:"center",fontSize:11,color:"var(--t2)"}}>
+          <div><span style={{color:"var(--t3)"}}>Unipile:</span> <strong style={{color:status.unipile_connected?"var(--grn)":"var(--red)"}}>{status.unipile_connected ? "✓ Connected" : "✗ Not connected"}</strong></div>
+          <div><span style={{color:"var(--t3)"}}>Accounts:</span> <strong style={{color:"var(--t1)"}}>{status.accounts_count || 0}</strong></div>
+          <div><span style={{color:"var(--t3)"}}>Leads indexed:</span> <strong style={{color:"var(--t1)"}}>{status.leads_indexed || 0}</strong></div>
+        </div>
+        {status.webhook_url && (
+          <details style={{marginTop:10,fontSize:10,color:"var(--t3)"}}>
+            <summary style={{cursor:"pointer"}}>📡 Webhook setup (paste this URL into Unipile)</summary>
+            <div style={{marginTop:8,padding:10,background:"var(--hover)",borderRadius:4,fontFamily:"'JetBrains Mono',monospace",wordBreak:"break-all",color:"var(--t2)"}}>{status.webhook_url}</div>
+            <div style={{marginTop:6,fontSize:10}}>Replace YOUR_CRON_SECRET with your CRON_SECRET env var. Configure in Unipile → Webhooks → New webhook for events: <code>message.received</code>, <code>users.relations.created</code>, <code>post.commented</code></div>
+          </details>
+        )}
+      </div>
+    )}
+
+    {pollResult && (
+      <div style={{padding:12,background:pollResult.ok?"rgba(93,168,122,.08)":"rgba(239,68,68,.08)",border:"1px solid "+(pollResult.ok?"var(--grn)":"var(--red)"),borderRadius:6,marginBottom:14,fontSize:11,color:"var(--t2)"}}>
+        {pollResult.ok ? (
+          <div>
+            ✅ Poll complete — {pollResult.accounts_checked} accounts checked, {pollResult.profile_views_processed} profile views, {pollResult.reactions_processed} reactions, {pollResult.tasks_created} new tasks ({pollResult.skipped_dupes} duplicates skipped).
+            {pollResult.errors?.length > 0 && <div style={{marginTop:6,color:"var(--amb)"}}>⚠ {pollResult.errors.length} errors during poll</div>}
+          </div>
+        ) : (
+          <div>❌ {pollResult.error || "Poll failed"}</div>
+        )}
+      </div>
+    )}
+
+    {/* Source filter pills + window selector */}
+    <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap",alignItems:"center"}}>
+      {[
+        {id:"all",label:"All",count:counts.all},
+        {id:"unipile",label:"🔗 Unipile",count:counts.unipile},
+        {id:"ga",label:"📊 GA",count:counts.ga},
+        {id:"posts",label:"📝 Posts",count:counts.posts},
+      ].map(p => (
+        <button key={p.id} onClick={()=>setSourceFilter(p.id)} className="btn btn-s" style={sourceFilter===p.id ? {background:"var(--amb)",color:"var(--bg)",borderColor:"var(--amb)"} : {}}>
+          {p.label} <span style={{opacity:0.6,marginLeft:4}}>({p.count})</span>
+        </button>
+      ))}
+      <div style={{marginLeft:"auto",fontSize:11,color:"var(--t3)"}}>
+        Window: 
+        <select value={windowDays} onChange={e=>setWindowDays(Number(e.target.value))} style={{marginLeft:6,padding:"4px 8px",background:"var(--card)",border:"1px solid var(--bdr)",color:"var(--t1)",borderRadius:4,fontSize:11}}>
+          <option value={1}>Last 24h</option>
+          <option value={7}>Last 7 days</option>
+          <option value={30}>Last 30 days</option>
+        </select>
+      </div>
+    </div>
+
+    {/* Triggers feed */}
+    {loading ? (
+      <div style={{padding:40,textAlign:"center",color:"var(--t3)"}}>Loading triggers...</div>
+    ) : filteredTriggers.length === 0 ? (
+      <div style={{padding:40,textAlign:"center",color:"var(--t3)",border:"1px dashed var(--bdr)",borderRadius:8}}>
+        <div style={{fontSize:24,marginBottom:8}}>🤷</div>
+        <div>No triggers in this window.</div>
+        <div style={{fontSize:10,marginTop:6}}>Try clicking <strong>Poll Unipile Now</strong> or extend the time window above.</div>
+      </div>
+    ) : (
+      <div style={{display:"flex",flexDirection:"column",gap:10}}>
+        {filteredTriggers.map(t => (
+          <div key={t.id} style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,marginBottom:8}}>
+              <div>
+                <div style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>{t.name || "Unknown lead"}</div>
+                <div style={{fontSize:11,color:"var(--t3)"}}>{t.company || ""}{t.created ? ` · ${new Date(t.created).toLocaleString()}` : ""}</div>
+              </div>
+              <div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}>
+                <span style={{padding:"3px 8px",background:"var(--hover)",borderRadius:4,fontSize:10,color:"var(--t2)"}}>{triggerTypeLabels[t.task_type] || t.task_type}</span>
+                <span style={{padding:"3px 8px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:4,fontSize:11,fontWeight:600,color:t.score >= 80 ? "var(--grn)" : t.score >= 50 ? "var(--amb)" : "var(--t2)",fontFamily:"'JetBrains Mono',monospace"}}>{t.score || 0}</span>
+              </div>
+            </div>
+            {t.signal && (
+              <div style={{padding:10,background:"var(--hover)",borderRadius:4,fontSize:10,color:"var(--t2)",whiteSpace:"pre-wrap",lineHeight:1.5,maxHeight:140,overflow:"auto"}}>{t.signal.slice(0, 600)}{t.signal.length > 600 ? "..." : ""}</div>
+            )}
+            {t.url && (
+              <div style={{marginTop:8,fontSize:10}}>
+                <a href={t.url} target="_blank" rel="noreferrer" style={{color:"var(--blu)"}}>🔗 view source →</a>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    )}
+  </div>);
 }
 
 // ═══════════════════════════════════════════════════════════════
