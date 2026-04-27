@@ -104,6 +104,16 @@ const FIELD_TYPE_MAP = {
   "Signal": { type: "multilineText" },
   "Tables": { type: "multilineText" },
   "Notes": { type: "multilineText" },
+  // Common lead-content fields that tend to be long-form. Created as multilineText
+  // so they display correctly in Airtable instead of as truncated single-line text.
+  "Lead Summary": { type: "multilineText" },
+  "Lead Description": { type: "multilineText" },
+  "Lead Relevance Score Reason": { type: "multilineText" },
+  "Lead Relevance Score": { type: "number", options: { precision: 1 } },
+  "About": { type: "multilineText" },
+  "Headline": { type: "multilineText" },
+  "Bio": { type: "multilineText" },
+  "Reasoning": { type: "multilineText" },
 };
 
 async function autoEnsureFields(baseId, table, records) {

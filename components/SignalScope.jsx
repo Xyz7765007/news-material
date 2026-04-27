@@ -919,6 +919,19 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     }).filter(r => Object.keys(r).length > (tag ? 1 : 0)); // don't count only-tag records
     if (!recs.length) { setCsvModal(null); return; }
 
+    // Client-side chunking. Vercel Hobby has a 4.5MB request body limit. A typical lead
+    // record is 1-15KB once you count Lead Summary + Description + reasoning fields.
+    // With ~1500 leads × ~3.5KB = ~5MB → exceeds the limit. Chunking at 50 records per
+    // request keeps each payload safely under 1MB even for very heavy lead data.
+    // The backend already batches Airtable PATCH/POST internally at 10/call, so this
+    // outer chunk size only affects the Vercel function payload, not Airtable rate limits.
+    const CHUNK_SIZE = 50;
+    const chunkArray = (arr, size) => {
+      const chunks = [];
+      for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
+      return chunks;
+    };
+
     try {
       // Use local prepping state instead of global setLoading. Global setLoading hides the
       // entire tab (because every tab has `tab===X && !loading && (...)`), which makes the
@@ -972,48 +985,78 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
           }
         }
 
-        // Update matched records
+        // Update matched records — chunked to avoid Vercel's 4.5MB request body limit
         let updateErrors = [];
+        let updatedCount = 0;
         if (matched.length > 0) {
-          try {
-            const res = await at("update", table, { records: matched }, bid);
-            const updatedMap = {};
-            (res.records || []).forEach(r => { updatedMap[r.id] = r; });
-            setter(p => p.map(r => updatedMap[r.id] ? { ...r, fields: { ...r.fields, ...updatedMap[r.id].fields } } : r));
-          } catch (e) {
-            updateErrors.push(e.message);
+          const chunks = chunkArray(matched, CHUNK_SIZE);
+          for (let i = 0; i < chunks.length; i++) {
+            // Update progress toast so user sees we're not hung
+            setCsvUploadResult({ msg: `Uploading: updated ${updatedCount}/${matched.length}, creating ${unmatched.length} new...`, isError: false, isProgress: true });
+            try {
+              const res = await at("update", table, { records: chunks[i] }, bid);
+              const updatedMap = {};
+              (res.records || []).forEach(r => { updatedMap[r.id] = r; });
+              setter(p => p.map(r => updatedMap[r.id] ? { ...r, fields: { ...r.fields, ...updatedMap[r.id].fields } } : r));
+              updatedCount += res.records?.length || 0;
+            } catch (e) {
+              updateErrors.push(`chunk ${i + 1}/${chunks.length}: ${e.message}`);
+              // Don't bail — keep going so partial success isn't lost
+            }
           }
         }
 
-        // Create unmatched as new records (if any)
+        // Create unmatched as new records (if any) — also chunked
         let createErrors = [];
+        let createdCount = 0;
         if (unmatched.length > 0) {
-          try {
-            const res = await at("create", table, { records: unmatched }, bid);
-            setter(p => [...p, ...(res.records || [])]);
-          } catch (e) {
-            createErrors.push(e.message);
+          const chunks = chunkArray(unmatched, CHUNK_SIZE);
+          for (let i = 0; i < chunks.length; i++) {
+            setCsvUploadResult({ msg: `Uploading: ${updatedCount} updated, creating ${createdCount}/${unmatched.length}...`, isError: false, isProgress: true });
+            try {
+              const res = await at("create", table, { records: chunks[i] }, bid);
+              setter(p => [...p, ...(res.records || [])]);
+              createdCount += res.records?.length || 0;
+            } catch (e) {
+              createErrors.push(`chunk ${i + 1}/${chunks.length}: ${e.message}`);
+            }
           }
         }
 
         // Tell the user what happened — was failing silently before
         const summary = [];
-        if (matched.length > 0) summary.push(`${matched.length} updated`);
-        if (unmatched.length > 0) summary.push(`${unmatched.length} created (no match by ${matchField})`);
+        if (updatedCount > 0) summary.push(`${updatedCount} updated`);
+        if (createdCount > 0) summary.push(`${createdCount} created (no match by ${matchField})`);
         if (skippedNoMatchValue.length > 0) summary.push(`${skippedNoMatchValue.length} skipped (blank ${matchField} field)`);
-        if (updateErrors.length > 0) summary.push(`UPDATE FAILED: ${updateErrors[0]}`);
-        if (createErrors.length > 0) summary.push(`CREATE FAILED: ${createErrors[0]}`);
+        if (updateErrors.length > 0) summary.push(`${updateErrors.length} update chunks failed: ${updateErrors[0].slice(0, 80)}`);
+        if (createErrors.length > 0) summary.push(`${createErrors.length} create chunks failed: ${createErrors[0].slice(0, 80)}`);
         const msg = `CSV ${mode}: ${summary.join(", ")}`;
         console.log(`[CSV Update]`, msg);
         // Inline notification — show for 8 sec so user has time to read
         setCsvUploadResult({ msg, isError: updateErrors.length + createErrors.length > 0 });
-        setTimeout(() => setCsvUploadResult(null), 8000);
+        setTimeout(() => setCsvUploadResult(null), 12000);
       } else {
-        // ─── Normal create ───
-        const res = await at("create", table, { records: recs }, bid);
-        setter(p => [...p, ...(res.records || [])]);
-        setCsvUploadResult({ msg: `CSV create: ${recs.length} new ${table.toLowerCase()} created`, isError: false });
-        setTimeout(() => setCsvUploadResult(null), 6000);
+        // ─── Normal create — chunked to avoid Vercel 4.5MB body limit ───
+        const chunks = chunkArray(recs, CHUNK_SIZE);
+        let createdCount = 0;
+        const errors = [];
+        for (let i = 0; i < chunks.length; i++) {
+          setCsvUploadResult({ msg: `Uploading: ${createdCount}/${recs.length} ${table.toLowerCase()} created...`, isError: false, isProgress: true });
+          try {
+            const res = await at("create", table, { records: chunks[i] }, bid);
+            setter(p => [...p, ...(res.records || [])]);
+            createdCount += res.records?.length || 0;
+          } catch (e) {
+            errors.push(`chunk ${i + 1}/${chunks.length}: ${e.message}`);
+          }
+        }
+        if (errors.length > 0) {
+          setCsvUploadResult({ msg: `Created ${createdCount}/${recs.length}. ${errors.length} chunks failed: ${errors[0].slice(0, 100)}`, isError: true });
+          setTimeout(() => setCsvUploadResult(null), 12000);
+        } else {
+          setCsvUploadResult({ msg: `CSV create: ${createdCount} new ${table.toLowerCase()} created`, isError: false });
+          setTimeout(() => setCsvUploadResult(null), 6000);
+        }
       }
 
       fetchAvailableFields();
@@ -2735,16 +2778,21 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     </div>
   )}
 
-  {/* CSV upload prep indicator — shows during fetch-fresh-records prep AND during upload */}
-  {csvPrepping&&(<div style={{position:"fixed",top:20,right:20,zIndex:9998,padding:12,maxWidth:340,background:"rgba(91,143,212,.95)",color:"white",borderRadius:8,fontSize:11,boxShadow:"0 4px 12px rgba(0,0,0,.3)"}}>
+  {/* CSV upload prep indicator — shows only during the pre-modal fetch phase.
+      During the actual upload, the csvUploadResult toast shows progress instead. */}
+  {csvPrepping && !csvUploadResult && (<div style={{position:"fixed",top:20,right:20,zIndex:9998,padding:12,maxWidth:340,background:"rgba(91,143,212,.95)",color:"white",borderRadius:8,fontSize:11,boxShadow:"0 4px 12px rgba(0,0,0,.3)"}}>
     ⏳ Working on CSV — fetching latest records and applying changes...
   </div>)}
 
   {/* CSV upload result toast — shows match/create counts after upload */}
-  {csvUploadResult&&(<div style={{position:"fixed",top:20,right:20,zIndex:9999,padding:14,maxWidth:480,background:csvUploadResult.isError?"rgba(239,68,68,.95)":"rgba(93,168,122,.95)",color:"white",borderRadius:8,fontSize:12,boxShadow:"0 4px 12px rgba(0,0,0,.3)",lineHeight:1.4}}>
+  {csvUploadResult&&(<div style={{position:"fixed",top:20,right:20,zIndex:9999,padding:14,maxWidth:480,
+      background: csvUploadResult.isError ? "rgba(239,68,68,.95)" : csvUploadResult.isProgress ? "rgba(91,143,212,.95)" : "rgba(93,168,122,.95)",
+      color:"white",borderRadius:8,fontSize:12,boxShadow:"0 4px 12px rgba(0,0,0,.3)",lineHeight:1.4}}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10}}>
-      <div>{csvUploadResult.isError?"❌ ":"✅ "}{csvUploadResult.msg}</div>
-      <button onClick={()=>setCsvUploadResult(null)} style={{background:"transparent",border:"none",color:"white",cursor:"pointer",fontSize:14,padding:0,lineHeight:1}}>✕</button>
+      <div>{csvUploadResult.isError ? "❌ " : csvUploadResult.isProgress ? "⏳ " : "✅ "}{csvUploadResult.msg}</div>
+      {!csvUploadResult.isProgress && (
+        <button onClick={()=>setCsvUploadResult(null)} style={{background:"transparent",border:"none",color:"white",cursor:"pointer",fontSize:14,padding:0,lineHeight:1}}>✕</button>
+      )}
     </div>
   </div>)}
 
@@ -6770,23 +6818,74 @@ function ExportModal({ tasks, accounts, leads, onClose }) {
   });
 
   // Lookup maps for enrichment — multi-key to handle both account and lead-targeted tasks
-  // For lead-targeted Top X: task.Company = lead's Name (person name)
-  // For account-targeted scans: task.Company = account's Name (company name)
+  // For lead-targeted Top X: task.Company = lead's Company name (the company the lead works at)
+  // For account-targeted scans: task.Company = account's Name (the company itself)
+  // Some legacy tasks may have task.Company = lead's name (older bug). We index by all keys
+  // to handle every case.
+  //
+  // Normalization helpers — same as cross-ref matching for consistency
+  const normalizeMatch = (v) => {
+    if (v === null || v === undefined) return "";
+    let s = Array.isArray(v) ? v.join(",") : (typeof v === "object" ? (v.id || v.name || "") : String(v));
+    return s.toLowerCase().replace(/\s+/g, " ").trim();
+  };
+  const normalizeDomain = (v) => {
+    if (!v) return "";
+    let s = String(v).toLowerCase().trim();
+    s = s.replace(/^https?:\/\//, "").replace(/^www\./, "");
+    s = s.split("/")[0].split("?")[0].split("#")[0].split(":")[0];
+    return s.replace(/\.$/, "");
+  };
+
+  // Account index — by name AND by domain/website
   const acctMap = {};
+  const acctByDomain = {};
   (accounts || []).forEach(a => {
-    const n = (a.fields?.Name || "").toLowerCase().trim();
+    const n = normalizeMatch(a.fields?.Name);
     if (n) acctMap[n] = a.fields;
+    const dom = normalizeDomain(a.fields?.Domain || a.fields?.["Company Domain"] || a.fields?.Website || a.fields?.["Company website"] || a.fields?.["Company Website"]);
+    if (dom && !acctByDomain[dom]) acctByDomain[dom] = a.fields;
   });
 
-  // Lead lookup by BOTH Name (person) and Company - so we match regardless of what task.Company contains
+  // Lead index — by Name (person), by Company (their employer), by Email domain, by LinkedIn URL.
+  // Field name detection is permissive because real-world Airtable schemas vary:
+  //   - "Company" vs "Company Name" vs "Account"
+  //   - "Domain" vs "Company Domain" vs "Website" vs "Company website"
+  //   - "LinkedIn URL" vs "Linkedin URL" vs "Lead Linkedin"
   const leadByName = {};
   const leadByCompany = {};
+  const leadByDomain = {};
+  const leadByLinkedIn = {};
   (leads || []).forEach(l => {
-    const name = (l.fields?.Name || "").toLowerCase().trim();
-    const company = (l.fields?.Company || "").toLowerCase().trim();
-    if (name) leadByName[name] = l.fields;
-    if (company && !leadByCompany[company]) leadByCompany[company] = l.fields;
+    const f = l.fields || {};
+    const name = normalizeMatch(f.Name || f["Full Name"] || f["Lead: Full Name"]);
+    const company = normalizeMatch(f.Company || f["Company Name"] || f.Account);
+    if (name) leadByName[name] = f;
+    if (company && !leadByCompany[company]) leadByCompany[company] = f;
+    // Domain index — try several common field names AND email fallback
+    const domSrc = f.Domain || f["Company Domain"] || f.Website || f["Company website"] || f["Company Website"] || (f.Email ? f.Email.split("@")[1] : "");
+    const dom = normalizeDomain(domSrc);
+    if (dom && !leadByDomain[dom]) leadByDomain[dom] = f;
+    const li = normalizeMatch(f["LinkedIn URL"] || f["Linkedin URL"] || f["Lead Linkedin"] || f["Lead LinkedIn"]);
+    if (li) leadByLinkedIn[li] = f;
   });
+
+  // Coverage stats — show before export so user can see if enrichment is going to work
+  const enrichmentCoverage = (() => {
+    if (!leads.length && !accounts.length) return { leadHits: 0, acctHits: 0, total: tasks.length };
+    let leadHits = 0, acctHits = 0;
+    tasks.forEach(t => {
+      const f = t.fields || {};
+      const co = normalizeMatch(f.Company);
+      const nm = normalizeMatch(f.Name);
+      const li = normalizeMatch(f["LinkedIn URL"] || f.URL);
+      const em = f.Email || "";
+      const emDom = em ? normalizeDomain(em.split("@")[1] || "") : "";
+      if (leadByName[nm] || leadByCompany[co] || leadByName[co] || (li && leadByLinkedIn[li]) || (emDom && leadByDomain[emDom])) leadHits++;
+      if (acctMap[co] || (emDom && acctByDomain[emDom])) acctHits++;
+    });
+    return { leadHits, acctHits, total: tasks.length };
+  })();
 
   const allExportCols = [...selectedCols, ...enrichAcct.map(c => "Acct: " + c), ...enrichLead.map(c => "Lead: " + c)];
   const enrichCount = enrichAcct.length + enrichLead.length;
@@ -6794,21 +6893,34 @@ function ExportModal({ tasks, accounts, leads, onClose }) {
   const doExport = () => {
     if (!filteredTasks.length || !allExportCols.length) return;
     const csvRows = [allExportCols.map(c => '"' + c.replace(/"/g, '""') + '"').join(",")];
+    let leadEnriched = 0, acctEnriched = 0;
     filteredTasks.forEach(t => {
       const f = t.fields || {};
-      const co = (f.Company || "").toLowerCase().trim();
+      const co = normalizeMatch(f.Company);
+      const nm = normalizeMatch(f.Name);
+      const li = normalizeMatch(f["LinkedIn URL"] || f.URL);
+      const emDom = f.Email ? normalizeDomain(f.Email.split("@")[1] || "") : "";
 
-      // Try matching lead by name first (Top X on leads), then by company
-      const ld = leadByName[co] || leadByCompany[co] || {};
+      // Try multiple match strategies in priority order:
+      // 1. By task.Name → leadByName (most direct — task created from this lead)
+      // 2. By task.Company → leadByCompany (lead works at this company)
+      // 3. By task.Company → leadByName (legacy bug where company field had lead's name)
+      // 4. By LinkedIn URL → leadByLinkedIn
+      // 5. By Email domain → leadByDomain
+      const ld = leadByName[nm] || leadByCompany[co] || leadByName[co] || leadByLinkedIn[li] || leadByDomain[emDom] || {};
+      if (Object.keys(ld).length > 0) leadEnriched++;
 
-      // Try matching account directly, or chain via lead's Company field
-      const leadCompany = (ld.Company || "").toLowerCase().trim();
-      const ad = acctMap[co] || (leadCompany ? acctMap[leadCompany] : {}) || {};
+      // For account match: try task.Company → acctMap, then domain match,
+      // then chain via lead's Company field
+      const leadCompany = normalizeMatch(ld.Company);
+      const ad = acctMap[co] || acctByDomain[emDom] || (leadCompany ? acctMap[leadCompany] : {}) || {};
+      if (Object.keys(ad).length > 0) acctEnriched++;
 
       const row = allExportCols.map(c => {
         if (c.startsWith("Acct: ")) return String(ad[c.slice(6)] || "");
         if (c.startsWith("Lead: ")) return String(ld[c.slice(6)] || "");
-        return String(f[c] || "");
+        const v = f[c];
+        return v === null || v === undefined ? "" : (Array.isArray(v) ? v.join(", ") : String(v));
       });
       csvRows.push(row.map(v => '"' + v.replace(/"/g, '""') + '"').join(","));
     });
@@ -6816,7 +6928,17 @@ function ExportModal({ tasks, accounts, leads, onClose }) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url; a.download = "signalscope-tasks-" + new Date().toISOString().slice(0, 10) + ".csv"; a.click();
-    URL.revokeObjectURL(url); onClose();
+    URL.revokeObjectURL(url);
+    // Tell user how enrichment did, especially when it FAILED
+    const enrichSummary = (enrichLead.length > 0 || enrichAcct.length > 0)
+      ? ` (lead enriched: ${leadEnriched}/${filteredTasks.length}${enrichAcct.length > 0 ? `, account enriched: ${acctEnriched}/${filteredTasks.length}` : ""})`
+      : "";
+    if (enrichLead.length > 0 && leadEnriched === 0) {
+      alert(`Export downloaded but ALL Lead enrichment columns came back empty.\n\nThis usually means the current campaign's Leads table doesn't contain the leads referenced by your tasks. Switch to the campaign that has the matching Leads, then re-export, OR uncheck the "Lead: ..." columns and rely on the direct task fields (Name, Lead Title, Email, etc.) instead.`);
+    } else if (enrichSummary) {
+      console.log(`[Export] Downloaded${enrichSummary}`);
+    }
+    onClose();
   };
 
   const chipStyle = (on, color) => ({ display: "flex", alignItems: "center", gap: 4, padding: "4px 10px", borderRadius: 4, border: "1px solid " + (on ? `var(--${color})` : "var(--bdr)"), background: on ? `var(--${color}-d)` : "var(--card)", cursor: "pointer", fontSize: 11, color: on ? `var(--${color})` : "var(--t2)", transition: "all .15s" });
@@ -6868,18 +6990,42 @@ function ExportModal({ tasks, accounts, leads, onClose }) {
 
       {/* Enrich from Accounts */}
       {acctCols.length > 0 && (<div className="ig">
-        <div className="il">Enrich from Accounts <span style={{ fontSize: 9, color: "var(--t3)", fontWeight: 400 }}>— joined by Company name</span></div>
+        <div className="il">Enrich from Accounts <span style={{ fontSize: 9, color: "var(--t3)", fontWeight: 400 }}>— joined by Company name or Domain</span></div>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
           {acctCols.map(c => (<label key={c} style={chipStyle(enrichAcct.includes(c), "grn")}><input type="checkbox" checked={enrichAcct.includes(c)} onChange={() => toggleEA(c)} style={{ accentColor: "var(--grn)", width: 12, height: 12 }} />{c}</label>))}
         </div>
+        {enrichAcct.length > 0 && (
+          <div style={{ marginTop: 6, padding: 8, fontSize: 10, borderRadius: 4,
+            background: enrichmentCoverage.acctHits === 0 ? "rgba(239,68,68,.08)" : enrichmentCoverage.acctHits / enrichmentCoverage.total < 0.3 ? "rgba(191,163,90,.08)" : "rgba(93,168,122,.08)",
+            border: "1px solid " + (enrichmentCoverage.acctHits === 0 ? "var(--red)" : enrichmentCoverage.acctHits / enrichmentCoverage.total < 0.3 ? "var(--amb)" : "rgba(93,168,122,.3)"),
+            color: enrichmentCoverage.acctHits === 0 ? "var(--red)" : "var(--t2)" }}>
+            🔍 Account enrichment coverage: <strong>{enrichmentCoverage.acctHits} / {enrichmentCoverage.total}</strong> tasks will get enriched from the {accounts.length} accounts in this campaign.
+            {enrichmentCoverage.acctHits === 0 && enrichmentCoverage.total > 0 && (
+              <div style={{ marginTop: 4 }}>⚠️ ZERO matches. Tasks reference accounts not in this campaign's Accounts table.</div>
+            )}
+          </div>
+        )}
       </div>)}
 
       {/* Enrich from Leads */}
       {leadCols.length > 0 && (<div className="ig">
-        <div className="il">Enrich from Leads <span style={{ fontSize: 9, color: "var(--t3)", fontWeight: 400 }}>— joined by Company name</span></div>
+        <div className="il">Enrich from Leads <span style={{ fontSize: 9, color: "var(--t3)", fontWeight: 400 }}>— joined by Name, Company, Email domain, or LinkedIn URL</span></div>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
           {leadCols.map(c => (<label key={c} style={chipStyle(enrichLead.includes(c), "blu")}><input type="checkbox" checked={enrichLead.includes(c)} onChange={() => toggleEL(c)} style={{ accentColor: "var(--blu)", width: 12, height: 12 }} />{c}</label>))}
         </div>
+        {enrichLead.length > 0 && (
+          <div style={{ marginTop: 6, padding: 8, fontSize: 10, borderRadius: 4,
+            background: enrichmentCoverage.leadHits === 0 ? "rgba(239,68,68,.08)" : enrichmentCoverage.leadHits / enrichmentCoverage.total < 0.3 ? "rgba(191,163,90,.08)" : "rgba(93,168,122,.08)",
+            border: "1px solid " + (enrichmentCoverage.leadHits === 0 ? "var(--red)" : enrichmentCoverage.leadHits / enrichmentCoverage.total < 0.3 ? "var(--amb)" : "rgba(93,168,122,.3)"),
+            color: enrichmentCoverage.leadHits === 0 ? "var(--red)" : "var(--t2)" }}>
+            🔍 Lead enrichment coverage: <strong>{enrichmentCoverage.leadHits} / {enrichmentCoverage.total}</strong> tasks will get enriched from the {leads.length} leads in this campaign.
+            {enrichmentCoverage.leadHits === 0 && (
+              <div style={{ marginTop: 4 }}>
+                ⚠️ ZERO matches. Tasks reference leads not in this campaign's Leads table. Either: (1) switch to the campaign that has those leads, OR (2) uncheck Lead enrichment columns and use the direct task fields (Name, Lead Title, Email, LinkedIn URL, Phone) which are saved with each task.
+              </div>
+            )}
+          </div>
+        )}
       </div>)}
 
       {/* Preview */}
