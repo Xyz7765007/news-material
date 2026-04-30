@@ -126,7 +126,9 @@ function cleanCompanyName(name) {
 
 function parseRSSItems(xml, defaultSource) {
   const items = [];
-  const re = /<item>([\s\S]*?)<\/item>/gi;
+  // Match <item> OR <item type="..."> — some feeds add attributes/namespaces.
+  // Old regex /<item>/ silently dropped any item with attributes.
+  const re = /<item\b[^>]*>([\s\S]*?)<\/item>/gi;
   let m;
   while ((m = re.exec(xml)) !== null) {
     const x = m[1];
@@ -145,34 +147,168 @@ function srcFrom(t) { const m = t?.match(/\s[-–—]\s([^-–—]+)$/); return 
 function cl(t) { return (t || "").replace(/<[^>]*>/g, "").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ").trim(); }
 function sd(s) { try { const d = new Date(s); return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString(); } catch { return new Date().toISOString(); } }
 
+// User-Agent rotation. Single UA from one IP gets fingerprinted and blocked
+// faster than rotating. We pick one per request based on attempt number.
+const USER_AGENTS = [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+];
+const pickUA = (i = 0) => USER_AGENTS[i % USER_AGENTS.length];
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
 async function fetchRSS(url, label, src) {
-  try {
-    const c = new AbortController(); const t = setTimeout(() => c.abort(), 10000);
-    const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", Accept: "application/rss+xml, application/xml, text/xml, */*" }, signal: c.signal });
-    clearTimeout(t);
-    if (!r.ok) { console.error(`${label}: HTTP ${r.status}`); return []; }
-    const xml = await r.text();
-    if (!xml.includes("<item>")) { console.error(`${label}: no items`); return []; }
-    const items = parseRSSItems(xml, src);
-    console.log(`${label}: ${items.length} items`);
-    return items;
-  } catch (e) { console.error(`${label}: ${e.message}`); return []; }
+  // Retry up to 3 attempts. RSS is cheap and reliability is critical — a single
+  // 429/503/timeout from Google News should NOT result in 0 signals for a company.
+  // Backoff: 0ms, 1s, 3s. Total worst-case: 3 attempts × 12s + 4s sleep = 40s.
+  const maxAttempts = 3;
+  let lastErr = "unknown";
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (attempt > 0) await sleep(1000 * attempt * attempt); // 0, 1s, 4s
+    try {
+      const c = new AbortController();
+      const t = setTimeout(() => c.abort(), 12000);
+      const r = await fetch(url, {
+        headers: {
+          "User-Agent": pickUA(attempt),
+          "Accept": "application/rss+xml, application/xml, text/xml, */*",
+          "Accept-Language": "en-US,en;q=0.9",
+        },
+        signal: c.signal,
+      });
+      clearTimeout(t);
+      if (!r.ok) {
+        lastErr = `HTTP ${r.status}`;
+        // Retry on transient errors (rate limit, server issue). Don't retry on 4xx other than 429.
+        if (r.status === 429 || r.status >= 500) {
+          console.warn(`  [RSS] ${label}: ${lastErr} on attempt ${attempt + 1}/${maxAttempts}, retrying...`);
+          continue;
+        }
+        console.error(`  [RSS] ${label}: ${lastErr} (no retry — non-transient)`);
+        return [];
+      }
+      const xml = await r.text();
+      if (!xml.includes("<item>")) {
+        // Empty results — could be legitimate (no recent news) OR Google News served a non-RSS response (rare, but happens)
+        const looksLikeRSS = xml.includes("<rss") || xml.includes("<feed");
+        if (!looksLikeRSS && attempt < maxAttempts - 1) {
+          console.warn(`  [RSS] ${label}: response doesn't look like RSS (got ${xml.length} chars), retrying...`);
+          lastErr = "non-RSS response";
+          continue;
+        }
+        console.log(`  [RSS] ${label}: 0 items (legitimately empty or filtered)`);
+        return [];
+      }
+      const items = parseRSSItems(xml, src);
+      console.log(`  [RSS] ${label}: ${items.length} items${attempt > 0 ? ` (succeeded on attempt ${attempt + 1})` : ""}`);
+      return items;
+    } catch (e) {
+      lastErr = e.name === "AbortError" ? "timeout" : e.message;
+      console.warn(`  [RSS] ${label}: ${lastErr} on attempt ${attempt + 1}/${maxAttempts}`);
+    }
+  }
+  console.error(`  [RSS] ${label}: FAILED after ${maxAttempts} attempts — last error: ${lastErr}`);
+  return [];
 }
 
 // ─── Article Content Fetcher ──────────────────────────────────────
+//
+// Returns { content: string, error: string|null }
+// - content: cleaned article body (up to 800 chars)
+// - error: null on success, otherwise: "no_url" | "http_<code>" | "timeout" | "thin_body" | "fetch_error" | ...
+//
+// The error indicator lets the caller track success rates per scan and surface
+// them in logs so we can debug "why did so few signals match" without guessing.
 
 async function fetchArticle(url) {
-  if (!url || url.length < 10) return "";
-  try {
-    const c = new AbortController(); const t = setTimeout(() => c.abort(), 6000);
-    const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", Accept: "text/html,*/*" }, signal: c.signal, redirect: "follow" });
-    clearTimeout(t);
-    if (!r.ok) return "";
-    const html = await r.text();
-    const art = html.match(/<article[^>]*>([\s\S]*?)<\/article>/i);
-    let text = art ? art[1] : (html.match(/<p[^>]*>([\s\S]*?)<\/p>/gi) || []).join(" ");
-    return text.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "").replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "").replace(/<[^>]*>/g, " ").replace(/&[a-z]+;/gi, " ").replace(/\s+/g, " ").trim().slice(0, 800);
-  } catch { return ""; }
+  if (!url || url.length < 10) return { content: "", error: "no_url" };
+  // 3 attempts with different UAs + escalating backoff. Total worst-case:
+  // 3 × 7s + 2s+4s sleeps = 27s per article. Combined with concurrency cap
+  // of 8 (see scanNews), wall-clock for 50 articles is bounded to ~3-4 min.
+  // We trade speed for reliability — the user's #1 complaint was inconsistent
+  // signal counts run-to-run, which traces to article fetch failures dropping
+  // body context → AI scores low → signals dropped below threshold.
+  const maxAttempts = 3;
+  let lastErr = "unknown";
+  // Track whether we've already followed a meta-refresh/JS redirect to avoid loops
+  let currentUrl = url;
+  let followedRedirect = false;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (attempt > 0) {
+      // Backoff: 0ms, 1.5s, 4s. Random jitter ±400ms to avoid thundering herd
+      // when many fetches retry simultaneously after a rate-limit burst.
+      const base = attempt === 1 ? 1500 : 4000;
+      const jitter = Math.random() * 800 - 400;
+      await sleep(Math.max(100, base + jitter));
+    }
+    try {
+      const c = new AbortController();
+      const t = setTimeout(() => c.abort(), 7000); // 7s per attempt
+      const r = await fetch(currentUrl, {
+        headers: {
+          "User-Agent": pickUA(attempt),
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.5",
+          "Accept-Encoding": "gzip, deflate, br",
+          "Cache-Control": "no-cache",
+        },
+        signal: c.signal,
+        redirect: "follow",
+      });
+      clearTimeout(t);
+      if (!r.ok) {
+        lastErr = `http_${r.status}`;
+        // Retry on transient errors (rate limit, server issues). 4xx other than 429 are permanent.
+        if ((r.status === 429 || r.status >= 500) && attempt < maxAttempts - 1) {
+          continue;
+        }
+        return { content: "", error: lastErr };
+      }
+      const html = await r.text();
+      // ── Detect meta-refresh / JS redirect (Google News redirector pattern) ──
+      // Google News RSS links often go to news.google.com/rss/articles/... which
+      // returns an HTML page that meta-refreshes or JS-redirects to the actual
+      // publisher URL. fetch() doesn't follow these by default. We extract the
+      // destination URL and re-fetch ONCE (avoid loops with followedRedirect flag).
+      if (!followedRedirect && html.length < 8000) {
+        // Try multiple redirect patterns publishers/Google News use
+        const metaRefresh = html.match(/<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["'][^"']*?url=([^"'\s>]+)/i);
+        const jsLocation = html.match(/(?:window\.location|location\.href|location\.replace)\s*=?\s*\(?\s*["']([^"']+)["']/i);
+        const dataUrl = html.match(/data-n-au=["']([^"']+)["']/); // Google News' own tracker
+        const canonical = html.match(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i);
+        const redirectUrl = (metaRefresh?.[1] || jsLocation?.[1] || dataUrl?.[1] || canonical?.[1] || "").replace(/&amp;/g, "&");
+        if (redirectUrl && /^https?:\/\//i.test(redirectUrl) && !redirectUrl.includes("news.google.com") && redirectUrl !== currentUrl) {
+          // Found a redirect target — follow it ONCE
+          currentUrl = redirectUrl;
+          followedRedirect = true;
+          continue; // retry loop with new URL, doesn't count against maxAttempts intent (but does count as attempt)
+        }
+      }
+      const art = html.match(/<article[^>]*>([\s\S]*?)<\/article>/i);
+      let text = art ? art[1] : (html.match(/<p[^>]*>([\s\S]*?)<\/p>/gi) || []).join(" ");
+      const cleaned = text
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+        .replace(/<[^>]*>/g, " ")
+        .replace(/&[a-z]+;/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 800);
+      if (cleaned.length < 50) {
+        // Too thin to be useful — don't retry (the page genuinely has no extractable text)
+        return { content: cleaned, error: "thin_body" };
+      }
+      return { content: cleaned, error: null };
+    } catch (e) {
+      lastErr = e.name === "AbortError" ? "timeout" : "fetch_error";
+      // Retry on timeout/network errors (often transient)
+      if ((lastErr === "timeout" || lastErr === "fetch_error") && attempt < maxAttempts - 1) continue;
+      return { content: "", error: lastErr };
+    }
+  }
+  return { content: "", error: lastErr };
 }
 
 // ─── Date Filter ──────────────────────────────────────────────────
@@ -216,20 +352,131 @@ async function scanNews(company, taskDefs, threshold = 50) {
   const items = await fetchRSS(`https://news.google.com/rss/search?q=${q}+when:7d&hl=en&gl=US&ceid=US:en`, `Google News [${cleanName}]`, "Google News");
 
   const recent = filterRecent(items);
-  console.log(`  [NEWS] ${items.length} total → ${recent.length} within ${MAX_AGE_DAYS} days`);
+  console.log(`  [NEWS] ${cleanName}: ${items.length} total → ${recent.length} within ${MAX_AGE_DAYS} days`);
 
   if (recent.length === 0) {
-    console.log(`  [NEWS] No recent articles found — skipping (real signals only)`);
+    console.log(`  [NEWS] ${cleanName}: No recent articles found`);
     return [];
   }
 
-  // Fetch full article body for the first 50 items in parallel — used in classify
-  // for higher accuracy (headlines alone are misleading). 6s timeout per fetch,
-  // wall clock max ~6s.
-  const enriched = await Promise.all(recent.slice(0, 50).map(async n => ({
-    ...n, taskType: "news", articleContent: await fetchArticle(n.url),
-  })));
-  return classify(enriched, taskDefs, cleanName, "news", threshold);
+  // Fetch full article body — used in classify for higher accuracy. Headlines alone
+  // are misleading and produce conservative scores that drop below threshold.
+  //
+  // CRITICAL: Limited to 8 parallel fetches. Was Promise.all of 50 simultaneous,
+  // which routinely triggered rate limits at CloudFront/Akamai/etc. when 50 fetches
+  // hit different publisher domains from one Vercel egress IP. Result: 30-40% of
+  // article bodies were silently empty → AI saw only headlines → scores clustered
+  // low → dropped below user threshold → "no relevant signals." This is exactly
+  // the symptom the user reported (different success rate per run = different
+  // signal count).
+  //
+  // Also: a SECOND PASS retries articles that failed on first round. By the time
+  // we re-attempt, the rate-limit window has passed and many succeed. Doubles
+  // wall-clock for failed articles only (typically 5-10) but recovers signals
+  // that would otherwise be lost.
+  // ── Headline-based dedup BEFORE fetch ──
+  // Google News during earnings season returns 30+ outlets republishing the same
+  // press release. Dedupe by normalized headline first (cheap, no AI). Saves fetch
+  // calls AND token spend on AI. We keep the FIRST occurrence (which Google News
+  // sorts by relevance/date — usually the original source).
+  const seenHeadlines = new Set();
+  const dedupedRecent = [];
+  for (const item of recent) {
+    // Normalize: lowercase, strip punctuation, strip common publication suffixes,
+    // collapse whitespace. "Apple Q3 Earnings - Reuters" → "apple q3 earnings"
+    const norm = (item.headline || "")
+      .toLowerCase()
+      .replace(/\s*[-–—|·•]\s*[^-–—|·•]+$/, "") // strip trailing " - Source Name"
+      .replace(/[^\w\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!norm || norm.length < 10) {
+      dedupedRecent.push(item); // can't reliably dedupe ultra-short or empty
+      continue;
+    }
+    if (seenHeadlines.has(norm)) continue;
+    seenHeadlines.add(norm);
+    dedupedRecent.push(item);
+  }
+  const dedupCount = recent.length - dedupedRecent.length;
+  if (dedupCount > 0) {
+    console.log(`  [NEWS] ${cleanName}: deduped ${dedupCount} near-identical headlines (${recent.length} → ${dedupedRecent.length})`);
+  }
+
+  // Diagnostic: count how many URLs are Google News redirectors. These often fail
+  // to fetch because they require following JS redirects, not HTTP 30x. Knowing
+  // this helps explain low fetch rates without guessing.
+  const googleNewsRedirectorCount = dedupedRecent.filter(item =>
+    (item.url || "").includes("news.google.com/rss/articles/")
+  ).length;
+  if (googleNewsRedirectorCount > 0) {
+    const pct = Math.round((googleNewsRedirectorCount / dedupedRecent.length) * 100);
+    console.log(`  [NEWS] ${cleanName}: ${googleNewsRedirectorCount}/${dedupedRecent.length} URLs (${pct}%) are Google News redirectors — these may fail to fetch body content`);
+  }
+
+  // Slice to 50. With 3-attempt fetcher (worst case ~26s per article) and
+  // concurrency 8, 50 articles take ~7 batches × ~10-15s wall = 70-100s typical,
+  // up to ~180s worst case during a publisher outage. Leaves room for the
+  // second-pass retry and classify within the 300s POST budget.
+  const recentSlice = dedupedRecent.slice(0, 50);
+  const stats = { total: recentSlice.length, succeeded: 0, errors: {}, secondPassRecovered: 0 };
+  const enriched = [];
+  // Concurrency 8: was 12, lowered for better publisher-side acceptance.
+  // 50 articles ÷ 8 concurrency = 7 batches × ~10s wall = ~70s. Within 300s budget.
+  const CONCURRENCY = 8;
+  for (let i = 0; i < recentSlice.length; i += CONCURRENCY) {
+    const batch = recentSlice.slice(i, i + CONCURRENCY);
+    const results = await Promise.all(batch.map(async n => {
+      const { content, error } = await fetchArticle(n.url);
+      if (error) {
+        stats.errors[error] = (stats.errors[error] || 0) + 1;
+      } else {
+        stats.succeeded++;
+      }
+      return { ...n, taskType: "news", articleContent: content, fetchError: error };
+    }));
+    enriched.push(...results);
+  }
+
+  // ── SECOND PASS: retry failed transient errors ──
+  // Permanent errors (http_404, no_url, thin_body) are not retried.
+  // Transient errors (timeout, fetch_error, http_429, http_5xx) get one more
+  // shot. By now any rate-limit windows have rolled over.
+  const retryable = enriched
+    .map((s, idx) => ({ s, idx }))
+    .filter(({ s }) => {
+      const e = s.fetchError;
+      return e === "timeout" || e === "fetch_error" || e === "http_429" || (e && e.startsWith("http_5"));
+    });
+  if (retryable.length > 0 && retryable.length < recentSlice.length) {
+    console.log(`  [NEWS] ${cleanName}: second-pass retry on ${retryable.length} transient failures...`);
+    await sleep(2000); // settle interval before retrying
+    for (let i = 0; i < retryable.length; i += CONCURRENCY) {
+      const batch = retryable.slice(i, i + CONCURRENCY);
+      await Promise.all(batch.map(async ({ s, idx }) => {
+        const { content, error } = await fetchArticle(s.url);
+        if (!error) {
+          // Recovered — update enriched in place
+          enriched[idx] = { ...s, articleContent: content, fetchError: null };
+          stats.succeeded++;
+          stats.secondPassRecovered++;
+          stats.errors[s.fetchError] = (stats.errors[s.fetchError] || 1) - 1;
+          if (stats.errors[s.fetchError] <= 0) delete stats.errors[s.fetchError];
+        }
+      }));
+    }
+  }
+
+  const successRate = Math.round((stats.succeeded / stats.total) * 100);
+  const errorSummary = Object.entries(stats.errors).filter(([, v]) => v > 0).map(([k, v]) => `${k}:${v}`).join(", ") || "none";
+  const recoveryNote = stats.secondPassRecovered > 0 ? ` (${stats.secondPassRecovered} recovered on retry)` : "";
+  console.log(`  [NEWS] ${cleanName}: article body fetch ${stats.succeeded}/${stats.total} (${successRate}%)${recoveryNote} — errors: ${errorSummary}`);
+  if (successRate < 50 && stats.total >= 5) {
+    console.warn(`  [NEWS] ${cleanName}: ⚠ LOW FETCH SUCCESS RATE (${successRate}%). Some signals will be scored on headline alone — accuracy may be lower than usual.`);
+  }
+
+  const classified = await classify(enriched, taskDefs, cleanName, "news", threshold);
+  return { signals: classified, fetchStats: { succeeded: stats.succeeded, total: stats.total, successRate, errors: stats.errors, secondPassRecovered: stats.secondPassRecovered } };
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -444,21 +691,40 @@ async function scanJobsBatch(companies, taskDefs, threshold = 50) {
 // ═══════════════════════════════════════════════════════════════════
 
 // Keyword pre-filter: only send signals to AI that have at least one task-keyword
-// in the headline or description. For news, an article that doesn't mention any of
-// the task's keywords is almost certainly noise. For jobs, the f_C filter already
-// scoped to right companies, but the JOB TITLE still needs to match the task's role.
+// in the headline, description, OR ARTICLE BODY. For news, an article that
+// doesn't mention any of the task's keywords ANYWHERE is almost certainly noise.
+// For jobs, the f_C filter already scoped to right companies, but the JOB TITLE
+// or description still needs to match the task's role.
 //
-// IMPORTANT: only used when the task has a non-empty keyword list. If the user has
-// NO keywords (relying purely on the prompt), we send everything to AI.
+// CRITICAL: We MUST include articleContent in the haystack. If we don't, an
+// earnings report titled "Merck Q3 2026 Results" gets dropped by the prefilter
+// even though the article body mentions a CMO transition that perfectly matches
+// the user's keyword "CMO". We just spent ~8s fetching that body — using it
+// for prefilter costs nothing and recovers ALL these false negatives.
+//
+// CRITICAL 2: We normalize punctuation. LinkedIn job titles often have commas
+// like "VP, Marketing" — without normalization, keyword "VP Marketing" doesn't
+// match. Stripping non-word chars to spaces and collapsing whitespace fixes this.
+//
+// IMPORTANT: only used when the task has a non-empty keyword list. If the user
+// has NO keywords (relying purely on the prompt), we send everything to AI.
+function normalizeForMatch(s) {
+  return (s || "").toLowerCase().replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
+}
 function prefilterSignals(signals, task, mode) {
   const kws = mode === "jobs"
     ? [...(task.jobTitleKeywords || []), ...(task.keywords || [])]
     : (task.keywords || []);
-  const cleanKws = kws.filter(k => k && k.length >= 2).map(k => k.toLowerCase());
+  const cleanKws = kws
+    .filter(k => k && k.length >= 2)
+    .map(k => normalizeForMatch(k))
+    .filter(k => k.length >= 2); // re-filter after normalization in case it stripped to empty
   if (cleanKws.length === 0) return signals.map((_, i) => i); // no keywords = send all
   const matchingIndices = [];
   signals.forEach((sig, i) => {
-    const haystack = `${sig.headline || ""} ${sig.description || ""} ${sig.jobTitle || ""}`.toLowerCase();
+    // For news: include the article body. For jobs: the description IS the body.
+    const body = mode === "jobs" ? "" : (sig.articleContent || "");
+    const haystack = normalizeForMatch(`${sig.headline || ""} ${sig.description || ""} ${sig.jobTitle || ""} ${body}`);
     if (cleanKws.some(kw => haystack.includes(kw))) {
       matchingIndices.push(i);
     }
@@ -468,6 +734,8 @@ function prefilterSignals(signals, task, mode) {
 
 // Build the per-signal block sent to OpenAI. For news, includes article content if
 // available (was being fetched but ignored before — wasted ~6s per company).
+// When body is unavailable (fetch failed), we EXPLICITLY mark it so the AI knows
+// not to over-penalize for thin context.
 function formatSignalForAI(sig, idx, mode) {
   const lines = [`[${idx}] ${sig.headline || "(no headline)"}`];
   if (mode === "jobs") {
@@ -483,6 +751,11 @@ function formatSignalForAI(sig, idx, mode) {
     // headlines alone are misleading. Cap at 1000 chars to control prompt size.
     if (sig.articleContent && sig.articleContent.length > 50) {
       lines.push(`  Article body: ${sig.articleContent.slice(0, 1000)}`);
+    } else if (sig.fetchError) {
+      // Explicit marker so the AI doesn't silently penalize this signal for thin context.
+      // Without this marker, the AI sees "headline + excerpt only" and tends to score
+      // conservatively (~50-60), even when the headline is a strong match.
+      lines.push(`  [Article body unavailable — fetch error: ${sig.fetchError}. Score based on headline + excerpt only; do not penalize for missing body.]`);
     }
   }
   return lines.join("\n");
@@ -504,12 +777,20 @@ async function classify(signals, taskDefs, companyName, mode, threshold = 50) {
       console.log(`  [TASK] "${task.name}" → 0 candidates after keyword pre-filter`);
       return { task, scores: [], error: null };
     }
-
-    // Build signal block — only candidates, with their original indices preserved.
-    // The AI will refer to signals by their original idx so we can map back.
-    const signalBlock = candidateIndices
-      .map(i => formatSignalForAI(signals[i], i, mode))
-      .join("\n\n");
+    // Split into chunks of at most 40 candidates per AI call. With prefilter
+    // including article body, candidate count can balloon during high-news weeks.
+    // 40 × ~250 chars per signal block = ~10K chars input ≈ ~2.5K tokens.
+    // Plus output ~1.5K tokens = ~4K total per call. Comfortable.
+    // If a task has 60 candidates, we make 2 parallel AI calls instead of dropping
+    // 20 signals or risking token-limit truncation.
+    const MAX_CANDIDATES_PER_CALL = 40;
+    const candidateChunks = [];
+    for (let i = 0; i < candidateIndices.length; i += MAX_CANDIDATES_PER_CALL) {
+      candidateChunks.push(candidateIndices.slice(i, i + MAX_CANDIDATES_PER_CALL));
+    }
+    if (candidateChunks.length > 1) {
+      console.log(`  [TASK] "${task.name}" → ${candidateIndices.length} candidates split into ${candidateChunks.length} parallel AI calls`);
+    }
 
     const userPrompt = (task.scoringPrompt || "").trim();
     const taskName = task.name || "(unnamed task)";
@@ -540,18 +821,27 @@ Output format (strict JSON, no markdown):
 
 If no signals score ${threshold}+, return: { "matches": [] }`;
 
-    const userMessage = `# Task: ${taskName}
+    // Helper: makes ONE AI call for a chunk of candidate indices, returns parsed scores.
+    // Extracted so we can call it once per chunk and merge results, instead of
+    // truncating to a single 40-candidate cap.
+    const scoreOneChunk = async (chunkIndices) => {
+      const signalBlock = chunkIndices.map(i => formatSignalForAI(signals[i], i, mode)).join("\n\n");
+      const userMessage = `# Task: ${taskName}
 ${task.description ? `\nTask description: ${task.description}\n` : ""}
 ${userPrompt ? `# User's scoring criteria:\n${userPrompt}\n` : "# User has not provided custom criteria. Use the task name and description above as the guide.\n"}
 # Signals to score:
 
 ${signalBlock}`;
-
-    try {
       const c = await getOpenAI().chat.completions.create({
         model: "gpt-5.4-mini",
-        temperature: 0.15,
-        max_completion_tokens: 2000,
+        // Temperature 0 = deterministic. Was 0.15 which caused 5-10 point score
+        // variance run-to-run — the difference between "above threshold" and
+        // "dropped" for borderline signals. User reported 1 vs 37 signals across
+        // runs; some of that variance came from this.
+        temperature: 0,
+        // 4000 tokens output. Each match is ~30-40 tokens (idx + score + reason).
+        // With 40 candidates × 40 tokens = 1600 — plenty of headroom.
+        max_completion_tokens: 4000,
         response_format: { type: "json_object" }, // GUARANTEED valid JSON
         messages: [
           { role: "system", content: sysPrompt },
@@ -559,16 +849,43 @@ ${signalBlock}`;
         ],
       });
       const text = c.choices[0]?.message?.content || "{}";
+      const finishReason = c.choices[0]?.finish_reason;
+      if (finishReason === "length") {
+        console.warn(`  [TASK] "${task.name}" chunk → ⚠ AI HIT TOKEN LIMIT (${chunkIndices.length} candidates produced too long output). Salvaging partial response.`);
+      }
       let parsed;
       try {
         parsed = JSON.parse(text);
       } catch (e) {
-        // Should never happen with json_object mode but defense in depth
-        const m = text.match(/\{[\s\S]*\}/);
-        parsed = m ? JSON.parse(m[0]) : { matches: [] };
+        // Fallback parse: trim back to a complete JSON object.
+        console.warn(`  [TASK] "${task.name}" chunk → JSON parse failed: ${e.message}. Attempting salvage...`);
+        const lastBrace = text.lastIndexOf("}");
+        if (lastBrace > 0) {
+          for (let cut = lastBrace; cut > 0; cut--) {
+            try { parsed = JSON.parse(text.slice(0, cut + 1)); break; } catch { /* keep trying */ }
+          }
+        }
+        if (!parsed) {
+          // Last resort: salvage individual match objects via regex
+          const matchRegex = /\{\s*"idx"\s*:\s*(\d+)\s*,\s*"score"\s*:\s*(\d+)\s*,\s*"reason"\s*:\s*"([^"]*)"/g;
+          const salvaged = [];
+          let m;
+          while ((m = matchRegex.exec(text)) !== null) {
+            salvaged.push({ idx: +m[1], score: +m[2], reason: m[3] });
+          }
+          parsed = salvaged.length > 0 ? { matches: salvaged } : { matches: [] };
+          if (salvaged.length > 0) console.log(`  [TASK] "${task.name}" chunk → regex-salvaged ${salvaged.length} match objects`);
+        }
       }
-      // Accept either { matches: [...] } or a bare array (model variance)
-      const scores = Array.isArray(parsed) ? parsed : (parsed.matches || parsed.scores || []);
+      return Array.isArray(parsed) ? parsed : (parsed.matches || parsed.scores || []);
+    };
+
+    try {
+      // Call AI once per chunk in parallel, merge all match arrays.
+      // For most tasks (1 chunk), this is identical to a single call.
+      // For tasks with 40+ candidates, multiple chunks run in parallel.
+      const chunkResults = await Promise.all(candidateChunks.map(scoreOneChunk));
+      const scores = chunkResults.flat();
       return { task, scores, error: null };
     } catch (e) {
       console.error(`  [TASK ERROR] "${task.name}":`, e.message);
@@ -591,9 +908,14 @@ ${signalBlock}`;
       }
       let fallbackCount = 0;
       signals.forEach((sig, i) => {
-        const t = `${sig.headline} ${sig.description || ""} ${sig.jobTitle || ""}`.toLowerCase();
-        const kws = [...(task.keywords || []), ...(task.jobTitleKeywords || [])].filter(k => k && k.length >= 2);
-        if (kws.length > 0 && kws.some(kw => t.includes(kw.toLowerCase()))) {
+        // Use same normalization as prefilter so behavior is consistent.
+        const body = mode === "jobs" ? "" : (sig.articleContent || "");
+        const haystack = normalizeForMatch(`${sig.headline} ${sig.description || ""} ${sig.jobTitle || ""} ${body}`);
+        const kws = [...(task.keywords || []), ...(task.jobTitleKeywords || [])]
+          .filter(k => k && k.length >= 2)
+          .map(k => normalizeForMatch(k))
+          .filter(k => k.length >= 2);
+        if (kws.length > 0 && kws.some(kw => haystack.includes(kw))) {
           results[i].matchedTaskIds.push(task.id);
           results[i].relevanceScores[task.id] = FALLBACK_SCORE;
           results[i].scoreReasons[task.id] = "AI scoring failed; keyword match fallback";
@@ -622,9 +944,11 @@ ${signalBlock}`;
     console.log(`  [TASK] "${task.name}" → ${matchCount} matches at threshold ${threshold}+`);
   }
 
-  // Log summary
+  // Log summary with diagnostic info
   const matched = results.filter(s => s.matchedTaskIds.length > 0);
-  console.log(`  [SUMMARY] ${signals.length} signals × ${taskDefs.length} tasks → ${matched.length} signals matched`);
+  const withBody = signals.filter(s => s.articleContent && s.articleContent.length > 50).length;
+  const bodyPct = signals.length > 0 ? Math.round((withBody / signals.length) * 100) : 0;
+  console.log(`  [SUMMARY] ${signals.length} signals (${withBody} with body, ${bodyPct}%) × ${taskDefs.length} tasks → ${matched.length} signals matched at threshold`);
 
   return results;
 }
@@ -663,7 +987,7 @@ export async function POST(request) {
     if (!taskDefs?.length) return NextResponse.json({ error: "Task definitions required" }, { status: 400 });
 
     console.log(`\n── Scanning: ${company.name} [${mode}] (threshold: ${threshold}) ──`);
-    const signals = await scanNews(company, taskDefs, threshold);
+    const { signals, fetchStats } = await scanNews(company, taskDefs, threshold);
 
     return NextResponse.json({
       news: signals,
@@ -671,6 +995,7 @@ export async function POST(request) {
       mode,
       threshold,
       matchedCount: signals.filter(n => (n.matchedTaskIds || []).length > 0).length,
+      fetchStats, // {succeeded, total, successRate, errors, secondPassRecovered}
     });
   } catch (error) {
     console.error("Scan error:", error);

@@ -1321,8 +1321,11 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     const newsRange = mode === "news" ? 90 : 50;
     const jobsBase = mode === "jobs" ? 0 : 50;
     const jobsRange = mode === "jobs" ? 90 : 40;
+    // Track fetch stats across all news scans this run — surface in completion message
+    // so user knows if poor fetch rates may have caused signal loss this run.
+    const aggFetchStats = { totalArticles: 0, succeededArticles: 0, errorBreakdown: {}, lowFetchCompanies: [], failedCompanies: [] };
     // ── NEWS phase ──
-    if(mode!=="jobs"&&nT.length>0){for(let i=0;i<companies.length;i++){if(!scanRef.current)break;setScanText("📰 "+companies[i].name);setScanProg(Math.round(i/total*newsRange));try{const res=await fetch("/api/scan",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({company:companies[i],taskDefs:nT,mode:"news",threshold})});if(res.ok){const d=await res.json();bufferSignals(d.news||[],companies[i],taskDefs)}}catch(e){console.error(e)}await sleep(100)}}
+    if(mode!=="jobs"&&nT.length>0){for(let i=0;i<companies.length;i++){if(!scanRef.current)break;setScanText("📰 "+companies[i].name);setScanProg(Math.round(i/total*newsRange));try{const res=await fetch("/api/scan",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({company:companies[i],taskDefs:nT,mode:"news",threshold})});if(res.ok){const d=await res.json();bufferSignals(d.news||[],companies[i],taskDefs);if(d.fetchStats){aggFetchStats.totalArticles+=d.fetchStats.total||0;aggFetchStats.succeededArticles+=d.fetchStats.succeeded||0;for(const[k,v]of Object.entries(d.fetchStats.errors||{})){aggFetchStats.errorBreakdown[k]=(aggFetchStats.errorBreakdown[k]||0)+v}if(d.fetchStats.total>=5&&d.fetchStats.successRate<50){aggFetchStats.lowFetchCompanies.push(`${companies[i].name} (${d.fetchStats.successRate}%)`)}}}else{aggFetchStats.failedCompanies.push(`${companies[i].name} (HTTP ${res.status})`);console.error(`[Scan] ${companies[i].name} failed: HTTP ${res.status}`)}}catch(e){aggFetchStats.failedCompanies.push(`${companies[i].name} (${e.message||"network error"})`);console.error(`[Scan] ${companies[i].name} threw:`,e)}await sleep(100)}}
     // ── JOBS phase ──
     if(scanRef.current&&mode!=="news"&&jT.length>0){const need=companies.filter(c=>c.linkedinSlug&&!c.linkedinCompanyId);if(need.length>0){setScanText("🔗 Resolving LinkedIn IDs...");try{const res=await fetch("/api/resolve-linkedin",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({slugs:need.map(c=>c.linkedinSlug)})});if(res.ok){const{ids}=await res.json();for(const c of companies){if(c.linkedinSlug&&!c.linkedinCompanyId&&ids[c.linkedinSlug.toLowerCase()])c.linkedinCompanyId=ids[c.linkedinSlug.toLowerCase()]}}}catch(e){console.error(e)}}
     const BS=5;for(let b=0;b<companies.length;b+=BS){if(!scanRef.current)break;const batch=companies.slice(b,b+BS);setScanText("📋 Jobs — Batch "+(Math.floor(b/BS)+1));setScanProg(jobsBase+Math.round(b/companies.length*jobsRange));try{const res=await fetch("/api/scan",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({companies:batch,taskDefs:jT,mode:"jobs-batch",threshold})});if(res.ok){const d=await res.json();for(const result of(d.results||[])){const co=batch.find(c=>c.name===result.company);if(co)bufferSignals(result.signals||[],co,taskDefs)}}}catch(e){console.error(e)}await sleep(200)}}
@@ -1330,6 +1333,28 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     // ─── Post-scan: AI dedup + save ───────────────────────────
     const buffered = scanBufferRef.current;
     const exactDupes = dupCountRef.current;
+    // Build fetch warning suffix to append to completion message. Helps user
+    // diagnose when low fetch rates may have caused signal loss.
+    let fetchWarning = "";
+    if (mode !== "jobs" && (aggFetchStats.totalArticles > 0 || aggFetchStats.failedCompanies.length > 0)) {
+      const aggRate = aggFetchStats.totalArticles > 0 ? Math.round((aggFetchStats.succeededArticles / aggFetchStats.totalArticles) * 100) : 0;
+      const errs = Object.entries(aggFetchStats.errorBreakdown).map(([k,v])=>`${k}:${v}`).join(",");
+      console.log(`[Scan] News article fetch aggregate: ${aggFetchStats.succeededArticles}/${aggFetchStats.totalArticles} (${aggRate}%) — errors: ${errs||"none"}`);
+      if (aggFetchStats.failedCompanies.length > 0) {
+        console.error(`[Scan] ⚠ ${aggFetchStats.failedCompanies.length} company scans FAILED entirely: ${aggFetchStats.failedCompanies.join(", ")}`);
+      }
+      if (aggFetchStats.lowFetchCompanies.length > 0) {
+        console.warn(`[Scan] ⚠ ${aggFetchStats.lowFetchCompanies.length} companies had <50% fetch success: ${aggFetchStats.lowFetchCompanies.join(", ")}`);
+      }
+      // Build user-visible warning, prioritizing the more severe issue
+      if (aggFetchStats.failedCompanies.length > 0) {
+        fetchWarning = ` ⚠ ${aggFetchStats.failedCompanies.length} co's failed entirely (check console)`;
+      } else if (aggFetchStats.lowFetchCompanies.length > 0) {
+        fetchWarning = ` ⚠ ${aggFetchStats.lowFetchCompanies.length} co's had low fetch (${aggRate}% overall — re-run if results look thin)`;
+      } else if (aggRate < 70 && aggRate > 0) {
+        fetchWarning = ` (article fetch ${aggRate}% — re-run for better coverage)`;
+      }
+    }
     if(buffered.length>0){
       setScanText(`🔍 AI dedup on ${buffered.length} tasks…`);setScanProg(90);
       const deduped = await aiDedupBatch(buffered);
@@ -1339,9 +1364,9 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         try{const res=await at("create","Tasks",{records:deduped},bid);setTasks(p=>[...(res.records||[]),...p])}catch(e){console.error(e)}
       }
       const totalDupes = exactDupes + aiRemoved;
-      setScanText(`✅ ${deduped.length} tasks created${totalDupes>0?` (${totalDupes} duplicates removed${aiRemoved>0?`, ${aiRemoved} by AI`:""})`:""}`);
+      setScanText(`✅ ${deduped.length} tasks created${totalDupes>0?` (${totalDupes} duplicates removed${aiRemoved>0?`, ${aiRemoved} by AI`:""})`:""}${fetchWarning}`);
     } else {
-      setScanText(exactDupes > 0 ? `✅ Scan complete — ${exactDupes} duplicates skipped, no new tasks` : "✅ Scan complete — no signals found");
+      setScanText((exactDupes > 0 ? `✅ Scan complete — ${exactDupes} duplicates skipped, no new tasks` : "✅ Scan complete — no signals found") + fetchWarning);
     }
     setScanProg(100);setScanning(false);scanRef.current=false;
   },[accounts,rules,threshold,scanning,bid,tasks]);
