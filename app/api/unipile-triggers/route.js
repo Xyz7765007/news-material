@@ -293,12 +293,111 @@ async function createTriggerTask(baseId, { triggerType, lead, signalText, eviden
 }
 
 // ═══════════════════════════════════════════════════════════════
+// ACCOUNT ROUTING
+// Map a Unipile LinkedIn account_id → Airtable base ID. Lets one webhook
+// URL serve all clients — events route based on which connected LinkedIn
+// account fired them, not based on URL parameters.
+//
+// Routing config lives in the master base in an "Account Routing" table:
+//   - Account ID (text, primary): Unipile's LinkedIn account_id
+//   - Account Name (text): user name as shown in Unipile
+//   - Provider (text): "linkedin", "email", etc.
+//   - Campaign Base ID (text): target Airtable base
+//   - Client Name (text): for UI display
+//   - Active (checkbox): can disable without deleting
+//   - Last Event At (datetime)
+//   - Notes (long text)
+//
+// Unrouted events (account_id not in routing table) get logged to "Unrouted Triggers"
+// so we can see what fell through and add the routing later.
+// ═══════════════════════════════════════════════════════════════
+
+let routingCache = null; // { byAccountId: Map, fetchedAt: ms }
+const ROUTING_CACHE_TTL_MS = 2 * 60 * 1000; // 2 min — rebuild often enough that new mappings take effect quickly
+
+async function loadRoutingTable() {
+  const now = Date.now();
+  if (routingCache && (now - routingCache.fetchedAt) < ROUTING_CACHE_TTL_MS) return routingCache;
+  if (!MASTER_BASE_ID) {
+    routingCache = { byAccountId: new Map(), fetchedAt: now };
+    return routingCache;
+  }
+  try {
+    const records = await atListAll(MASTER_BASE_ID, "Account Routing");
+    const byAccountId = new Map();
+    for (const r of records) {
+      const f = r.fields || {};
+      const acctId = (f["Account ID"] || "").trim();
+      const baseId = (f["Campaign Base ID"] || "").trim();
+      // Active checkbox: Airtable returns `true` when checked, omits the field when unchecked.
+      // Treat ONLY explicit `true` as active. Anything else (undefined, false) is inactive.
+      // This means newly-created rows must have Active explicitly set to true (which set_routing does).
+      const active = f["Active"] === true;
+      if (acctId && baseId && active) {
+        byAccountId.set(acctId, {
+          baseId,
+          accountName: f["Account Name"] || "",
+          clientName: f["Client Name"] || "",
+          recordId: r.id,
+        });
+      }
+    }
+    routingCache = { byAccountId, fetchedAt: now };
+    console.log(`[routing] Loaded ${byAccountId.size} active routing entries`);
+    return routingCache;
+  } catch (e) {
+    console.warn(`[routing] Could not load Account Routing table (${e.message}). Defaulting to no routing.`);
+    routingCache = { byAccountId: new Map(), fetchedAt: now };
+    return routingCache;
+  }
+}
+
+async function lookupBaseForAccount(accountId) {
+  if (!accountId) return null;
+  const cache = await loadRoutingTable();
+  const entry = cache.byAccountId.get(accountId);
+  return entry || null;
+}
+
+// When a routing miss happens, log the event to "Unrouted Triggers" table in master.
+// Auto-creates fields if missing. Lets user see what events fell through and
+// configure routing for them.
+async function logUnroutedEvent({ accountId, eventType, eventId, signalText, evidenceUrl, leadLinkedInData, payload }) {
+  if (!MASTER_BASE_ID) return;
+  try {
+    // Dedupe by event ID — Unipile may redeliver the same event
+    if (eventId) {
+      const dupeFormula = `{Event ID} = "${eventId.replace(/"/g, '\\"')}"`;
+      const existing = await atFindOne(MASTER_BASE_ID, "Unrouted Triggers", dupeFormula);
+      if (existing) return { skipped: true };
+    }
+    const record = {
+      fields: {
+        Name: `${eventType} from ${accountId?.slice(0, 12) || "unknown"}`,
+        "Account ID": accountId || "",
+        "Event Type": eventType || "",
+        "Event ID": eventId || "",
+        "Lead Name": leadLinkedInData?.public_identifier || leadLinkedInData?.name || "",
+        "Lead Profile URL": leadLinkedInData?.profile_url || evidenceUrl || "",
+        "Signal Text": (signalText || "").slice(0, 500),
+        "Raw Payload": JSON.stringify(payload || {}).slice(0, 5000),
+        Received: new Date().toISOString(),
+      },
+    };
+    await atCreateBatch(MASTER_BASE_ID, "Unrouted Triggers", [record]);
+  } catch (e) {
+    // Don't let logging failures break webhook handling
+    console.warn(`[routing] Failed to log unrouted event: ${e.message}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // WEBHOOK HANDLER
 // Unipile POSTs events here. We auth via shared secret in URL query
 // (since Unipile doesn't sign webhooks by default).
 // ═══════════════════════════════════════════════════════════════
 
-async function handleWebhook(request, baseId) {
+async function handleWebhook(request, fallbackBaseId) {
   const body = await request.json().catch(() => ({}));
   const eventType = body.event || body.type || body.AccountType || "unknown";
   const accountId = body.account_id || body.account?.id || null;
@@ -346,19 +445,51 @@ async function handleWebhook(request, baseId) {
       return NextResponse.json({ ok: true, ignored: true, reason: "unhandled event type", type: eventType });
   }
 
-  // Find the lead this event is about
+  // ─── Account-based routing ───
+  // Look up which campaign base this account_id belongs to. If not mapped,
+  // log to Unrouted Triggers so the user can see and configure later.
+  // Falls back to fallbackBaseId from URL ONLY if the URL provided one (legacy support).
+  let routingEntry = null;
+  let baseId = null;
+  if (accountId) {
+    routingEntry = await lookupBaseForAccount(accountId);
+    if (routingEntry) {
+      baseId = routingEntry.baseId;
+    }
+  }
+
+  if (!baseId) {
+    if (fallbackBaseId) {
+      // Legacy webhook URL with explicit ?base= param. Use it but log the fact.
+      baseId = fallbackBaseId;
+      console.log(`[routing] No routing entry for account ${accountId}, using fallback base from URL: ${fallbackBaseId}`);
+    } else {
+      // No routing. Log to Unrouted Triggers and bail.
+      await logUnroutedEvent({ accountId, eventType, eventId, signalText, evidenceUrl, leadLinkedInData, payload: body });
+      return NextResponse.json({
+        ok: true,
+        ignored: true,
+        reason: "no routing entry for this account_id",
+        accountId,
+        hint: "Add this account to the Account Routing table in master base, OR set up the routing via the Triggers tab in SignalScope",
+      });
+    }
+  }
+
+  // Find the lead this event is about (in the routed base)
   const { lead, match_type } = await findLeadForUnipileEvent(baseId, leadLinkedInData);
   if (!lead) {
-    console.log(`[unipile-triggers] No matching lead for event:`, leadLinkedInData);
+    console.log(`[unipile-triggers] No matching lead in base ${baseId} for event:`, leadLinkedInData);
     return NextResponse.json({
       ok: true,
       ignored: true,
       reason: "no matching lead in Leads table",
+      base: baseId,
       tried: { provider_id: leadLinkedInData.provider_id, public_id: leadLinkedInData.public_identifier },
     });
   }
 
-  // Create the task
+  // Create the task in the routed base
   const result = await createTriggerTask(baseId, {
     triggerType, lead, signalText, evidenceUrl,
     accountId, eventId,
@@ -369,6 +500,9 @@ async function handleWebhook(request, baseId) {
     trigger_type: triggerType,
     matched_lead: lead.fields?.Name || null,
     match_type,
+    routed_to_base: baseId,
+    routed_via: routingEntry ? "account_routing_table" : "fallback_url_param",
+    client_name: routingEntry?.clientName || null,
     task: result.created ? { id: result.created.id } : null,
     skipped: result.skipped || false,
     errors: result.errors || [],
@@ -480,7 +614,7 @@ export async function GET(request) {
           name: a.name || a.user?.name || "unnamed",
         })),
         leads_indexed: idx.totalLeads,
-        webhook_url: `${url.origin}/api/unipile-triggers?action=webhook&key=YOUR_CRON_SECRET&base=${baseId}`,
+        webhook_url: `${url.origin}/api/unipile-triggers?action=webhook&key=YOUR_CRON_SECRET`,
         poll_url: `${url.origin}/api/unipile-triggers?action=poll&key=YOUR_CRON_SECRET&base=${baseId}`,
       });
     }
@@ -531,15 +665,21 @@ export async function POST(request) {
     if (!CRON_SECRET || key !== CRON_SECRET) {
       return NextResponse.json({ error: "Invalid key" }, { status: 401 });
     }
-    return handleWebhook(request, baseId);
+    // For the webhook, only use ?base= param if EXPLICITLY provided in URL.
+    // Otherwise pass null and let account-based routing decide.
+    // Master base would be wrong as a fallback — events would land in the campaigns
+    // registry table instead of a real client base.
+    const explicitBase = url.searchParams.get("base") || null;
+    return handleWebhook(request, explicitBase);
   }
 
   // UI actions (called from the SignalScope frontend)
   let body;
   try { body = await request.json(); }
-  catch { return NextResponse.json({ error: "Invalid JSON" }, { status: 400 }); }
+  catch { body = {}; } // some UI actions may not send a body
 
-  const uiAction = body.action;
+  // Action can come from URL (frontend pattern: ?action=X) OR from body (legacy)
+  const uiAction = body.action || (action !== "ui_action" ? action : null);
 
   switch (uiAction) {
     case "test_match": {
@@ -564,6 +704,159 @@ export async function POST(request) {
 
     case "trigger_definitions": {
       return NextResponse.json({ ok: true, triggers: TRIGGER_DEFINITIONS });
+    }
+
+    // ─── Routing UI actions ───
+    case "list_routing": {
+      // Return all routing entries from master base + the connected Unipile accounts,
+      // joined so UI can show "Account X → Campaign Y" with a dropdown to change Y.
+      try {
+        const [accountsRes, routingRecords, campaignsRes] = await Promise.all([
+          unipileReq("/accounts"),
+          MASTER_BASE_ID ? atListAll(MASTER_BASE_ID, "Account Routing").catch(() => []) : [],
+          MASTER_BASE_ID ? atListAll(MASTER_BASE_ID, "Campaigns").catch(() => []) : [],
+        ]);
+        // Surface Unipile connection errors so the UI knows why no accounts show up
+        if (!accountsRes.ok) {
+          return NextResponse.json({
+            ok: false,
+            error: `Could not connect to Unipile: ${typeof accountsRes.data === "string" ? accountsRes.data.slice(0, 200) : (accountsRes.data?.error || JSON.stringify(accountsRes.data).slice(0, 200))}`,
+            unipile_status: accountsRes.status,
+          });
+        }
+        const accounts = accountsRes.data?.items || accountsRes.data?.accounts || (Array.isArray(accountsRes.data) ? accountsRes.data : []);
+        const routingByAcct = new Map();
+        for (const r of routingRecords) {
+          const f = r.fields || {};
+          if (f["Account ID"]) routingByAcct.set(f["Account ID"], { recordId: r.id, ...f });
+        }
+        const campaigns = (campaignsRes || []).map(c => ({
+          id: c.id,
+          name: c.fields?.Name || "Unnamed",
+          baseId: c.fields?.["Base ID"] || c.fields?.["Airtable Base ID"] || "",
+        })).filter(c => c.baseId);
+        const accountList = accounts.map(a => {
+          const acctId = a.id || a.account_id;
+          const routing = routingByAcct.get(acctId);
+          return {
+            account_id: acctId,
+            name: a.name || a.user?.name || "unnamed",
+            provider: a.provider || a.type || "unknown",
+            status: a.status,
+            routed_to_base_id: routing?.["Campaign Base ID"] || null,
+            routed_to_client: routing?.["Client Name"] || null,
+            routing_record_id: routing?.recordId || null,
+            active: routing ? routing["Active"] === true : false,
+          };
+        });
+        return NextResponse.json({ ok: true, accounts: accountList, campaigns, total_routed: routingByAcct.size });
+      } catch (e) {
+        return NextResponse.json({ error: e.message }, { status: 500 });
+      }
+    }
+
+    case "set_routing": {
+      // body: { account_id, account_name, campaign_base_id, client_name }
+      const { account_id, account_name, campaign_base_id, client_name } = body;
+      if (!account_id || !campaign_base_id) return NextResponse.json({ error: "account_id and campaign_base_id required" }, { status: 400 });
+      if (!MASTER_BASE_ID) return NextResponse.json({ error: "Master base not configured" }, { status: 500 });
+      try {
+        // Upsert: check if row exists for this account_id
+        const existing = await atFindOne(MASTER_BASE_ID, "Account Routing", `{Account ID} = "${account_id.replace(/"/g, '\\"')}"`);
+        const fields = {
+          Name: `${client_name || account_name || account_id} routing`,
+          "Account ID": account_id,
+          "Account Name": account_name || "",
+          "Campaign Base ID": campaign_base_id,
+          "Client Name": client_name || "",
+          Active: true,
+        };
+        if (existing) {
+          // Update — using direct PATCH since atUpdateBatch isn't in this file
+          const r = await fetch(`${AT_API}/${MASTER_BASE_ID}/${encodeURIComponent("Account Routing")}/${existing.id}`, {
+            method: "PATCH", headers: atHdr,
+            body: JSON.stringify({ fields, typecast: true }),
+          });
+          if (!r.ok) {
+            const errText = await r.text();
+            return NextResponse.json({ error: `Update failed: ${errText.slice(0, 200)}` }, { status: 500 });
+          }
+          routingCache = null; // invalidate
+          return NextResponse.json({ ok: true, action: "updated", record_id: existing.id });
+        } else {
+          const result = await atCreateBatch(MASTER_BASE_ID, "Account Routing", [{ fields }]);
+          if (result.errors.length > 0) return NextResponse.json({ error: result.errors[0] }, { status: 500 });
+          routingCache = null; // invalidate
+          return NextResponse.json({ ok: true, action: "created", record_id: result.results[0]?.id });
+        }
+      } catch (e) {
+        return NextResponse.json({ error: e.message }, { status: 500 });
+      }
+    }
+
+    case "delete_routing": {
+      const { record_id } = body;
+      if (!record_id) return NextResponse.json({ error: "record_id required" }, { status: 400 });
+      if (!MASTER_BASE_ID) return NextResponse.json({ error: "Master base not configured" }, { status: 500 });
+      try {
+        const r = await fetch(`${AT_API}/${MASTER_BASE_ID}/${encodeURIComponent("Account Routing")}/${record_id}`, {
+          method: "DELETE", headers: atHdr,
+        });
+        if (!r.ok) return NextResponse.json({ error: `Delete failed: ${r.status}` }, { status: 500 });
+        routingCache = null;
+        return NextResponse.json({ ok: true });
+      } catch (e) {
+        return NextResponse.json({ error: e.message }, { status: 500 });
+      }
+    }
+
+    case "list_unrouted": {
+      // For UI: show events that fell through (no account routing entry).
+      // Lets user see what they need to add to the routing table.
+      if (!MASTER_BASE_ID) return NextResponse.json({ ok: true, unrouted: [] });
+      try {
+        const records = await atListAll(MASTER_BASE_ID, "Unrouted Triggers", {
+          "sort[0][field]": "Received", "sort[0][direction]": "desc", maxRecords: "100",
+        }).catch(() => []);
+        return NextResponse.json({
+          ok: true,
+          unrouted: records.slice(0, 100).map(r => ({
+            id: r.id,
+            account_id: r.fields?.["Account ID"],
+            event_type: r.fields?.["Event Type"],
+            lead_name: r.fields?.["Lead Name"],
+            signal_text: r.fields?.["Signal Text"],
+            received: r.fields?.Received,
+          })),
+          // Group by account_id so user sees how many events per unmapped account
+          by_account: (() => {
+            const m = {};
+            for (const r of records) {
+              const a = r.fields?.["Account ID"] || "unknown";
+              m[a] = (m[a] || 0) + 1;
+            }
+            return Object.entries(m).map(([account_id, count]) => ({ account_id, count })).sort((a, b) => b.count - a.count);
+          })(),
+        });
+      } catch (e) {
+        return NextResponse.json({ error: e.message }, { status: 500 });
+      }
+    }
+
+    case "ensure_routing_tables": {
+      // Trigger the airtable route's schema setup on the master base — creates
+      // Account Routing and Unrouted Triggers tables if they don't exist.
+      if (!MASTER_BASE_ID) return NextResponse.json({ error: "Master base not configured" }, { status: 500 });
+      try {
+        const r = await fetch(`${url.origin}/api/airtable`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "setup", baseId: MASTER_BASE_ID }),
+        });
+        const result = await r.json();
+        return NextResponse.json({ ok: r.ok, ...result });
+      } catch (e) {
+        return NextResponse.json({ error: e.message }, { status: 500 });
+      }
     }
 
     default:

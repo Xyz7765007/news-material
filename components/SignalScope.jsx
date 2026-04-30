@@ -1295,19 +1295,37 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const scanBufferRef = useRef([]); // collects all new tasks during scan
   const dupCountRef = useRef(0);
 
-  const startScan = useCallback(async()=>{
-    const sigRules=rules.filter(r=>{const tt=(r.fields||{})["Task Type"]||"news";return tt==="news"||tt==="job_post"||tt==="both"});
-    if(scanning||!accounts.length||!sigRules.length)return;
+  // mode: "all" | "news" | "jobs"
+  // Allows user to run only news scans, only jobs scans, or both. Each mode
+  // filters its rule set and skips the other phase entirely (saves time + API cost
+  // when user only wants one signal type).
+  const startScan = useCallback(async(mode = "all")=>{
+    // Filter rules based on mode. "both" rules run in BOTH news and jobs phases.
+    const ruleMatches = (tt) => {
+      if (mode === "news") return tt === "news" || tt === "both";
+      if (mode === "jobs") return tt === "job_post" || tt === "both";
+      return tt === "news" || tt === "job_post" || tt === "both";
+    };
+    const sigRules=rules.filter(r=>ruleMatches((r.fields||{})["Task Type"]||"news"));
+    // scanRef.current synchronously catches fast double-clicks (between event and React state flush)
+    if(scanning||scanRef.current||!accounts.length||!sigRules.length)return;
     setScanning(true);scanRef.current=true;setScanProg(0);
     buildSeenSet(); scanBufferRef.current = []; dupCountRef.current = 0;
-    const taskDefs=rules.filter(r=>{const tt=(r.fields||{})["Task Type"]||"news";return tt==="news"||tt==="job_post"||tt==="both"}).map(r=>{const f=r.fields||{};const kws=(f.Keywords||"").split(",").map(k=>k.trim()).filter(Boolean);const jtk=(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()).filter(Boolean);let sp=f["Scoring Prompt"]||"";if(!sp){const ak=[...kws,...jtk].slice(0,5).join(", ");sp="Rate this signal for \""+f.Name+"\". Score 90-100 for exact matches ("+ak+"). 70-89 strong. 50-69 partial. Below 50 unrelated."}return{id:r.id,name:f.Name||"",description:f.Description||"",taskType:f["Task Type"]||"news",scanTarget:f["Scan Target"]||"accounts",ease:f.Ease||"Medium",strength:f.Strength||"Medium",sources:(f.Sources||"").split(",").map(s=>s.trim()).filter(Boolean),keywords:kws,jobTitleKeywords:jtk,scoringPrompt:sp}});
+    const taskDefs=rules.filter(r=>ruleMatches((r.fields||{})["Task Type"]||"news")).map(r=>{const f=r.fields||{};const kws=(f.Keywords||"").split(",").map(k=>k.trim()).filter(Boolean);const jtk=(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()).filter(Boolean);let sp=f["Scoring Prompt"]||"";if(!sp){const ak=[...kws,...jtk].slice(0,5).join(", ");sp="Rate this signal for \""+f.Name+"\". Score 90-100 for exact matches ("+ak+"). 70-89 strong. 50-69 partial. Below 50 unrelated."}return{id:r.id,name:f.Name||"",description:f.Description||"",taskType:f["Task Type"]||"news",scanTarget:f["Scan Target"]||"accounts",ease:f.Ease||"Medium",strength:f.Strength||"Medium",sources:(f.Sources||"").split(",").map(s=>s.trim()).filter(Boolean),keywords:kws,jobTitleKeywords:jtk,scoringPrompt:sp}});
     const companies=accounts.map(a=>{const f=a.fields||{};const li=f["LinkedIn URL"]||f.LinkedIn||"";return{name:f.Name||f.Company||"",domain:f.Domain||f.Website||"",linkedinSlug:extractLinkedInSlug(li),linkedinCompanyId:extractLinkedInId(li)}}).filter(c=>c.name);
     const nT=taskDefs.filter(t=>t.taskType==="news"||t.taskType==="both");
     const jT=taskDefs.filter(t=>t.taskType==="job_post"||t.taskType==="both");
     const total=companies.length;
-    if(nT.length>0){for(let i=0;i<companies.length;i++){if(!scanRef.current)break;setScanText("📰 "+companies[i].name);setScanProg(Math.round(i/total*50));try{const res=await fetch("/api/scan",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({company:companies[i],taskDefs:nT,mode:"news"})});if(res.ok){const d=await res.json();bufferSignals(d.news||[],companies[i],taskDefs)}}catch(e){console.error(e)}await sleep(100)}}
-    if(scanRef.current&&jT.length>0){const need=companies.filter(c=>c.linkedinSlug&&!c.linkedinCompanyId);if(need.length>0){setScanText("🔗 Resolving LinkedIn IDs...");try{const res=await fetch("/api/resolve-linkedin",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({slugs:need.map(c=>c.linkedinSlug)})});if(res.ok){const{ids}=await res.json();for(const c of companies){if(c.linkedinSlug&&!c.linkedinCompanyId&&ids[c.linkedinSlug.toLowerCase()])c.linkedinCompanyId=ids[c.linkedinSlug.toLowerCase()]}}}catch(e){console.error(e)}}
-    const BS=5;for(let b=0;b<companies.length;b+=BS){if(!scanRef.current)break;const batch=companies.slice(b,b+BS);setScanText("📋 Jobs — Batch "+(Math.floor(b/BS)+1));setScanProg(50+Math.round(b/companies.length*50));try{const res=await fetch("/api/scan",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({companies:batch,taskDefs:jT,mode:"jobs-batch"})});if(res.ok){const d=await res.json();for(const result of(d.results||[])){const co=batch.find(c=>c.name===result.company);if(co)bufferSignals(result.signals||[],co,taskDefs)}}}catch(e){console.error(e)}await sleep(200)}}
+    // Progress allocation: if running a single mode, that mode gets the full 0-90% range.
+    // If running "all", news is 0-50% and jobs is 50-90% (legacy split).
+    const newsRange = mode === "news" ? 90 : 50;
+    const jobsBase = mode === "jobs" ? 0 : 50;
+    const jobsRange = mode === "jobs" ? 90 : 40;
+    // ── NEWS phase ──
+    if(mode!=="jobs"&&nT.length>0){for(let i=0;i<companies.length;i++){if(!scanRef.current)break;setScanText("📰 "+companies[i].name);setScanProg(Math.round(i/total*newsRange));try{const res=await fetch("/api/scan",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({company:companies[i],taskDefs:nT,mode:"news",threshold})});if(res.ok){const d=await res.json();bufferSignals(d.news||[],companies[i],taskDefs)}}catch(e){console.error(e)}await sleep(100)}}
+    // ── JOBS phase ──
+    if(scanRef.current&&mode!=="news"&&jT.length>0){const need=companies.filter(c=>c.linkedinSlug&&!c.linkedinCompanyId);if(need.length>0){setScanText("🔗 Resolving LinkedIn IDs...");try{const res=await fetch("/api/resolve-linkedin",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({slugs:need.map(c=>c.linkedinSlug)})});if(res.ok){const{ids}=await res.json();for(const c of companies){if(c.linkedinSlug&&!c.linkedinCompanyId&&ids[c.linkedinSlug.toLowerCase()])c.linkedinCompanyId=ids[c.linkedinSlug.toLowerCase()]}}}catch(e){console.error(e)}}
+    const BS=5;for(let b=0;b<companies.length;b+=BS){if(!scanRef.current)break;const batch=companies.slice(b,b+BS);setScanText("📋 Jobs — Batch "+(Math.floor(b/BS)+1));setScanProg(jobsBase+Math.round(b/companies.length*jobsRange));try{const res=await fetch("/api/scan",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({companies:batch,taskDefs:jT,mode:"jobs-batch",threshold})});if(res.ok){const d=await res.json();for(const result of(d.results||[])){const co=batch.find(c=>c.name===result.company);if(co)bufferSignals(result.signals||[],co,taskDefs)}}}catch(e){console.error(e)}await sleep(200)}}
 
     // ─── Post-scan: AI dedup + save ───────────────────────────
     const buffered = scanBufferRef.current;
@@ -1332,11 +1350,24 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const bufferSignals = (signals, company, taskDefs)=>{
     for(const sig of signals){
       const scores=sig.relevanceScores||{};
+      const reasons=sig.scoreReasons||{};
       for(const tid of(sig.matchedTaskIds||[])){
         const td=taskDefs.find(t=>t.id===tid);if(!td)continue;
         const score=Math.max(0,Math.min(100,parseInt(scores[tid]||Math.round((sig.confidence||0.7)*100))||50));
         if(score<threshold)continue;
-        const newTask={Company:company.name,"Task Rule":td.name,Score:score,"Scan Target":td.scanTarget||"accounts",Signal:sig.headline||"",Source:sig.source||"",URL:sig.url||"","Task Type":sig.taskType||"news",Date:sig.date?sig.date.slice(0,10):new Date().toISOString().slice(0,10),Created:new Date().toISOString()};
+        const newTask={
+          Company:company.name,
+          "Task Rule":td.name,
+          Score:score,
+          "Score Reason":reasons[tid]||"",
+          "Scan Target":td.scanTarget||"accounts",
+          Signal:sig.headline||"",
+          Source:sig.source||"",
+          URL:sig.url||"",
+          "Task Type":sig.taskType||"news",
+          Date:sig.date?sig.date.slice(0,10):new Date().toISOString().slice(0,10),
+          Created:new Date().toISOString()
+        };
         // Instant dedup: fingerprint + URL + fuzzy against existing + buffer
         if(isDuplicate(newTask, [...tasks, ...scanBufferRef.current.map(t=>({fields:t}))])){
           dupCountRef.current++;
@@ -1423,6 +1454,9 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
 
   // ═══ DASHBOARD ═════════════════════════════════════════════
   const signalRules = rules.filter(r => { const tt = (r.fields||{})["Task Type"]; return !tt || tt==="news" || tt==="job_post" || tt==="both"; });
+  // Per-mode counts for the split scan buttons. "both" rules count toward BOTH news and jobs.
+  const newsRuleCount = signalRules.filter(r => { const tt=(r.fields||{})["Task Type"]||"news"; return tt==="news"||tt==="both"; }).length;
+  const jobsRuleCount = signalRules.filter(r => { const tt=(r.fields||{})["Task Type"]||"news"; return tt==="job_post"||tt==="both"; }).length;
   const topXRules = rules.filter(r => (r.fields||{})["Task Type"] === "top_x");
 
   const navs = [
@@ -1509,7 +1543,10 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   {tab==="dashboard"&&!loading&&(<div>
     <div className="ph"><div><div className="pt">{clientMode ? `${camp.emoji||"📊"} ${camp.name}` : "Dashboard"}</div><div className="pd">{clientMode ? "Your campaign workspace — everything in one view" : `${camp.name} — Real-time overview`}</div></div>
       <div style={{display:"flex",gap:6}}>
-        {hasSignals&&<button className="btn btn-s btn-p" onClick={startScan} disabled={scanning||!accounts.length||!signalRules.length}>{scanning?"⏳ "+Math.round(scanProg)+"%":<>▶ Run Scan</>}</button>}
+        {hasSignals&&<>
+          <button className="btn btn-s btn-p" onClick={()=>startScan("news")} disabled={scanning||!accounts.length||!newsRuleCount} title={!newsRuleCount?"No news or both-type rules":`Scan ${newsRuleCount} news rule${newsRuleCount===1?"":"s"}`}>{scanning?"⏳ "+Math.round(scanProg)+"%":<>📰 News</>}</button>
+          <button className="btn btn-s btn-p" onClick={()=>startScan("jobs")} disabled={scanning||!accounts.length||!jobsRuleCount} title={!jobsRuleCount?"No job_post or both-type rules":`Scan ${jobsRuleCount} jobs rule${jobsRuleCount===1?"":"s"}`}>{scanning?"⏳ "+Math.round(scanProg)+"%":<>📋 Jobs</>}</button>
+        </>}
       </div>
     </div>
 
@@ -2201,12 +2238,104 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   </>}</div>)}
 
   {/* PROMPTS */}
-  {tab==="prompts"&&!loading&&(<div><div className="ph"><div><div className="pt">Scoring Prompts</div><div className="pd">AI scoring criteria (0-100)</div></div><button className="btn btn-ai btn-s" onClick={async()=>{const empty=rules.filter(r=>!(r.fields||{})["Scoring Prompt"]);for(const rule of empty){const f=rule.fields||{};try{const res=await fetch("/api/classify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"generate_scoring_prompt",taskName:f.Name,taskDescription:f.Description,taskKeywords:(f.Keywords||"").split(",").map(k=>k.trim()),taskJobTitleKeywords:(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()),taskSources:(f.Sources||"").split(",").map(s=>s.trim())})});if(res.ok){const d=await res.json();if(d.scoringPrompt){await at("update","Task Rules",{records:[{id:rule.id,fields:{"Scoring Prompt":d.scoringPrompt}}]},bid);setRules(p=>p.map(x=>x.id===rule.id?{...x,fields:{...x.fields,"Scoring Prompt":d.scoringPrompt}}:x))}}}catch(e){console.error(e)}}}}><I.Sparkle/> Generate Missing</button></div>
-  <div style={{display:"flex",flexDirection:"column",gap:12}}>{rules.map(r=>{const f=r.fields||{};const tt=f["Task Type"]||"news";return(<div key={r.id} style={{padding:14,border:"1px solid var(--bdr)",borderRadius:8,background:"var(--card)"}}>
+  {tab==="prompts"&&!loading&&(<div>
+  <div className="ph">
+    <div>
+      <div className="pt">Scoring Prompts</div>
+      <div className="pd">AI scoring criteria (0-100). Your prompt is the SINGLE source of truth — there are no hardcoded judgement rules competing with it.</div>
+    </div>
+    <button className="btn btn-ai btn-s" onClick={async()=>{const empty=rules.filter(r=>!(r.fields||{})["Scoring Prompt"]);for(const rule of empty){const f=rule.fields||{};try{const res=await fetch("/api/classify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"generate_scoring_prompt",taskName:f.Name,taskDescription:f.Description,taskKeywords:(f.Keywords||"").split(",").map(k=>k.trim()),taskJobTitleKeywords:(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()),taskSources:(f.Sources||"").split(",").map(s=>s.trim())})});if(res.ok){const d=await res.json();if(d.scoringPrompt){await at("update","Task Rules",{records:[{id:rule.id,fields:{"Scoring Prompt":d.scoringPrompt}}]},bid);setRules(p=>p.map(x=>x.id===rule.id?{...x,fields:{...x.fields,"Scoring Prompt":d.scoringPrompt}}:x))}}}catch(e){console.error(e)}}}}><I.Sparkle/> Generate Missing</button>
+  </div>
+
+  {/* PROMPT REFERENCE — collapsible, explains the full prompt contract */}
+  <details style={{marginBottom:16,padding:0,border:"1px solid rgba(155,126,216,.3)",borderRadius:8,background:"rgba(155,126,216,.04)"}}>
+    <summary style={{cursor:"pointer",padding:14,fontSize:12,fontWeight:600,color:"var(--pur)",userSelect:"none"}}>📖 How prompts work — the full contract</summary>
+    <div style={{padding:"0 14px 14px",fontSize:11,color:"var(--t2)",lineHeight:1.7}}>
+
+      <div style={{marginTop:8,marginBottom:8,fontSize:11,fontWeight:600,color:"var(--t1)"}}>1. What the AI sees per signal</div>
+      <div style={{padding:10,background:"var(--bg)",borderRadius:6,fontFamily:"'JetBrains Mono',monospace",fontSize:10,color:"var(--t2)",whiteSpace:"pre-wrap",marginBottom:10}}>
+{`# News mode — per signal:
+[<idx>] <headline>
+  Source: <publication name>
+  Date: <YYYY-MM-DD>
+  Excerpt: <RSS description, 250 chars>
+  Article body: <full fetched body, up to 1000 chars>
+
+# Jobs mode — per signal:
+[<idx>] <Job Title @ Company>
+  Title: <job title>
+  Location: <location>
+  Company: <Apify-resolved company name>
+  Description: <job description, 600 chars>`}
+      </div>
+
+      <div style={{marginTop:14,marginBottom:8,fontSize:11,fontWeight:600,color:"var(--t1)"}}>2. The system prompt (sent before your custom prompt)</div>
+      <div style={{padding:10,background:"var(--bg)",borderRadius:6,fontFamily:"'JetBrains Mono',monospace",fontSize:10,color:"var(--t2)",whiteSpace:"pre-wrap",marginBottom:10}}>
+{`You are scoring [news articles about "<company>" | job postings] against ONE specific task: "<task name>".
+
+The user has provided their scoring criteria below. Use it AS THE PRIMARY GUIDE — it overrides any generic intuition.
+
+Score each signal 0-100:
+- 90-100: exact match, immediately actionable
+- 70-89: strong match, likely actionable
+- 50-69: partial / tangential
+- Below 50: reject
+
+Return ONLY signals scoring <threshold> or higher. Drop everything else.
+
+Output format (strict JSON, no markdown):
+{
+  "matches": [
+    { "idx": <original index from input>, "score": <0-100 integer>, "reason": "<1 sentence, max 140 chars>" }
+  ]
+}`}
+      </div>
+
+      <div style={{marginTop:14,marginBottom:8,fontSize:11,fontWeight:600,color:"var(--t1)"}}>3. Your prompt is appended verbatim — no rewording</div>
+      <div style={{padding:10,background:"rgba(93,168,122,.08)",border:"1px solid rgba(93,168,122,.3)",borderRadius:6,marginBottom:10}}>
+        ✅ Whatever you write below is sent to the model as-is. Be specific. Use concrete examples. List false positives explicitly.
+      </div>
+
+      <div style={{marginTop:14,marginBottom:8,fontSize:11,fontWeight:600,color:"var(--t1)"}}>4. What the app expects back</div>
+      <div style={{padding:10,background:"var(--bg)",borderRadius:6,fontFamily:"'JetBrains Mono',monospace",fontSize:10,color:"var(--t2)",whiteSpace:"pre-wrap",marginBottom:10}}>
+{`{
+  "matches": [
+    { "idx": 3, "score": 92, "reason": "CMO publicly stepped down, immediately actionable" },
+    { "idx": 7, "score": 75, "reason": "VP Marketing role open — adjacent to target seniority" }
+  ]
+}`}
+      </div>
+      <div style={{marginTop:6,marginBottom:14,padding:10,background:"rgba(91,143,212,.08)",border:"1px solid rgba(91,143,212,.3)",borderRadius:6}}>
+        <strong style={{color:"var(--blu)"}}>Read by the app:</strong> The <code>idx</code> maps back to the input signal. The <code>score</code> populates the Tasks <code>Score</code> field. The <code>reason</code> populates the new <code>Score Reason</code> field — visible on each task. Anything below the threshold (set in 🎯 Threshold tab, default 70) is dropped at the AI level — you save tokens and the frontend never sees it.
+      </div>
+
+      <div style={{marginTop:14,marginBottom:8,fontSize:11,fontWeight:600,color:"var(--t1)"}}>5. Pre-filtering before AI</div>
+      <div style={{padding:10,background:"var(--bg)",borderRadius:6,marginBottom:10,color:"var(--t3)",fontSize:10}}>
+        Before sending to AI, signals are pre-filtered by keyword presence in headline/description (or job title for jobs). If your rule has keywords <code>[CMO, marketing, brand]</code>, signals not mentioning any of those get dropped without an AI call. <strong>If your rule has NO keywords, all signals go through.</strong> Use keywords as a coarse filter; use the prompt for the precise judgement.
+      </div>
+
+      <div style={{marginTop:14,marginBottom:8,fontSize:11,fontWeight:600,color:"var(--t1)"}}>6. Prompt-writing tips</div>
+      <div style={{paddingLeft:14,fontSize:11,color:"var(--t2)"}}>
+        <div style={{marginBottom:4}}>• <strong>Lead with the WHAT</strong>: "Score 90+ if a senior marketer just exited their role." First sentence anchors the AI.</div>
+        <div style={{marginBottom:4}}>• <strong>Define each tier</strong> (90-100, 70-89, 50-69, &lt;50) with concrete examples.</div>
+        <div style={{marginBottom:4}}>• <strong>List explicit false positives</strong>: "An engineer leaving is NOT a marketer; score below 30."</div>
+        <div style={{marginBottom:4}}>• <strong>Mention the role / seniority precisely</strong>: "Director, VP, CMO" not "senior marketer."</div>
+        <div style={{marginBottom:4}}>• <strong>Disambiguate ambiguous topics</strong>: "Regulatory change" → which kind? Healthcare? Privacy? Antitrust?</div>
+        <div style={{marginBottom:4}}>• <strong>Don't repeat the system prompt</strong>: no need to say "return JSON" or "score 0-100" — that's already in the system prompt.</div>
+        <div style={{marginBottom:4}}>• <strong>Keep it under 500 chars</strong> for best results. Long prompts dilute focus.</div>
+      </div>
+    </div>
+  </details>
+
+  <div style={{display:"flex",flexDirection:"column",gap:12}}>{rules.filter(r=>{const tt=(r.fields||{})["Task Type"]||"news";return tt==="news"||tt==="job_post"||tt==="both"}).map(r=>{const f=r.fields||{};const tt=f["Task Type"]||"news";return(<div key={r.id} style={{padding:14,border:"1px solid var(--bdr)",borderRadius:8,background:"var(--card)"}}>
   <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}><div style={{display:"flex",alignItems:"center",gap:8}}><span className={"chip "+(tt==="job_post"?"cb":tt==="top_x"?"cp":"cg")}>{tt.replace(/_/g," ")}</span><span style={{fontSize:13,fontWeight:600}}>{f.Name}</span></div>
   <button className="btn btn-ai btn-s" onClick={async()=>{try{const res=await fetch("/api/classify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"generate_scoring_prompt",taskName:f.Name,taskDescription:f.Description,taskKeywords:(f.Keywords||"").split(",").map(k=>k.trim()),taskJobTitleKeywords:(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()),taskSources:(f.Sources||"").split(",").map(s=>s.trim())})});if(res.ok){const d=await res.json();if(d.scoringPrompt){await at("update","Task Rules",{records:[{id:r.id,fields:{"Scoring Prompt":d.scoringPrompt}}]},bid);setRules(p=>p.map(x=>x.id===r.id?{...x,fields:{...x.fields,"Scoring Prompt":d.scoringPrompt}}:x))}}}catch(e){console.error(e)}}}><I.Sparkle/> Regen</button></div>
-  <textarea className="inp ta" value={f["Scoring Prompt"]||""} placeholder="No prompt — click Regen" style={{minHeight:70,fontSize:11,background:"var(--bg)"}} onChange={e=>{const v=e.target.value;setRules(p=>p.map(x=>x.id===r.id?{...x,fields:{...x.fields,"Scoring Prompt":v}}:x))}} onBlur={async e=>{try{await at("update","Task Rules",{records:[{id:r.id,fields:{"Scoring Prompt":e.target.value}}]},bid)}catch{}}}/>
-  <div style={{fontSize:9,color:"var(--t3)",marginTop:4}}>{f["Scoring Prompt"]?f["Scoring Prompt"].length+" chars":"⚠️ Empty"}</div></div>)})}</div></div>)}
+  <textarea className="inp ta" value={f["Scoring Prompt"]||""} placeholder="No prompt — click Regen, or write one using the reference above" style={{minHeight:90,fontSize:11,background:"var(--bg)"}} onChange={e=>{const v=e.target.value;setRules(p=>p.map(x=>x.id===r.id?{...x,fields:{...x.fields,"Scoring Prompt":v}}:x))}} onBlur={async e=>{try{await at("update","Task Rules",{records:[{id:r.id,fields:{"Scoring Prompt":e.target.value}}]},bid)}catch{}}}/>
+  <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"var(--t3)",marginTop:4}}>
+    <span>{f["Scoring Prompt"]?f["Scoring Prompt"].length+" chars":"⚠️ Empty — task name/description will be used"}</span>
+    <span>{(f.Keywords||f["Job Title Keywords"])?<>Keywords pre-filter: <strong style={{color:"var(--t2)"}}>{[...(f.Keywords||"").split(",").map(k=>k.trim()).filter(Boolean),...(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()).filter(Boolean)].length}</strong> active</>:<span style={{color:"var(--amb)"}}>⚠ No keywords — all signals go to AI</span>}</span>
+  </div>
+  </div>)})}</div></div>)}
 
   {/* THRESHOLD */}
   {tab==="threshold"&&!loading&&(<div><div className="ph"><div><div className="pt">Scoring Threshold</div><div className="pd">Minimum score for signals to become tasks</div></div></div>
@@ -2221,7 +2350,10 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       <button className="btn btn-s" onClick={()=>setShowExportModal(true)} disabled={!tasks.length}><I.Download/> Export{selCount>0?` (${selCount})`:""}</button>
       <button className="btn btn-s" style={{color:"var(--pur)",borderColor:"rgba(155,126,216,.3)"}} disabled={!tasks.length} onClick={()=>setEnrichModal({mode:"select"})}><I.Sparkle/> Enrich Phones</button>
       {hsConnected && <button className="btn btn-s" style={{color:"var(--grn)",borderColor:"rgba(93,168,122,.3)"}} disabled={!tasks.length} onClick={()=>setEnrichModal({mode:"push"})}><I.Upload/> Push to HubSpot{selCount>0?` (${selCount})`:""}</button>}
-      {hasSignals&&<button className="btn btn-p btn-s" onClick={startScan} disabled={scanning||!accounts.length||!signalRules.length}>{scanning?"Scanning "+Math.round(scanProg)+"%":<><I.Play/> Run Scan</>}</button>}
+      {hasSignals&&<>
+        <button className="btn btn-p btn-s" onClick={()=>startScan("news")} disabled={scanning||!accounts.length||!newsRuleCount} title={!newsRuleCount?"No news or both-type rules":`Scan ${newsRuleCount} news rule${newsRuleCount===1?"":"s"}`}>{scanning?"Scanning "+Math.round(scanProg)+"%":<>📰 News</>}</button>
+        <button className="btn btn-p btn-s" onClick={()=>startScan("jobs")} disabled={scanning||!accounts.length||!jobsRuleCount} title={!jobsRuleCount?"No job_post or both-type rules":`Scan ${jobsRuleCount} jobs rule${jobsRuleCount===1?"":"s"}`}>{scanning?"Scanning "+Math.round(scanProg)+"%":<>📋 Jobs</>}</button>
+      </>}
     </div></div>
     {scanning&&<div className="scan-s"><div className="scan-d"/><span style={{fontSize:12,flex:1}}>{scanText}</span><span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:11,color:"var(--acc)"}}>{Math.round(scanProg)}%</span>{hasSignals&&<button className="btn btn-d btn-s" onClick={()=>{scanRef.current=false;setScanning(false)}}>Stop</button>}</div>}
 
@@ -2255,9 +2387,9 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       <td style={{padding:"10px 8px"}}><input type="checkbox" checked={sel} onChange={()=>toggleTask(t.id)} style={{cursor:"pointer",accentColor:"var(--acc)"}}/></td>
       <td style={{color:"var(--t1)",fontWeight:500}}>{f.Company}</td>
       <td>{f["Task Rule"]}</td>
-      <td><div className="sb" style={{width:80}}><div className="st"><div className="sf" style={{width:sc+"%",background:sc>=80?"var(--grn)":sc>=60?"var(--amb)":"var(--red)"}}/></div><span className="sv" style={{color:sc>=80?"var(--grn)":sc>=60?"var(--amb)":"var(--red)"}}>{sc}</span></div></td>
+      <td><div className="sb" style={{width:80}} title={f["Score Reason"]?`AI reason: ${f["Score Reason"]}`:""}><div className="st"><div className="sf" style={{width:sc+"%",background:sc>=80?"var(--grn)":sc>=60?"var(--amb)":"var(--red)"}}/></div><span className="sv" style={{color:sc>=80?"var(--grn)":sc>=60?"var(--amb)":"var(--red)"}}>{sc}</span></div></td>
       <td><span className={"chip "+(f["Scan Target"]==="leads"?"cp":"cg")}>{f["Scan Target"]||"accounts"}</span></td>
-      <td style={{maxWidth:200,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{f.Signal}</td>
+      <td style={{maxWidth:200,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={f.Signal+(f["Score Reason"]?"\n\n💡 Why this matched: "+f["Score Reason"]:"")}>{f.Signal}</td>
       <td><span className={"chip "+(f["Task Type"]==="job_post"?"cb":f["Task Type"]==="top_x"?"cp":"cg")}>{(f["Task Type"]||"news").replace(/_/g," ").toUpperCase()}</span></td>
       <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10}}>{f.Date}</td>
       <td>{f.URL?<a href={f.URL} target="_blank" rel="noopener" style={{color:"var(--blu)",fontSize:10}}>↗</a>:"—"}</td>
@@ -4599,6 +4731,14 @@ function TriggersTab({ baseId, campaign }) {
   const [lastRefreshed, setLastRefreshed] = useState(null);
   const [err, setErr] = useState("");
 
+  // Routing state — for the per-account "which campaign does this LinkedIn account belong to" UI
+  const [routingExpanded, setRoutingExpanded] = useState(false);
+  const [routingData, setRoutingData] = useState(null); // { accounts, campaigns }
+  const [routingLoading, setRoutingLoading] = useState(false);
+  const [routingSavingAcct, setRoutingSavingAcct] = useState(null); // account_id being saved
+  const [unroutedExpanded, setUnroutedExpanded] = useState(false);
+  const [unroutedData, setUnroutedData] = useState(null);
+
   const upiAPI = async (action, body = {}) => {
     const r = await fetch(`/api/unipile-triggers?action=${action}&base=${baseId}`, {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -4646,6 +4786,64 @@ function TriggersTab({ baseId, campaign }) {
     } catch (e) { setErr(e.message); }
     setRefreshing(false);
   };
+
+  // ─── Account Routing helpers ───
+  // Load list of LinkedIn accounts + their current routing + available campaigns
+  const loadRouting = async () => {
+    setRoutingLoading(true);
+    try {
+      // First-time setup — auto-create the master tables if they don't exist yet.
+      // Idempotent — does nothing if tables already exist.
+      await upiAPI("ensure_routing_tables").catch(() => null);
+      const r = await upiAPI("list_routing");
+      if (r.ok) setRoutingData(r);
+      else setErr(r.error || "Failed to load routing");
+    } catch (e) { setErr(e.message); }
+    setRoutingLoading(false);
+  };
+
+  // Save a single account's routing — called from the per-account dropdown
+  const saveRouting = async (account_id, account_name, campaign) => {
+    setRoutingSavingAcct(account_id);
+    try {
+      const r = await upiAPI("set_routing", {
+        account_id,
+        account_name,
+        campaign_base_id: campaign.baseId,
+        client_name: campaign.name,
+      });
+      if (r.ok) await loadRouting(); // refresh display
+      else setErr(r.error || "Failed to save routing");
+    } catch (e) { setErr(e.message); }
+    setRoutingSavingAcct(null);
+  };
+
+  // Remove a routing entry — events from this account will go to Unrouted Triggers
+  const deleteRouting = async (recordId) => {
+    if (!confirm("Remove routing for this account? Future events will be logged to Unrouted Triggers instead of creating tasks.")) return;
+    try {
+      const r = await upiAPI("delete_routing", { record_id: recordId });
+      if (r.ok) await loadRouting();
+      else setErr(r.error || "Failed to delete routing");
+    } catch (e) { setErr(e.message); }
+  };
+
+  // Load unrouted events (events that came in for accounts without a routing entry)
+  const loadUnrouted = async () => {
+    try {
+      const r = await upiAPI("list_unrouted");
+      if (r.ok) setUnroutedData(r);
+      else setErr(r.error || "Failed to load unrouted");
+    } catch (e) { setErr(e.message); }
+  };
+
+  // Auto-load routing when section is expanded
+  useEffect(() => {
+    if (routingExpanded && !routingData) loadRouting();
+  }, [routingExpanded]);
+  useEffect(() => {
+    if (unroutedExpanded && !unroutedData) loadUnrouted();
+  }, [unroutedExpanded]);
 
   // Group triggers by source for the dashboard cards
   const filteredTriggers = sourceFilter === "all"
@@ -4703,13 +4901,149 @@ function TriggersTab({ baseId, campaign }) {
         </div>
         {status.webhook_url && (
           <details style={{marginTop:10,fontSize:10,color:"var(--t3)"}}>
-            <summary style={{cursor:"pointer"}}>📡 Webhook setup (one-time, paste URL into Unipile)</summary>
-            <div style={{marginTop:8,padding:10,background:"var(--hover)",borderRadius:4,fontFamily:"'JetBrains Mono',monospace",wordBreak:"break-all",color:"var(--t2)"}}>{status.webhook_url}</div>
-            <div style={{marginTop:6,fontSize:10}}>Replace YOUR_CRON_SECRET with your CRON_SECRET env var. In Unipile dashboard → Webhooks → New webhook for events: <code>message.received</code>, <code>users.relations.created</code>, <code>post.commented</code>. Once set, these triggers fire automatically — no need to click refresh for them.</div>
+            <summary style={{cursor:"pointer",fontWeight:600,color:"var(--t2)"}}>📡 Unipile webhook setup (do this once per webhook type)</summary>
+            <div style={{marginTop:10,padding:12,background:"var(--hover)",borderRadius:6,lineHeight:1.6}}>
+              <div style={{marginBottom:8,color:"var(--t1)",fontWeight:600,fontSize:11}}>One URL handles everything:</div>
+              <div style={{padding:8,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:4,fontFamily:"'JetBrains Mono',monospace",wordBreak:"break-all",color:"var(--t1)",fontSize:10,marginBottom:10}}>
+                {(status.webhook_url || "").replace(/&base=[^&]+/, "")}
+              </div>
+              <div style={{marginBottom:10,color:"var(--t2)"}}>
+                Replace <code style={{background:"var(--card)",padding:"1px 4px",borderRadius:2}}>YOUR_CRON_SECRET</code> with your <code style={{background:"var(--card)",padding:"1px 4px",borderRadius:2}}>CRON_SECRET</code> env var value (set in Vercel).
+              </div>
+
+              <div style={{marginTop:14,marginBottom:6,color:"var(--t1)",fontWeight:600,fontSize:11}}>Step-by-step in Unipile dashboard:</div>
+              <ol style={{paddingLeft:16,margin:0,color:"var(--t2)"}}>
+                <li style={{marginBottom:6}}>Go to <a href="https://dashboard.unipile.com/webhooks" target="_blank" rel="noopener noreferrer" style={{color:"var(--blu)"}}>Unipile Dashboard → Webhooks</a> → <strong>Create a webhook</strong></li>
+                <li style={{marginBottom:6}}>For <strong>name</strong>, use something like "SignalScope Messaging" so you can identify it later</li>
+                <li style={{marginBottom:6}}>Pick category <strong style={{color:"var(--t1)"}}>Messaging</strong> → Continue</li>
+                <li style={{marginBottom:6}}>Paste the URL above into the webhook URL field</li>
+                <li style={{marginBottom:6}}>Enable event: <code style={{background:"var(--card)",padding:"1px 4px",borderRadius:2}}>message_received</code> (and <code style={{background:"var(--card)",padding:"1px 4px",borderRadius:2}}>message_reaction</code> if shown)</li>
+                <li style={{marginBottom:6}}>Save</li>
+                <li style={{marginBottom:6}}>Repeat: <strong>Create a webhook</strong> → name "SignalScope Connections" → category <strong style={{color:"var(--t1)"}}>Users</strong> → same URL → enable <code style={{background:"var(--card)",padding:"1px 4px",borderRadius:2}}>new_relation</code> (or <code style={{background:"var(--card)",padding:"1px 4px",borderRadius:2}}>users.relations.created</code>)</li>
+                <li style={{marginBottom:6}}>Optional: 3rd webhook for post comments — IF Unipile lists <code style={{background:"var(--card)",padding:"1px 4px",borderRadius:2}}>post_comment</code> as an event. As of writing, this isn't visible in Unipile's UI categories. Skip if not available — manual <strong>🔄 Refresh from Unipile</strong> still pulls reactions and views.</li>
+              </ol>
+
+              <div style={{marginTop:12,padding:8,background:"rgba(91,143,212,.08)",border:"1px solid rgba(91,143,212,.3)",borderRadius:4,color:"var(--t2)",fontSize:10}}>
+                <strong style={{color:"var(--blu)"}}>One URL, all clients.</strong> Routing happens internally based on which LinkedIn account fired the event — set up <strong>🔀 Account Routing</strong> below. Don't add a <code>&base=</code> parameter unless you want to override routing for a specific webhook (legacy mode).
+              </div>
+
+              <div style={{marginTop:10,padding:8,background:"rgba(191,163,90,.08)",border:"1px solid rgba(191,163,90,.3)",borderRadius:4,color:"var(--t2)",fontSize:10}}>
+                <strong style={{color:"var(--amb)"}}>Test it:</strong> after saving, send yourself a LinkedIn DM from another account → check the 🔥 Triggers feed → a task should appear within ~5 seconds. If nothing shows, check 🚧 Unrouted Triggers below — the LinkedIn account_id may not be mapped yet.
+              </div>
+            </div>
           </details>
         )}
       </div>
     )}
+
+    {/* ─── ACCOUNT ROUTING SECTION ─── */}
+    {status?.accounts_count > 0 && (
+      <div style={{marginBottom:14,border:"1px solid var(--bdr)",borderRadius:8,background:"var(--card)"}}>
+        <button onClick={()=>setRoutingExpanded(e=>!e)} style={{width:"100%",padding:14,background:"transparent",border:"none",textAlign:"left",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",color:"var(--t1)"}}>
+          <span style={{fontSize:12,fontWeight:600}}>🔀 Account Routing <span style={{color:"var(--t3)",fontWeight:400,marginLeft:6}}>— map each LinkedIn account to a client campaign</span></span>
+          <span style={{color:"var(--t3)",fontSize:11}}>{routingExpanded ? "▾" : "▸"}</span>
+        </button>
+        {routingExpanded && (
+          <div style={{padding:"0 14px 14px",borderTop:"1px solid var(--bdr)"}}>
+            {routingLoading && !routingData && <div style={{padding:20,textAlign:"center",color:"var(--t3)",fontSize:11}}>Loading...</div>}
+            {routingData && (
+              <div>
+                <div style={{fontSize:10,color:"var(--t3)",marginBottom:10,marginTop:10,lineHeight:1.5}}>
+                  Each LinkedIn account connected to Unipile needs to be mapped to a campaign. Webhook events from that account will create tasks in the mapped campaign's base.
+                  {routingData.campaigns.length === 0 && <div style={{color:"var(--amb)",marginTop:6}}>⚠️ No campaigns found in master base. Create campaigns first via SignalScope's main page.</div>}
+                </div>
+                <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                  {routingData.accounts.map(a => {
+                    const isCurrent = !!a.routed_to_base_id;
+                    const isSaving = routingSavingAcct === a.account_id;
+                    return (
+                      <div key={a.account_id} style={{padding:10,background:"var(--hover)",borderRadius:4,display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+                        <div style={{flex:1,minWidth:200}}>
+                          <div style={{fontSize:11,fontWeight:600,color:"var(--t1)"}}>{a.name}</div>
+                          <div style={{fontSize:9,color:"var(--t3)",fontFamily:"'JetBrains Mono',monospace"}}>
+                            {a.provider} · {a.account_id?.slice(0, 16)}{a.account_id?.length > 16 ? "..." : ""} · {a.status === "OK" || a.status === "active" ? <span style={{color:"var(--grn)"}}>active</span> : <span style={{color:"var(--amb)"}}>{a.status || "unknown"}</span>}
+                          </div>
+                        </div>
+                        <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                          <select
+                            value={a.routed_to_base_id || ""}
+                            onChange={e => {
+                              const v = e.target.value;
+                              if (!v) return;
+                              const camp = routingData.campaigns.find(c => c.baseId === v);
+                              if (camp) saveRouting(a.account_id, a.name, camp);
+                            }}
+                            disabled={isSaving || routingData.campaigns.length === 0}
+                            style={{padding:"5px 8px",background:"var(--card)",border:"1px solid var(--bdr)",color:"var(--t1)",borderRadius:4,fontSize:11,minWidth:160}}>
+                            <option value="">{isSaving ? "Saving..." : isCurrent ? `→ ${a.routed_to_client || a.routed_to_base_id.slice(0,12)}` : "(unmapped — select campaign)"}</option>
+                            {routingData.campaigns.map(c => (
+                              <option key={c.baseId} value={c.baseId}>→ {c.name}</option>
+                            ))}
+                          </select>
+                          {isCurrent && a.routing_record_id && (
+                            <button className="btn btn-s btn-d" onClick={()=>deleteRouting(a.routing_record_id)} title="Remove routing">✕</button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div style={{marginTop:10,fontSize:10,color:"var(--t3)"}}>
+                  💡 Edit <code>Account Routing</code> table directly in your master Airtable base ({routingData.accounts.length} accounts, {routingData.total_routed} mapped). Changes propagate within 2 minutes (cache TTL).
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    )}
+
+    {/* ─── UNROUTED EVENTS SECTION ─── */}
+    <div style={{marginBottom:14,border:"1px solid var(--bdr)",borderRadius:8,background:"var(--card)"}}>
+      <button onClick={()=>setUnroutedExpanded(e=>!e)} style={{width:"100%",padding:14,background:"transparent",border:"none",textAlign:"left",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",color:"var(--t1)"}}>
+        <span style={{fontSize:12,fontWeight:600}}>🚧 Unrouted Triggers <span style={{color:"var(--t3)",fontWeight:400,marginLeft:6}}>— events from accounts not yet mapped</span></span>
+        <span style={{color:"var(--t3)",fontSize:11}}>{unroutedExpanded ? "▾" : "▸"}</span>
+      </button>
+      {unroutedExpanded && (
+        <div style={{padding:"0 14px 14px",borderTop:"1px solid var(--bdr)"}}>
+          {!unroutedData && <div style={{padding:20,textAlign:"center",color:"var(--t3)",fontSize:11}}>Loading...</div>}
+          {unroutedData && unroutedData.unrouted?.length === 0 && (
+            <div style={{padding:20,textAlign:"center",color:"var(--t3)",fontSize:11,marginTop:10}}>
+              <div style={{fontSize:24,marginBottom:6}}>✓</div>
+              No unrouted events. Either all your accounts are mapped, or no events have come in yet.
+            </div>
+          )}
+          {unroutedData && unroutedData.unrouted?.length > 0 && (
+            <div style={{marginTop:10}}>
+              <div style={{fontSize:10,color:"var(--amb)",marginBottom:10}}>
+                ⚠️ {unroutedData.unrouted.length} event{unroutedData.unrouted.length===1?"":"s"} dropped because the LinkedIn account_id wasn't found in your routing table. Add routing above to capture future events.
+              </div>
+              {unroutedData.by_account?.length > 0 && (
+                <div style={{marginBottom:10,padding:10,background:"var(--hover)",borderRadius:4}}>
+                  <div style={{fontSize:10,fontWeight:600,color:"var(--t2)",marginBottom:4}}>By account:</div>
+                  {unroutedData.by_account.slice(0, 5).map(b => (
+                    <div key={b.account_id} style={{fontSize:10,color:"var(--t3)",fontFamily:"'JetBrains Mono',monospace",marginBottom:2}}>
+                      {b.account_id?.slice(0, 24) || "(no id)"}: <strong style={{color:"var(--t2)"}}>{b.count} events</strong>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div style={{display:"flex",flexDirection:"column",gap:6,maxHeight:240,overflowY:"auto"}}>
+                {unroutedData.unrouted.slice(0, 30).map(u => (
+                  <div key={u.id} style={{padding:8,background:"var(--hover)",borderRadius:4,fontSize:10}}>
+                    <div style={{display:"flex",justifyContent:"space-between",color:"var(--t2)"}}>
+                      <span><strong>{u.event_type}</strong> · {u.lead_name || "(no lead name)"}</span>
+                      <span style={{color:"var(--t3)"}}>{u.received ? new Date(u.received).toLocaleString() : ""}</span>
+                    </div>
+                    {u.signal_text && <div style={{color:"var(--t3)",marginTop:2,fontStyle:"italic"}}>"{u.signal_text.slice(0, 120)}"</div>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
 
     {refreshResult && (
       <div style={{padding:12,background:refreshResult.ok?"rgba(93,168,122,.08)":"rgba(239,68,68,.08)",border:"1px solid "+(refreshResult.ok?"var(--grn)":"var(--red)"),borderRadius:6,marginBottom:14,fontSize:11,color:"var(--t2)"}}>
@@ -6498,11 +6832,12 @@ function RuleEditor({rule,onSave,onClose,availableFields,baseId}){
   <div style={{padding:14,border:"1px solid rgba(191,163,90,.3)",borderRadius:8,background:"rgba(191,163,90,.05)"}}>
   <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}><span>🎯</span><span style={{fontSize:11,fontWeight:600,color:"var(--acc)"}}>SCORING PROMPT</span></div>
   <div style={{fontSize:10,color:"var(--t3)",marginBottom:8,lineHeight:1.6,padding:10,background:"var(--card)",borderRadius:6}}>
-    <div style={{fontWeight:600,color:"var(--t2)",marginBottom:4}}>📋 Prompt format guide</div>
-    <div style={{marginBottom:3}}>Start with: <em>"Rate this signal on how directly it [describes what the signal must show]."</em></div>
+    <div style={{fontWeight:600,color:"var(--t2)",marginBottom:4}}>📋 Prompt format guide <span style={{fontWeight:400,color:"var(--t3)",fontSize:9}}>· See full contract in Prompts tab</span></div>
+    <div style={{marginBottom:3}}>Your prompt is <strong style={{color:"var(--t2)"}}>the single source of truth</strong> for scoring. No hardcoded rules compete with it.</div>
     <div style={{marginBottom:3}}>Define 4 tiers: <strong style={{color:"var(--t2)"}}>90-100</strong> (exact match with examples), <strong style={{color:"var(--t2)"}}>70-89</strong> (strong but incomplete), <strong style={{color:"var(--t2)"}}>50-69</strong> (tangential), <strong style={{color:"var(--t2)"}}>&lt;50</strong> (reject — most important tier).</div>
     <div style={{marginBottom:3}}>✅ Include concrete examples: <em>"CMO steps down after 10 months" scores 95, "Company hires new CMO" scores 45</em></div>
-    <div>❌ Include <strong style={{color:"var(--t2)"}}>false positives to reject</strong>: e.g. for "Senior marketer exits" — <em>"a robotics leader leaving is NOT a marketer, score below 30"</em></div>
+    <div style={{marginBottom:3}}>❌ List <strong style={{color:"var(--t2)"}}>false positives to reject</strong>: e.g. for "Senior marketer exits" — <em>"a robotics leader leaving is NOT a marketer, score below 30"</em></div>
+    <div style={{marginTop:6,fontSize:9,color:"var(--t3)",fontStyle:"italic"}}>The AI returns: <code>&#123;matches:[&#123;idx, score, reason&#125;]&#125;</code> — score &amp; reason saved to each task.</div>
   </div>
   <textarea className="inp ta" value={f.scoringPrompt} onChange={e=>sF(p=>({...p,scoringPrompt:e.target.value}))} placeholder={"Rate this signal on how directly it [describes the event].\n\nAssign 90-100 if [exact match criteria with example].\nScore 70-89 if [strong but incomplete match].\nAssign 50-69 if [tangential mention].\nScore below 50 if [rejection criteria — be specific].\n\nFalse positives to reject: [list what does NOT count].\nExamples: \"[example A]\" scores 95, \"[example B]\" scores 40."} style={{minHeight:120,fontSize:11,background:"var(--card)"}}/>
   <button className="btn btn-ai btn-s" style={{marginTop:6}} disabled={aiL||!f.name} onClick={async()=>{sAiL(true);try{const res=await fetch("/api/classify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"generate_scoring_prompt",taskName:f.name,taskDescription:f.description,taskKeywords:f.keywords,taskJobTitleKeywords:f.jobTitleKeywords,taskSources:f.sources})});if(res.ok){const d=await res.json();if(d.scoringPrompt)sF(p=>({...p,scoringPrompt:d.scoringPrompt}))}}catch(e){console.error(e)}sAiL(false)}}>{aiL?"Generating…":<><I.Sparkle/> Auto-Generate</>}</button></div>

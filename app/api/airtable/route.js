@@ -92,6 +92,7 @@ const _ensuredFieldsCache = new Map(); // key: baseId+table, value: Set of field
 // Known field type overrides — autoEnsure uses these instead of defaulting to singleLineText
 const FIELD_TYPE_MAP = {
   "Score": { type: "number", options: { precision: 0 } },
+  "Score Reason": { type: "multilineText" },
   "Top N": { type: "number", options: { precision: 0 } },
   "DM Step": { type: "number", options: { precision: 0 } },
   "Description": { type: "multilineText" },
@@ -330,6 +331,7 @@ const SCHEMA = {
     { name: "Company", type: "singleLineText" },
     { name: "Task Rule", type: "singleLineText" },
     { name: "Score", type: "number", options: { precision: 0 } },
+    { name: "Score Reason", type: "multilineText" },
     { name: "Scan Target", type: "singleLineText" },
     { name: "Signal", type: "singleLineText" },
     { name: "Source", type: "singleLineText" },
@@ -391,6 +393,32 @@ const SCHEMA = {
     { name: "CTA Purpose", type: "multilineText" },
     { name: "Last Used At", type: "singleLineText" },
     { name: "Use Count", type: "number", options: { precision: 0 } },
+  ],
+  // Maps Unipile LinkedIn account_id → Airtable base ID for client. Lets one webhook
+  // URL handle events from all clients — events route based on which account fired them.
+  "Account Routing": [
+    { name: "Name", type: "singleLineText" },
+    { name: "Account ID", type: "singleLineText" },
+    { name: "Account Name", type: "singleLineText" },
+    { name: "Provider", type: "singleLineText" },
+    { name: "Campaign Base ID", type: "singleLineText" },
+    { name: "Client Name", type: "singleLineText" },
+    { name: "Active", type: "checkbox", options: { icon: "check", color: "greenBright" } },
+    { name: "Last Event At", type: "singleLineText" },
+    { name: "Notes", type: "multilineText" },
+  ],
+  // Captures webhook events for accounts NOT yet in the routing table. Lets user see
+  // what fell through and decide which campaign to route them to.
+  "Unrouted Triggers": [
+    { name: "Name", type: "singleLineText" },
+    { name: "Account ID", type: "singleLineText" },
+    { name: "Event Type", type: "singleLineText" },
+    { name: "Event ID", type: "singleLineText" },
+    { name: "Lead Name", type: "singleLineText" },
+    { name: "Lead Profile URL", type: "singleLineText" },
+    { name: "Signal Text", type: "multilineText" },
+    { name: "Raw Payload", type: "multilineText" },
+    { name: "Received", type: "singleLineText" },
   ],
 };
 
@@ -547,7 +575,7 @@ async function setupSchema(baseId) {
 
   // Campaigns table only lives on the master base, not per-campaign bases
   const isMasterBase = baseId === MASTER_BASE_ID;
-  const MASTER_ONLY_TABLES = ["Campaigns"];
+  const MASTER_ONLY_TABLES = ["Campaigns", "Account Routing", "Unrouted Triggers"];
 
   for (const [tableName, requiredFields] of Object.entries(SCHEMA)) {
     if (!isMasterBase && MASTER_ONLY_TABLES.includes(tableName)) continue;

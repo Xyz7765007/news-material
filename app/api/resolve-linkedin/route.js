@@ -1,5 +1,10 @@
 import { NextResponse } from "next/server";
 
+// 5-minute timeout for batched LinkedIn ID resolution. Each Apify call can take up to
+// 480s configured (we cap at 300s here to match Vercel max). At 10 slugs per batch,
+// 5 tokens to try, this is generous.
+export const maxDuration = 300;
+
 /**
  * Resolves LinkedIn company slugs to numeric company IDs.
  * 

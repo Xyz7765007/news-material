@@ -1,6 +1,15 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 
+// 5-minute Vercel function timeout. News scan per company:
+//   - 1 RSS fetch (~1-2s)
+//   - Up to 50 article fetches in parallel (~6s)
+//   - N OpenAI classify calls (now parallelized, ~3-5s total instead of N*3s)
+// Jobs-batch: ~30-60s for Apify per batch of 5 companies.
+// Default Fluid Compute timeout is already 300s on Hobby+, but set explicitly for safety
+// in case Fluid Compute is disabled or migration happens.
+export const maxDuration = 300;
+
 let _openai;
 function getOpenAI() { if (!_openai) _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY }); return _openai; }
 
@@ -100,6 +109,19 @@ async function apifyCallWithFallback(actorId, input, timeoutMs = 480000) {
   return { error: "All Apify tokens exhausted", data: null };
 }
 
+// ─── Company Name Cleaner ─────────────────────────────────────────
+// Strip trailing parenthetical notes/clarifications. These are common in account
+// lists ("American Standard (finishes)", "Ashley Furniture (furniture retail/finance)")
+// and break Google News search (parens are boolean operators) and harm Apify name
+// matching against real LinkedIn company names.
+function cleanCompanyName(name) {
+  if (!name) return "";
+  return name
+    .replace(/\s*\([^)]*\)\s*$/, "")   // trailing (...)
+    .replace(/\s*\[[^\]]*\]\s*$/, "")  // trailing [...]
+    .trim();
+}
+
 // ─── RSS Parser (for news only) ──────────────────────────────────
 
 function parseRSSItems(xml, defaultSource) {
@@ -170,10 +192,15 @@ function filterRecent(items) {
 // MODE: NEWS — Google News RSS → article fetch → classify
 // ═══════════════════════════════════════════════════════════════════
 
-async function scanNews(company, taskDefs) {
-  console.log(`  [NEWS] Fetching for ${company.name}...`);
-  const q = encodeURIComponent(`"${company.name}"`);
-  const items = await fetchRSS(`https://news.google.com/rss/search?q=${q}+when:7d&hl=en&gl=US&ceid=US:en`, `Google News [${company.name}]`, "Google News");
+async function scanNews(company, taskDefs, threshold = 50) {
+  const cleanName = cleanCompanyName(company.name);
+  if (!cleanName) {
+    console.log(`  [NEWS] Skipping ${company.name} — empty name after cleaning`);
+    return [];
+  }
+  console.log(`  [NEWS] Fetching for ${cleanName}${cleanName !== company.name ? ` (was: "${company.name}")` : ""}...`);
+  const q = encodeURIComponent(`"${cleanName}"`);
+  const items = await fetchRSS(`https://news.google.com/rss/search?q=${q}+when:7d&hl=en&gl=US&ceid=US:en`, `Google News [${cleanName}]`, "Google News");
 
   const recent = filterRecent(items);
   console.log(`  [NEWS] ${items.length} total → ${recent.length} within ${MAX_AGE_DAYS} days`);
@@ -183,8 +210,13 @@ async function scanNews(company, taskDefs) {
     return [];
   }
 
-  const enriched = await Promise.all(recent.slice(0, 50).map(async n => ({ ...n, taskType: "news", articleContent: await fetchArticle(n.url) })));
-  return classify(enriched, taskDefs, company.name, "news");
+  // Fetch full article body for the first 50 items in parallel — used in classify
+  // for higher accuracy (headlines alone are misleading). 6s timeout per fetch,
+  // wall clock max ~6s.
+  const enriched = await Promise.all(recent.slice(0, 50).map(async n => ({
+    ...n, taskType: "news", articleContent: await fetchArticle(n.url),
+  })));
+  return classify(enriched, taskDefs, cleanName, "news", threshold);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -194,7 +226,7 @@ async function scanNews(company, taskDefs) {
 // Returns results grouped by company for the frontend to process
 // ═══════════════════════════════════════════════════════════════════
 
-async function scanJobsBatch(companies, taskDefs) {
+async function scanJobsBatch(companies, taskDefs, threshold = 50) {
   const tokens = getApifyTokens();
   if (tokens.length === 0) {
     console.log("  [JOBS-BATCH] No Apify tokens configured — skipping");
@@ -209,20 +241,26 @@ async function scanJobsBatch(companies, taskDefs) {
   const urls = [];
 
   if (withIds.length > 0) {
-    // LinkedIn supports multiple f_C params: f_C=123&f_C=456&f_C=789
-    const fcParams = withIds.map(c => `f_C=${c.linkedinCompanyId}`).join("&");
-    const combinedUrl = `https://www.linkedin.com/jobs/search/?${fcParams}&f_TPR=r604800&sortBy=DD`;
+    // LinkedIn's URL filter syntax uses COMMA-SEPARATED values for repeated dimensions:
+    //   f_C=123,456,789  ✓  (filters jobs from any of those companies)
+    //   f_C=123&f_C=456  ✗  (LinkedIn keeps only the last value — Apify will return jobs only for the LAST company, or none at all)
+    // Same pattern applies to f_E (experience), f_PP (location), etc. Confirmed via
+    // LinkedIn's own scraped jobSearchUrl format and the Kondo URL-hacking guide.
+    const ids = withIds.map(c => c.linkedinCompanyId).join(",");
+    const combinedUrl = `https://www.linkedin.com/jobs/search/?f_C=${ids}&f_TPR=r604800&sortBy=DD`;
     urls.push(combinedUrl);
-    console.log(`  [JOBS-BATCH] Combined ${withIds.length} company IDs into ONE URL`);
+    console.log(`  [JOBS-BATCH] Combined ${withIds.length} company IDs into ONE URL (comma-separated)`);
     withIds.forEach(c => console.log(`    f_C=${c.linkedinCompanyId} (${c.name})`));
   }
 
   // Each keyword fallback company gets its own URL (can't combine these)
   for (const c of withoutIds) {
+    const cleanName = cleanCompanyName(c.name);
+    if (!cleanName) continue;
     const topKw = taskDefs.flatMap(t => t.jobTitleKeywords || t.keywords || [])[0] || "marketing";
-    const url = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${c.name}" ${topKw}`)}&sortBy=DD`;
+    const url = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${cleanName}" ${topKw}`)}&sortBy=DD`;
     urls.push(url);
-    console.log(`  [JOBS-BATCH] ${c.name}: keyword fallback (separate URL)`);
+    console.log(`  [JOBS-BATCH] ${cleanName}: keyword fallback (separate URL)`);
   }
 
   console.log(`  [JOBS-BATCH] Total URLs: ${urls.length} (was ${companies.length} before combining)`);
@@ -246,15 +284,26 @@ async function scanJobsBatch(companies, taskDefs) {
   for (let i = 0; i < companies.length; i++) {
     const c = companies[i];
     const hasId = !!c.linkedinCompanyId;
-    const companyLower = c.name.toLowerCase().trim();
-    const domainBase = (c.domain || "").replace(/\.(com|io|co|org|net|ai)$/i, "").toLowerCase();
+    // Use cleaned name for matching against Apify's companyName field — Apify returns
+    // LinkedIn's official name like "American Standard", not internal notes.
+    const cleanName = cleanCompanyName(c.name);
+    const companyLower = cleanName.toLowerCase().trim();
+    // Domain base: strip protocol/www/path, then take first segment.
+    // Handles all TLDs (.com, .in, .io, .tech) by ignoring everything after first dot.
+    // Skip short bases (≤2 chars) — they over-match in jobCoName.includes() (e.g., "ai" matches "Air France").
+    const cleanedDomain = (c.domain || "").replace(/^https?:\/\//i, "").replace(/^www\./i, "").split("/")[0];
+    const rawBase = cleanedDomain.split(".")[0].toLowerCase();
+    const domainBase = rawBase.length >= 3 ? rawBase : "";
     const companySlug = (c.linkedinSlug || "").toLowerCase();
 
     // Match jobs to this company
-    const companyJobs = allJobs.filter(job => {
+    const companyJobs = !companyLower ? [] : allJobs.filter(job => {
       const jobCoName = (job.companyName || "").toLowerCase().trim();
       const jobLinkedinUrl = (job.companyLinkedinUrl || job.companyUrl || "").toLowerCase();
       const jobSlug = jobLinkedinUrl.match(/linkedin\.com\/company\/([^\/?\s]+)/)?.[1] || "";
+      // Skip jobs with empty or trivially short company names — would false-match.
+      // Real LinkedIn companies always have names of 3+ chars.
+      if (!jobCoName || jobCoName.length < 3) return false;
 
       if (hasId) {
         // When we used f_C, match by slug or name
@@ -289,7 +338,7 @@ async function scanJobsBatch(companies, taskDefs) {
     console.log(`  [JOBS-BATCH] ${c.name}: ${companyJobs.length} matched → ${recent.length} recent`);
 
     if (recent.length > 0) {
-      const classified = await classify(recent, taskDefs, c.name, "jobs");
+      const classified = await classify(recent, taskDefs, c.name, "jobs", threshold);
       results.push({ company: c.name, signals: classified });
     } else {
       results.push({ company: c.name, signals: [] });
@@ -299,101 +348,201 @@ async function scanJobsBatch(companies, taskDefs) {
   return results;
 }
 
-// ─── Shared: OpenAI Classification — ONE TASK AT A TIME ───────
+// ─── Shared: OpenAI Classification ───────────────────────────────
+//
+// THE USER'S SCORING PROMPT IS THE SINGLE SOURCE OF TRUTH FOR HOW SIGNALS ARE SCORED.
+//
+// We do NOT inject conflicting hardcoded "rules" into the system prompt — those would
+// fight the user's custom instructions. The system prompt only explains FORMAT (output
+// shape, score range, what data is available). The user's prompt explains JUDGEMENT
+// (what to score 90, what to reject, what counts, what doesn't).
+//
+// Why this matters: the user can write a prompt like "score 95 if a senior marketer
+// just left, score below 30 if it's any other role." That prompt is precise. The OLD
+// system prompt added generic rules like "executive scheduled to speak = 60-69" which
+// could conflict and confuse the model. Now: user's prompt wins.
+//
+// Output contract:
+//   { matches: [{ idx: number, score: number, reason: string }] }
+//
+// - idx is the index of the signal in the input list (0-based)
+// - score is 0-100 integer
+// - reason is a 1-sentence explanation (max ~140 chars). Useful for debugging which
+//   signals scored what and why.
+// - Only signals scoring >= threshold are returned (saves output tokens)
+//
+// We use response_format: { type: "json_object" } for guaranteed valid JSON.
+// We pre-filter obviously irrelevant signals (no keyword presence in headline/description)
+// to reduce token usage and let AI focus on real candidates.
+// ═══════════════════════════════════════════════════════════════════
 
-async function classify(signals, taskDefs, companyName, mode) {
+// Keyword pre-filter: only send signals to AI that have at least one task-keyword
+// in the headline or description. For news, an article that doesn't mention any of
+// the task's keywords is almost certainly noise. For jobs, the f_C filter already
+// scoped to right companies, but the JOB TITLE still needs to match the task's role.
+//
+// IMPORTANT: only used when the task has a non-empty keyword list. If the user has
+// NO keywords (relying purely on the prompt), we send everything to AI.
+function prefilterSignals(signals, task, mode) {
+  const kws = mode === "jobs"
+    ? [...(task.jobTitleKeywords || []), ...(task.keywords || [])]
+    : (task.keywords || []);
+  const cleanKws = kws.filter(k => k && k.length >= 2).map(k => k.toLowerCase());
+  if (cleanKws.length === 0) return signals.map((_, i) => i); // no keywords = send all
+  const matchingIndices = [];
+  signals.forEach((sig, i) => {
+    const haystack = `${sig.headline || ""} ${sig.description || ""} ${sig.jobTitle || ""}`.toLowerCase();
+    if (cleanKws.some(kw => haystack.includes(kw))) {
+      matchingIndices.push(i);
+    }
+  });
+  return matchingIndices;
+}
+
+// Build the per-signal block sent to OpenAI. For news, includes article content if
+// available (was being fetched but ignored before — wasted ~6s per company).
+function formatSignalForAI(sig, idx, mode) {
+  const lines = [`[${idx}] ${sig.headline || "(no headline)"}`];
+  if (mode === "jobs") {
+    if (sig.jobTitle) lines.push(`  Title: ${sig.jobTitle}`);
+    if (sig.jobLocation) lines.push(`  Location: ${sig.jobLocation}`);
+    if (sig.jobCompany) lines.push(`  Company: ${sig.jobCompany}`);
+    if (sig.description) lines.push(`  Description: ${sig.description.slice(0, 600)}`);
+  } else {
+    if (sig.source) lines.push(`  Source: ${sig.source}`);
+    if (sig.date) lines.push(`  Date: ${sig.date.slice(0, 10)}`);
+    if (sig.description) lines.push(`  Excerpt: ${sig.description.slice(0, 250)}`);
+    // Article content if we successfully fetched the full body. Big accuracy win:
+    // headlines alone are misleading. Cap at 1000 chars to control prompt size.
+    if (sig.articleContent && sig.articleContent.length > 50) {
+      lines.push(`  Article body: ${sig.articleContent.slice(0, 1000)}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+async function classify(signals, taskDefs, companyName, mode, threshold = 50) {
   if (!signals.length || !taskDefs.length) return [];
-
-  const signalList = signals
-    .map((n, i) => {
-      let e = `[${i}] "${n.headline}"`;
-      if (n.description) e += ` — ${n.description.slice(0, 200)}`;
-      return e;
-    }).join("\n");
 
   // Initialize results — each signal starts with no matches
   const results = signals.map(sig => ({
-    ...sig, matchedTaskIds: [], confidence: 0, relevanceScores: {},
+    ...sig, matchedTaskIds: [], confidence: 0, relevanceScores: {}, scoreReasons: {},
   }));
 
-  // Run EACH task independently — its own call, its own prompt
-  for (const task of taskDefs) {
-    const taskDesc = mode === "jobs"
-      ? `Task: "${task.name}"\nJob Titles to match: [${(task.jobTitleKeywords || []).join(", ")}]\nKeywords: [${(task.keywords || []).join(", ")}]`
-      : `Task: "${task.name}"\nKeywords: [${(task.keywords || []).join(", ")}]`;
+  // Run ALL tasks in parallel — was serial, made N tasks take N×3s. Now ~3s total.
+  const taskPromises = taskDefs.map(async task => {
+    // Pre-filter: drop signals that don't even mention task keywords. Big token savings.
+    const candidateIndices = prefilterSignals(signals, task, mode);
+    if (candidateIndices.length === 0) {
+      console.log(`  [TASK] "${task.name}" → 0 candidates after keyword pre-filter`);
+      return { task, scores: [], error: null };
+    }
 
-    const scoringCriteria = task.scoringPrompt
-      ? `\n\nScoring Criteria (use this as your primary guide):\n${task.scoringPrompt}`
-      : "";
+    // Build signal block — only candidates, with their original indices preserved.
+    // The AI will refer to signals by their original idx so we can map back.
+    const signalBlock = candidateIndices
+      .map(i => formatSignalForAI(signals[i], i, mode))
+      .join("\n\n");
 
-    const sysPrompt = mode === "jobs"
-      ? `Score each job posting 0-100 for this ONE task. Use the scoring criteria if provided.
+    const userPrompt = (task.scoringPrompt || "").trim();
+    const taskName = task.name || "(unnamed task)";
 
-Rules:
-- The job TITLE must align with the task's role type AND seniority level
-- "Marketing Analyst" or "Analyst" is junior — only score 70+ for Director, VP, Head of, or C-level roles unless the task explicitly targets analyst-level
-- HR/Finance/Supply Chain/Operations roles NEVER match marketing tasks, even if keywords overlap
-- The signal must be ACTIONABLE — would this lead to a concrete outreach action? If not, score below 50.
-${scoringCriteria}
+    // System prompt: format only. No judgement rules. The user's prompt is authority.
+    const sysPrompt = `You are scoring ${mode === "jobs" ? "job postings" : `news articles about "${companyName}"`} against ONE specific task: "${taskName}".
 
-Return ONLY JSON: [{"idx":0,"score":85},{"idx":3,"score":72}]
-Only include postings scoring 50+. No markdown.`
-      : `Score each news article 0-100 for this ONE task about ${companyName}. Use the scoring criteria if provided.
+The user has provided their scoring criteria below. Use it AS THE PRIMARY GUIDE — it overrides any generic intuition.
 
-Rules:
-- The article must describe the SPECIFIC event this task tracks, not just share keywords
-- ROLE SPECIFICITY: If the task says "CMO" — only CMO qualifies, not CSCO/CFO/CTO. If it says "marketer" — the person must be in marketing, not engineering/supply chain/finance.
-- TOPIC SPECIFICITY: "Regulatory change affecting data use" means marketing/consumer data regulations, not healthcare records. "Category growth stalls" means the actual product category declining, not a company launching a fund.
-- ACTIONABILITY: Would this signal lead to a concrete next action for the sales team? If the answer is "we wouldn't do anything with this," score below 50.
-- "Executive scheduled to speak" is an early indicator signal — score 60-69 (useful but not yet actionable on its own)
-${scoringCriteria}
+Score each signal 0-100:
+- 90-100: exact match, immediately actionable
+- 70-89: strong match, likely actionable
+- 50-69: partial / tangential
+- Below 50: reject
 
-Return ONLY JSON: [{"idx":0,"score":85},{"idx":3,"score":72}]
-Only include articles scoring 50+. No markdown.`;
+Return ONLY signals scoring ${threshold} or higher. Drop everything else.
+
+Output format (strict JSON, no markdown):
+{
+  "matches": [
+    { "idx": <original index from input>, "score": <0-100 integer>, "reason": "<1 sentence, max 140 chars>" }
+  ]
+}
+
+If no signals score ${threshold}+, return: { "matches": [] }`;
+
+    const userMessage = `# Task: ${taskName}
+${task.description ? `\nTask description: ${task.description}\n` : ""}
+${userPrompt ? `# User's scoring criteria:\n${userPrompt}\n` : "# User has not provided custom criteria. Use the task name and description above as the guide.\n"}
+# Signals to score:
+
+${signalBlock}`;
 
     try {
       const c = await getOpenAI().chat.completions.create({
-        model: "gpt-5.4-mini", temperature: 0.15, max_completion_tokens: 1000,
+        model: "gpt-5.4-mini",
+        temperature: 0.15,
+        max_completion_tokens: 2000,
+        response_format: { type: "json_object" }, // GUARANTEED valid JSON
         messages: [
           { role: "system", content: sysPrompt },
-          { role: "user", content: `${taskDesc}\n\nSignals:\n${signalList}` },
+          { role: "user", content: userMessage },
         ],
       });
-      const text = c.choices[0]?.message?.content || "[]";
-      let scores;
+      const text = c.choices[0]?.message?.content || "{}";
+      let parsed;
       try {
-        scores = JSON.parse(text.replace(/```json\n?|```/g, "").trim());
-      } catch {
-        const m = text.match(/\[[\s\S]*?\]/);
-        scores = m ? JSON.parse(m[0]) : [];
+        parsed = JSON.parse(text);
+      } catch (e) {
+        // Should never happen with json_object mode but defense in depth
+        const m = text.match(/\{[\s\S]*\}/);
+        parsed = m ? JSON.parse(m[0]) : { matches: [] };
       }
-      if (!Array.isArray(scores)) scores = [];
-
-      let matchCount = 0;
-      for (const s of scores) {
-        const idx = s.idx ?? s.newsIndex;
-        const score = s.score ?? s.relevanceScore;
-        if (idx !== undefined && score >= 50 && results[idx]) {
-          results[idx].matchedTaskIds.push(task.id);
-          results[idx].relevanceScores[task.id] = Math.min(100, Math.max(0, Math.round(score)));
-          results[idx].confidence = Math.max(results[idx].confidence, score / 100);
-          matchCount++;
-        }
-      }
-      console.log(`  [TASK] "${task.name}" → ${matchCount} matches from ${signals.length} signals`);
+      // Accept either { matches: [...] } or a bare array (model variance)
+      const scores = Array.isArray(parsed) ? parsed : (parsed.matches || parsed.scores || []);
+      return { task, scores, error: null };
     } catch (e) {
       console.error(`  [TASK ERROR] "${task.name}":`, e.message);
-      // Fallback: keyword matching
+      return { task, scores: null, error: e.message };
+    }
+  });
+
+  const taskOutputs = await Promise.all(taskPromises);
+
+  for (const { task, scores, error } of taskOutputs) {
+    if (scores === null) {
+      // OpenAI failed for this task — keyword fallback. Score is conservative (60)
+      // since we can't verify quality without AI. Above threshold of 50 by default,
+      // but might be filtered out by frontend's user threshold (default 70).
+      let fallbackCount = 0;
       signals.forEach((sig, i) => {
-        const t = (sig.headline + " " + (sig.description || "")).toLowerCase();
-        const kws = [...(task.keywords || []), ...(task.jobTitleKeywords || [])];
-        if (kws.some(kw => t.includes(kw.toLowerCase()))) {
+        const t = `${sig.headline} ${sig.description || ""} ${sig.jobTitle || ""}`.toLowerCase();
+        const kws = [...(task.keywords || []), ...(task.jobTitleKeywords || [])].filter(k => k && k.length >= 2);
+        if (kws.length > 0 && kws.some(kw => t.includes(kw.toLowerCase()))) {
           results[i].matchedTaskIds.push(task.id);
-          results[i].relevanceScores[task.id] = 55;
-          results[i].confidence = Math.max(results[i].confidence, 0.55);
+          results[i].relevanceScores[task.id] = 60;
+          results[i].scoreReasons[task.id] = "AI scoring failed; keyword match fallback";
+          results[i].confidence = Math.max(results[i].confidence, 0.6);
+          fallbackCount++;
         }
       });
+      console.log(`  [TASK] "${task.name}" → AI ERROR, ${fallbackCount} keyword fallbacks (score 60 each, may be filtered by user threshold)`);
+      continue;
     }
+    let matchCount = 0;
+    for (const s of scores) {
+      const idx = s.idx ?? s.newsIndex ?? s.index;
+      // AI may return score as string ("85") even with json_object mode. Coerce defensively.
+      const rawScore = s.score ?? s.relevanceScore;
+      const score = typeof rawScore === "number" ? rawScore : Number(rawScore);
+      const reason = s.reason ?? s.explanation ?? "";
+      if (idx !== undefined && Number.isFinite(score) && score >= threshold && results[idx]) {
+        results[idx].matchedTaskIds.push(task.id);
+        results[idx].relevanceScores[task.id] = Math.min(100, Math.max(0, Math.round(score)));
+        results[idx].scoreReasons[task.id] = String(reason).slice(0, 200);
+        results[idx].confidence = Math.max(results[idx].confidence, score / 100);
+        matchCount++;
+      }
+    }
+    console.log(`  [TASK] "${task.name}" → ${matchCount} matches at threshold ${threshold}+`);
   }
 
   // Log summary
@@ -409,6 +558,11 @@ export async function POST(request) {
   try {
     const body = await request.json();
     const { mode } = body;
+    // The frontend passes the user's configured scoring threshold (default 70).
+    // We pass this to the AI so it can drop low-scoring signals at output time
+    // instead of returning them and having the frontend filter post-hoc.
+    // Floor at 50 — anything below 50 is "not even tangentially related" by our prompt convention.
+    const threshold = Math.max(50, Math.min(100, parseInt(body.threshold) || 70));
 
     if (!process.env.OPENAI_API_KEY) return NextResponse.json({ error: "OPENAI_API_KEY not configured" }, { status: 500 });
 
@@ -418,9 +572,9 @@ export async function POST(request) {
       if (!companies?.length) return NextResponse.json({ error: "No companies provided" }, { status: 400 });
       if (!taskDefs?.length) return NextResponse.json({ error: "No task definitions provided" }, { status: 400 });
 
-      console.log(`\n── Jobs Batch: ${companies.length} companies ──`);
-      const results = await scanJobsBatch(companies, taskDefs);
-      return NextResponse.json({ results });
+      console.log(`\n── Jobs Batch: ${companies.length} companies (threshold: ${threshold}) ──`);
+      const results = await scanJobsBatch(companies, taskDefs, threshold);
+      return NextResponse.json({ results, threshold });
     }
 
     // Single company mode (news)
@@ -428,13 +582,14 @@ export async function POST(request) {
     if (!company?.name) return NextResponse.json({ error: "Company name required" }, { status: 400 });
     if (!taskDefs?.length) return NextResponse.json({ error: "Task definitions required" }, { status: 400 });
 
-    console.log(`\n── Scanning: ${company.name} [${mode}] ──`);
-    const signals = await scanNews(company, taskDefs);
+    console.log(`\n── Scanning: ${company.name} [${mode}] (threshold: ${threshold}) ──`);
+    const signals = await scanNews(company, taskDefs, threshold);
 
     return NextResponse.json({
       news: signals,
       company: company.name,
       mode,
+      threshold,
       matchedCount: signals.filter(n => (n.matchedTaskIds || []).length > 0).length,
     });
   } catch (error) {
