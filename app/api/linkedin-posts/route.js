@@ -1366,6 +1366,62 @@ export async function POST(request) {
         return NextResponse.json({ ok: true, progress });
       }
 
+      // Returns the live default scoring prompt + sanity-check rules + output schema.
+      // Used by the frontend so the Custom Prompt section always displays the
+      // CURRENT default rather than a stale duplicate. Lets users click "Load Default"
+      // to get the actual prompt as a starting point for customization.
+      case "get_default_prompt": {
+        return NextResponse.json({
+          ok: true,
+          defaultPrompt: defaultScoringSystemPrompt(""),
+          // Sanity-check rules applied AFTER AI scoring (the AI's score can be capped):
+          sanityRules: [
+            "If evidence_quote is missing or 'NO_SPECIFIC_EVIDENCE' → score capped at 25",
+            "If post_type is holiday/anniversary/birthday/condolence → score capped at 5",
+            "If post_type is hiring/farewell → score capped at 10",
+            "If post_type is award → score capped at 15",
+            "If post_type is gratitude → score capped at 20",
+            "If post_type is self_promo/content_promo → score capped at 25",
+            "If post_type is motivational → score capped at 30",
+            "If post_type is reshare → score capped at 35",
+            "If post_type is event_announcement → score capped at 45",
+            "If post_type is thought_leadership → score capped at 85 (high ceiling — quality posts welcome)",
+            "If post_type is industry_news → score capped at 70",
+            "If post_type is pain_point/project_announcement/question_to_network → no cap (100 max)",
+            "If score > 55 but rationale doesn't reference any 5-letter+ word from evidence_quote → score capped at 50",
+          ],
+          // Pre-filter category ceilings (applied BEFORE AI based on regex pattern matching).
+          // Even if user prompt scores 100, if pre-filter caught it as 'motivational', cap at 35.
+          categoryCeilings: {
+            holiday: 5, anniversary: 5, birthday: 5, condolence: 5,
+            hiring: 10, linkedin_spam: 10, farewell: 10,
+            award: 25, gratitude: 30,
+            content_promo: 35, self_promo: 35, motivational: 35,
+            reshare_minimal: 40, funding_announcement: 40,
+            event_promo: 55, engagement_bait: 55,
+            thin_content: 50, short_content: 70,
+            genuine_content: 100, unknown: 60,
+          },
+          // Required output schema. ANY custom prompt MUST return this shape.
+          requiredOutputSchema: {
+            post_type: "string — one of: holiday, anniversary, birthday, award, gratitude, condolence, hiring, farewell, self_promo, content_promo, motivational, reshare, thought_leadership, industry_news, event_announcement, pain_point, project_announcement, question_to_network, personal, other",
+            relevance_score: "integer 1-100",
+            evidence_quote: "string ≤25 words — the EXACT sentence from the post that justifies your score. If no substantive content, write 'NO_SPECIFIC_EVIDENCE' and score must be ≤25",
+            relevance_rationale: "string ≤40 words — what makes this post engagement-worthy (or why not)",
+            structured_sentence: "string ≤20 words, format: '{Full name}, {simplified title} at {simplified company} posted about {neutral 15-word summary}'",
+            suggested_comment: "string ≤20 words, MUST start with 'You could comment' or 'You could highlight'. Must reference specific content from THIS post, not generic pleasantries",
+          },
+          // What the user payload looks like (so users can reference these fields in their custom prompt)
+          inputPayload: {
+            full_name: "Lead's full name",
+            title: "Lead's job title",
+            company: "Lead's company",
+            post_text: "Post content (capped at 3000 chars)",
+            pre_filter_category: "Category assigned by pre-filter (e.g. 'motivational', 'genuine_content')",
+          },
+        });
+      }
+
       case "clear_progress": {
         // Reset state so next run starts fresh (doesn't delete any tasks already created)
         const { campaignAirtableId } = body;

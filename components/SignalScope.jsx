@@ -1353,7 +1353,10 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       const reasons=sig.scoreReasons||{};
       for(const tid of(sig.matchedTaskIds||[])){
         const td=taskDefs.find(t=>t.id===tid);if(!td)continue;
-        const score=Math.max(0,Math.min(100,parseInt(scores[tid]||Math.round((sig.confidence||0.7)*100))||50));
+        // Use ?? not || so score=0 is preserved (|| would fall through to confidence-based).
+        // confidence fallback only kicks in if scores[tid] is undefined/null.
+        const rawScore = scores[tid] ?? Math.round((sig.confidence||0.7)*100);
+        const score = Math.max(0,Math.min(100,Number(rawScore) || 0));
         if(score<threshold)continue;
         const newTask={
           Company:company.name,
@@ -3943,6 +3946,20 @@ function LinkedInPostsTab({ baseId, campaign, leads, onCampaignProvisioned }) {
   const [taskRuleName, setTaskRuleName] = useState("LinkedIn Post Engagement");
   const [systemPromptOverride, setSystemPromptOverride] = useState("");
   const [showPromptEditor, setShowPromptEditor] = useState(false);
+  // For the new Prompt Reference UI — fetched from backend so it always shows
+  // the LIVE default prompt + sanity-check rules, not a stale duplicate.
+  const [promptReference, setPromptReference] = useState(null); // {defaultPrompt, sanityRules, requiredOutputSchema, ...}
+  const [promptRefLoading, setPromptRefLoading] = useState(false);
+  const [promptRefView, setPromptRefView] = useState("guide"); // "guide" | "default" | "schema" | "sanity"
+  // Saved prompts library — stored in the campaign's Prompts table with Task Rule="LinkedIn Posts"
+  // so they're isolated from the per-task-rule scoring prompts used by news/jobs scans.
+  const [savedPrompts, setSavedPrompts] = useState([]); // [{id, name, prompt, lastModified}]
+  const [loadedPromptId, setLoadedPromptId] = useState(null); // id of the currently-loaded saved prompt
+  const [loadedPromptOriginal, setLoadedPromptOriginal] = useState(""); // original prompt text — used to detect "modified"
+  const [savePromptModal, setSavePromptModal] = useState(null); // null | {mode: "save" | "save_as", name: ""}
+  const [savedPromptsLoading, setSavedPromptsLoading] = useState(false);
+  const [savedPromptsError, setSavedPromptsError] = useState("");
+  const [promptSaving, setPromptSaving] = useState(false); // lock to prevent double-save races
   const [searchLeads, setSearchLeads] = useState("");
   const [autoCleanup, setAutoCleanup] = useState(true);
   const [autoCleanupDays, setAutoCleanupDays] = useState(14);
@@ -3993,6 +4010,141 @@ function LinkedInPostsTab({ baseId, campaign, leads, onCampaignProvisioned }) {
     }, 2000);
     return () => { clearInterval(pollRef.current); pollRef.current = null; };
   }, [scanning, campaign?.airtableId]);
+
+  // ─── Saved Prompts: load on mount ────────────────────────────────
+  // Filtered by Task Rule="LinkedIn Posts" so they're isolated from per-task-rule
+  // scoring prompts (which use other Task Rule values like "Material News" etc).
+  // We sort by Name for stable display order.
+  const loadSavedPrompts = async (autoSetupOnFailure = true) => {
+    if (!baseId) return;
+    setSavedPromptsLoading(true);
+    setSavedPromptsError("");
+    try {
+      const res = await at("list", "Prompts", {
+        filterByFormula: `{Task Rule}="LinkedIn Posts"`,
+      }, baseId);
+      const records = (res.records || []).map(r => ({
+        id: r.id,
+        name: (r.fields || {}).Name || "(unnamed)",
+        prompt: (r.fields || {}).Prompt || "",
+      })).sort((a, b) => a.name.localeCompare(b.name));
+      setSavedPrompts(records);
+    } catch (e) {
+      console.error("Failed to load saved prompts:", e);
+      // Auto-recover: if Prompts table is missing on this base, run setup ONCE to create it
+      if (autoSetupOnFailure) {
+        try {
+          console.log("[SavedPrompts] Attempting auto-setup of base schema...");
+          await at("setup", null, {}, baseId);
+          // Retry list after setup, but don't loop indefinitely
+          await loadSavedPrompts(false);
+          return;
+        } catch (setupErr) {
+          console.error("Auto-setup failed:", setupErr);
+        }
+      }
+      setSavedPromptsError("Failed to load saved prompts. The Prompts table may not exist in this base — try opening the Prompts tab in the sidebar to trigger schema setup.");
+    } finally {
+      setSavedPromptsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (baseId) loadSavedPrompts();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [baseId]);
+
+  // Save current prompt as a NEW saved prompt (or overwrite if name exists)
+  const handleSavePrompt = async (name) => {
+    if (promptSaving) return false; // already saving — ignore
+    if (!name || !name.trim()) { alert("Name is required"); return false; }
+    if (!systemPromptOverride.trim()) { alert("Cannot save an empty prompt. Write or load a prompt first."); return false; }
+    if (!baseId) { alert("No campaign base ID available"); return false; }
+    setPromptSaving(true);
+    try {
+      const trimmedName = name.trim();
+      const existing = savedPrompts.find(p => p.name.toLowerCase() === trimmedName.toLowerCase());
+      if (existing) {
+        if (!confirm(`A saved prompt named "${trimmedName}" already exists. Overwrite it?`)) return false;
+        try {
+          await at("update", "Prompts", { records: [{ id: existing.id, fields: { Prompt: systemPromptOverride } }] }, baseId);
+          await loadSavedPrompts();
+          setLoadedPromptId(existing.id);
+          setLoadedPromptOriginal(systemPromptOverride);
+          return true;
+        } catch (e) {
+          alert("Save failed: " + e.message);
+          return false;
+        }
+      }
+      // New prompt — create it
+      try {
+        const res = await at("create", "Prompts", {
+          records: [{ fields: { Name: trimmedName, "Task Rule": "LinkedIn Posts", Prompt: systemPromptOverride } }],
+        }, baseId);
+        await loadSavedPrompts();
+        const newId = res.records?.[0]?.id;
+        if (newId) {
+          setLoadedPromptId(newId);
+          setLoadedPromptOriginal(systemPromptOverride);
+        }
+        return true;
+      } catch (e) {
+        alert("Save failed: " + e.message);
+        return false;
+      }
+    } finally {
+      setPromptSaving(false);
+    }
+  };
+
+  // Update the currently-loaded saved prompt with the current textarea content
+  const handleUpdateLoadedPrompt = async () => {
+    if (promptSaving) return;
+    if (!loadedPromptId) return;
+    const loaded = savedPrompts.find(p => p.id === loadedPromptId);
+    if (!loaded) { alert("Loaded prompt not found in saved list. It may have been deleted."); setLoadedPromptId(null); return; }
+    if (!confirm(`Overwrite saved prompt "${loaded.name}" with current edits?`)) return;
+    setPromptSaving(true);
+    try {
+      await at("update", "Prompts", { records: [{ id: loadedPromptId, fields: { Prompt: systemPromptOverride } }] }, baseId);
+      await loadSavedPrompts();
+      setLoadedPromptOriginal(systemPromptOverride);
+    } catch (e) {
+      alert("Update failed: " + e.message);
+    } finally {
+      setPromptSaving(false);
+    }
+  };
+
+  // Load a saved prompt into the textarea
+  const handleLoadPrompt = (id) => {
+    const p = savedPrompts.find(s => s.id === id);
+    if (!p) return;
+    if (systemPromptOverride.trim() && systemPromptOverride !== loadedPromptOriginal) {
+      if (!confirm("You have unsaved changes to the current prompt. Load anyway?")) return;
+    }
+    setSystemPromptOverride(p.prompt);
+    setLoadedPromptId(id);
+    setLoadedPromptOriginal(p.prompt);
+  };
+
+  // Delete a saved prompt
+  const handleDeletePrompt = async (id) => {
+    const p = savedPrompts.find(s => s.id === id);
+    if (!p) return;
+    if (!confirm(`Delete saved prompt "${p.name}"? This cannot be undone.`)) return;
+    try {
+      await at("delete", "Prompts", { recordIds: [id] }, baseId);
+      await loadSavedPrompts();
+      if (loadedPromptId === id) {
+        setLoadedPromptId(null);
+        setLoadedPromptOriginal("");
+      }
+    } catch (e) {
+      alert("Delete failed: " + e.message);
+    }
+  };
 
   const toggleLead = (id) => {
     setSelectedLeadIds(prev => {
@@ -4394,39 +4546,246 @@ function LinkedInPostsTab({ baseId, campaign, leads, onCampaignProvisioned }) {
           </div>
         </div>
 
-        {/* Prompt editor (collapsible) */}
+        {/* Prompt editor (collapsible) — fully interactive prompt reference */}
         <div style={{marginTop:14,padding:12,background:"var(--hover)",borderRadius:6}}>
-          <div onClick={()=>setShowPromptEditor(!showPromptEditor)} style={{cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-            <div style={{fontSize:11,fontWeight:600,color:"var(--t1)"}}>🧠 Custom Scoring Prompt {systemPromptOverride.trim() ? <span style={{color:"var(--grn)",fontWeight:400,fontSize:10,marginLeft:6}}>· custom prompt set</span> : <span style={{color:"var(--t3)",fontWeight:400,fontSize:10,marginLeft:6}}>· using default</span>}</div>
+          <div onClick={()=>{
+            setShowPromptEditor(!showPromptEditor);
+            // Lazy-load the prompt reference the first time the section opens
+            if (!showPromptEditor && !promptReference && !promptRefLoading) {
+              setPromptRefLoading(true);
+              fetch("/api/linkedin-posts", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({action:"get_default_prompt"})})
+                .then(r=>r.json()).then(d=>{ if(d.ok) setPromptReference(d); setPromptRefLoading(false); })
+                .catch(()=>setPromptRefLoading(false));
+            }
+          }} style={{cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div style={{fontSize:11,fontWeight:600,color:"var(--t1)"}}>🧠 Custom Scoring Prompt {systemPromptOverride.trim() ? <span style={{color:"var(--grn)",fontWeight:400,fontSize:10,marginLeft:6}}>· custom prompt set ({systemPromptOverride.length} chars)</span> : <span style={{color:"var(--t3)",fontWeight:400,fontSize:10,marginLeft:6}}>· using default</span>}</div>
             <span style={{fontSize:11,color:"var(--t3)"}}>{showPromptEditor?"▲":"▼"}</span>
           </div>
           {showPromptEditor && (
             <div style={{marginTop:10}}>
-              <div style={{fontSize:10,color:"var(--t2)",marginBottom:8,lineHeight:1.5}}>
-                <strong>Output schema (required JSON, enforced by OpenAI response_format):</strong>
-                <pre style={{fontSize:9,background:"var(--card)",padding:8,borderRadius:4,marginTop:6,overflow:"auto"}}>{`{
-  "post_type": "holiday" | "anniversary" | "birthday" | "award" | "gratitude" |
-               "condolence" | "hiring" | "farewell" | "self_promo" |
-               "content_promo" | "motivational" | "reshare" |
-               "thought_leadership" | "industry_news" | "event_announcement" |
-               "pain_point" | "project_announcement" | "question_to_network" |
-               "personal" | "other",
-  "relevance_score": integer 1-100,
-  "evidence_quote": string <=25 words — EXACT sentence from post that justifies
-                    the score. If no specific evidence, return "NO_SPECIFIC_EVIDENCE"
-                    and score must be <=25.
-  "relevance_rationale": string <=40 words, referencing what in our offering
-                         the post connects (or fails to connect) to.
-  "structured_sentence": "{name}, {title} at {company} posted about {summary <=15 words}",
-  "suggested_comment": string <=20 words, starts with 'You could comment' or 'You could highlight'
-}`}</pre>
-                <div style={{marginTop:8,color:"var(--amb)"}}>⚠️ Backend sanity checks: if evidence is "NO_SPECIFIC_EVIDENCE" → score capped at 25. If post_type is holiday/anniversary/birthday/award → cap at 5-15. If rationale doesn't reference words from evidence → cap at 50.</div>
-                <div style={{marginTop:8}}>Leave blank for the <strong style={{color:"var(--t1)"}}>default engagement-quality prompt</strong> — scores "is this a substantive post worth commenting on?" independent of any campaign context. Same approach as your Apify+AppsScript flow. Paste a custom prompt here only if you want sales-relevance scoring tied to a specific ICP.</div>
+              {/* Tab bar for switching between guide / default / schema / sanity */}
+              <div style={{display:"flex",gap:4,borderBottom:"1px solid var(--bdr)",marginBottom:10,paddingBottom:0}}>
+                {[
+                  ["guide","📋 Prompting Guide"],
+                  ["default","📖 Default Prompt"],
+                  ["schema","🔧 Output Schema"],
+                  ["sanity","⚠️ Score Caps"],
+                ].map(([k,label])=>(
+                  <button key={k} onClick={()=>setPromptRefView(k)} style={{padding:"6px 10px",fontSize:10,fontWeight:promptRefView===k?600:400,background:promptRefView===k?"var(--card)":"transparent",border:"none",borderBottom:promptRefView===k?"2px solid var(--acc)":"2px solid transparent",color:promptRefView===k?"var(--t1)":"var(--t3)",cursor:"pointer",borderRadius:"4px 4px 0 0"}}>{label}</button>
+                ))}
               </div>
-              <textarea className="inp" rows="10" placeholder="Leave blank for default post-quality prompt (campaign-agnostic). Write custom only if you want sales-relevance scoring — must return all 6 JSON fields above or sanity checks will cap scores." value={systemPromptOverride} onChange={e=>setSystemPromptOverride(e.target.value)} style={{fontSize:11,fontFamily:"'JetBrains Mono',monospace",lineHeight:1.5}}/>
+
+              {promptRefLoading && <div style={{fontSize:10,color:"var(--t3)",padding:8}}>Loading prompt reference…</div>}
+
+              {/* GUIDE TAB */}
+              {promptRefView==="guide" && (
+                <div style={{fontSize:10,color:"var(--t2)",lineHeight:1.6}}>
+                  <div style={{padding:10,background:"rgba(93,168,122,.06)",border:"1px solid rgba(93,168,122,.25)",borderRadius:6,marginBottom:10}}>
+                    <strong style={{color:"var(--grn)"}}>How custom prompts work:</strong> Whatever you write in the textarea below is sent to OpenAI <em>as the system prompt</em>, replacing the default. The user payload (lead info + post text) is sent as the user message in JSON. Your prompt MUST instruct the AI to return the 6-field JSON output (see Output Schema tab) or the backend's sanity checks will cap your scores.
+                  </div>
+
+                  <div style={{marginBottom:10,fontSize:11,fontWeight:600,color:"var(--t1)"}}>📝 Writing a good custom prompt:</div>
+                  <div style={{paddingLeft:14,marginBottom:10}}>
+                    <div style={{marginBottom:6}}>1. <strong style={{color:"var(--t1)"}}>Define WHAT you're scoring</strong> — e.g. "Score posts for buying intent in the e-commerce logistics space" not "Score posts."</div>
+                    <div style={{marginBottom:6}}>2. <strong style={{color:"var(--t1)"}}>Provide explicit score tiers</strong> — give the AI 4-5 score bands (e.g. 90-100, 70-89, 50-69, 30-49, 0-29) with concrete examples for each.</div>
+                    <div style={{marginBottom:6}}>3. <strong style={{color:"var(--t1)"}}>List false positives explicitly</strong> — "A post about hiring is NOT a buying signal, score below 20." Be aggressive about this.</div>
+                    <div style={{marginBottom:6}}>4. <strong style={{color:"var(--t1)"}}>Specify the JSON output format</strong> — paste the schema from the Output Schema tab into your prompt, or the model may invent its own keys.</div>
+                    <div style={{marginBottom:6}}>5. <strong style={{color:"var(--t1)"}}>Include "OUTPUT JSON (no other text, no markdown):"</strong> as a header before the schema, so the model doesn't wrap it in code fences.</div>
+                    <div style={{marginBottom:6}}>6. <strong style={{color:"var(--t1)"}}>Reference the input fields available</strong> — your prompt receives <code>full_name, title, company, post_text, pre_filter_category</code>. You can reference these in your scoring logic.</div>
+                  </div>
+
+                  <div style={{marginBottom:8,fontSize:11,fontWeight:600,color:"var(--t1)"}}>🎯 What the AI receives</div>
+                  <div style={{padding:10,background:"var(--card)",borderRadius:6,fontFamily:"'JetBrains Mono',monospace",fontSize:9,marginBottom:10,whiteSpace:"pre-wrap"}}>{`# System message
+<your custom prompt OR the default prompt>
+
+# User message (always JSON)
+{
+  "full_name": "Jane Smith",
+  "title": "VP Marketing",
+  "company": "Acme Corp",
+  "post_text": "<post content, capped at 3000 chars>",
+  "pre_filter_category": "genuine_content"
+}`}</div>
+
+                  <div style={{padding:10,background:"rgba(245,158,11,.06)",border:"1px solid rgba(245,158,11,.3)",borderRadius:6}}>
+                    <strong style={{color:"var(--amb)"}}>⚠️ Important:</strong> Even if your prompt scores a post 100, the backend will <strong>cap the score</strong> based on (a) the pre-filter category and (b) sanity checks on the AI's output. A post categorized as "motivational" cannot exceed 35, no matter what your prompt does. See <strong>Score Caps</strong> tab.
+                  </div>
+                </div>
+              )}
+
+              {/* DEFAULT PROMPT TAB */}
+              {promptRefView==="default" && (
+                <div>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
+                    <div style={{fontSize:10,color:"var(--t3)"}}>This is the LIVE default prompt being used right now (fetched from backend).</div>
+                    <div style={{display:"flex",gap:6}}>
+                      <button className="btn btn-s" onClick={()=>{
+                        if(promptReference?.defaultPrompt){
+                          navigator.clipboard.writeText(promptReference.defaultPrompt);
+                        }
+                      }} style={{fontSize:9,padding:"3px 8px"}}>📋 Copy</button>
+                      <button className="btn btn-s" disabled={!promptReference?.defaultPrompt||systemPromptOverride.trim()===promptReference?.defaultPrompt?.trim()} onClick={()=>{
+                        if(promptReference?.defaultPrompt){
+                          if(systemPromptOverride.trim() && !confirm("Replace your current custom prompt with the default?")) return;
+                          setSystemPromptOverride(promptReference.defaultPrompt);
+                        }
+                      }} style={{fontSize:9,padding:"3px 8px",background:"rgba(93,168,122,.1)",color:"var(--grn)",borderColor:"rgba(93,168,122,.3)"}}>📥 Load as Custom</button>
+                    </div>
+                  </div>
+                  {promptReference?.defaultPrompt ? (
+                    <pre style={{fontSize:9,background:"var(--card)",padding:10,borderRadius:6,maxHeight:400,overflow:"auto",whiteSpace:"pre-wrap",lineHeight:1.5,color:"var(--t2)"}}>{promptReference.defaultPrompt}</pre>
+                  ) : (
+                    <div style={{fontSize:10,color:"var(--t3)",padding:12,textAlign:"center"}}>{promptRefLoading?"Loading…":"Click to load default prompt"}</div>
+                  )}
+                </div>
+              )}
+
+              {/* OUTPUT SCHEMA TAB */}
+              {promptRefView==="schema" && (
+                <div>
+                  <div style={{fontSize:10,color:"var(--t3)",marginBottom:8}}>The app reads these 6 fields from the AI's JSON response. Missing or wrong fields → silent fallbacks or capped scores.</div>
+                  {promptReference?.requiredOutputSchema ? (
+                    <div>
+                      <pre style={{fontSize:9,background:"var(--card)",padding:10,borderRadius:6,overflow:"auto",lineHeight:1.6,color:"var(--t2)"}}>{`{
+${Object.entries(promptReference.requiredOutputSchema).map(([k,v])=>`  "${k}": ${v}`).join(",\n")}
+}`}</pre>
+                      <div style={{marginTop:10,fontSize:11,fontWeight:600,color:"var(--t1)",marginBottom:6}}>📋 Copy-paste this into your custom prompt:</div>
+                      <pre style={{fontSize:9,background:"var(--card)",padding:10,borderRadius:6,overflow:"auto",lineHeight:1.5,color:"var(--t2)"}}>{`OUTPUT JSON (no other text, no markdown):
+{
+  "post_type": "holiday|anniversary|birthday|award|gratitude|condolence|hiring|farewell|self_promo|content_promo|motivational|reshare|thought_leadership|industry_news|event_announcement|pain_point|project_announcement|question_to_network|personal|other",
+  "relevance_score": <integer 1-100>,
+  "evidence_quote": "<exact sentence from post, ≤25 words. If no substantive content: 'NO_SPECIFIC_EVIDENCE' and score ≤25>",
+  "relevance_rationale": "<≤40 words on why this score>",
+  "structured_sentence": "<{name}, {title} at {company} posted about {15-word summary}>",
+  "suggested_comment": "<≤20 words, starts with 'You could comment' or 'You could highlight'>"
+}`}</pre>
+                      <button className="btn btn-s" onClick={()=>{
+                        navigator.clipboard.writeText(`OUTPUT JSON (no other text, no markdown):
+{
+  "post_type": "holiday|anniversary|birthday|award|gratitude|condolence|hiring|farewell|self_promo|content_promo|motivational|reshare|thought_leadership|industry_news|event_announcement|pain_point|project_announcement|question_to_network|personal|other",
+  "relevance_score": <integer 1-100>,
+  "evidence_quote": "<exact sentence from post, ≤25 words. If no substantive content: 'NO_SPECIFIC_EVIDENCE' and score ≤25>",
+  "relevance_rationale": "<≤40 words on why this score>",
+  "structured_sentence": "<{name}, {title} at {company} posted about {15-word summary}>",
+  "suggested_comment": "<≤20 words, starts with 'You could comment' or 'You could highlight'>"
+}`);
+                      }} style={{fontSize:9,padding:"3px 8px",marginTop:6}}>📋 Copy schema</button>
+                    </div>
+                  ) : (
+                    <div style={{fontSize:10,color:"var(--t3)",padding:12,textAlign:"center"}}>{promptRefLoading?"Loading…":"Click tab to load"}</div>
+                  )}
+                </div>
+              )}
+
+              {/* SANITY CAPS TAB */}
+              {promptRefView==="sanity" && (
+                <div>
+                  <div style={{padding:10,background:"rgba(245,158,11,.08)",border:"1px solid rgba(245,158,11,.3)",borderRadius:6,marginBottom:10,fontSize:10,color:"var(--t2)"}}>
+                    <strong style={{color:"var(--amb)"}}>Why scores get capped:</strong> Even with the most well-tuned prompts, AI models sometimes overscore (a "Happy Birthday Sarah!" post somehow gets a 75). The backend applies hard ceilings to prevent these false positives from polluting your task list. <strong>These caps run AFTER the AI scores</strong> — so your custom prompt cannot bypass them.
+                  </div>
+
+                  <div style={{marginBottom:10,fontSize:11,fontWeight:600,color:"var(--t1)"}}>1️⃣ Sanity Rules (applied to AI output)</div>
+                  {promptReference?.sanityRules ? (
+                    <ul style={{fontSize:10,color:"var(--t2)",lineHeight:1.7,paddingLeft:18,marginBottom:14}}>
+                      {promptReference.sanityRules.map((rule,i)=>(
+                        <li key={i} style={{marginBottom:3}}>{rule}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <div style={{fontSize:10,color:"var(--t3)",padding:8}}>{promptRefLoading?"Loading…":"Click tab to load"}</div>
+                  )}
+
+                  <div style={{marginBottom:10,fontSize:11,fontWeight:600,color:"var(--t1)"}}>2️⃣ Pre-Filter Category Ceilings (applied BEFORE AI based on regex)</div>
+                  {promptReference?.categoryCeilings && (
+                    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))",gap:6,fontSize:10,marginBottom:10}}>
+                      {Object.entries(promptReference.categoryCeilings).sort((a,b)=>a[1]-b[1]).map(([cat,cap])=>(
+                        <div key={cat} style={{padding:"4px 8px",background:"var(--card)",borderRadius:4,display:"flex",justifyContent:"space-between"}}>
+                          <span style={{color:"var(--t2)"}}>{cat}</span>
+                          <span style={{color:cap>=80?"var(--grn)":cap>=50?"var(--amb)":"var(--red)",fontFamily:"'JetBrains Mono',monospace",fontWeight:600}}>{cap}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div style={{padding:10,background:"rgba(91,143,212,.06)",border:"1px solid rgba(91,143,212,.25)",borderRadius:6,fontSize:10,color:"var(--t2)"}}>
+                    <strong style={{color:"var(--blu)"}}>How to debug a low score:</strong> When a task is created, the score field is the FINAL score (post-cap). If a post you expected to score 90 is showing 35, check: (a) what was its <code>post_type</code> from the AI output? (b) was it pre-filter-categorized as something low-ceiling? Use the test_profile action or check the scan logs to see the raw AI score vs the capped score.
+                  </div>
+                </div>
+              )}
+
+              {/* ─── SAVED PROMPTS LIBRARY ─── */}
+              <div style={{marginTop:14,padding:10,background:"rgba(155,126,216,.05)",border:"1px solid rgba(155,126,216,.25)",borderRadius:6}}>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
+                  <div style={{fontSize:11,fontWeight:600,color:"var(--pur)"}}>📚 Saved Prompts <span style={{color:"var(--t3)",fontWeight:400,fontSize:10,marginLeft:6}}>· {savedPrompts.length} saved · scoped to this campaign</span></div>
+                  <button className="btn btn-s" onClick={()=>loadSavedPrompts()} disabled={savedPromptsLoading} style={{fontSize:9,padding:"3px 8px"}} title="Refresh from Airtable">{savedPromptsLoading?"⟳":"↻"}</button>
+                </div>
+                {savedPromptsError && <div style={{fontSize:10,color:"var(--red)",marginBottom:8,padding:6,background:"rgba(232,107,107,.08)",borderRadius:4}}>{savedPromptsError}</div>}
+                {savedPrompts.length === 0 && !savedPromptsLoading && !savedPromptsError && (
+                  <div style={{fontSize:10,color:"var(--t3)",fontStyle:"italic",padding:6}}>No saved prompts yet. Write a prompt below and click 💾 Save to add one to the library.</div>
+                )}
+                {savedPrompts.length > 0 && (
+                  <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                    {savedPrompts.map(p => {
+                      const isLoaded = loadedPromptId === p.id;
+                      return (
+                        <div key={p.id} style={{display:"flex",alignItems:"center",gap:6,padding:"6px 8px",background:isLoaded?"rgba(155,126,216,.15)":"var(--card)",borderRadius:4,border:isLoaded?"1px solid rgba(155,126,216,.4)":"1px solid transparent"}}>
+                          <div style={{flex:1,fontSize:11,color:"var(--t1)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={p.prompt.slice(0,500)}>
+                            {isLoaded && <span style={{color:"var(--pur)",marginRight:4}}>●</span>}
+                            <strong>{p.name}</strong>
+                            <span style={{color:"var(--t3)",marginLeft:8,fontSize:9}}>{p.prompt.length} chars</span>
+                          </div>
+                          <button className="btn btn-s" onClick={()=>handleLoadPrompt(p.id)} disabled={isLoaded&&systemPromptOverride===loadedPromptOriginal} style={{fontSize:9,padding:"3px 8px"}} title={isLoaded&&systemPromptOverride===loadedPromptOriginal?"Already loaded":"Load this prompt into the editor"}>{isLoaded&&systemPromptOverride===loadedPromptOriginal?"✓ Loaded":"📥 Load"}</button>
+                          <button className="btn btn-s" onClick={()=>handleDeletePrompt(p.id)} style={{fontSize:9,padding:"3px 6px",color:"var(--red)"}} title="Delete this saved prompt">✕</button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* The actual textarea — always visible */}
+              <div style={{marginTop:14,padding:10,background:"var(--card)",borderRadius:6}}>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6,flexWrap:"wrap",gap:6}}>
+                  <div style={{fontSize:11,fontWeight:600,color:"var(--t1)"}}>
+                    ✏️ Your Custom Prompt
+                    {loadedPromptId && (() => {
+                      const loaded = savedPrompts.find(p=>p.id===loadedPromptId);
+                      if (!loaded) return null;
+                      const isModified = systemPromptOverride !== loadedPromptOriginal;
+                      return <span style={{fontSize:9,fontWeight:400,marginLeft:8,color:isModified?"var(--amb)":"var(--grn)"}}>{isModified ? `· editing "${loaded.name}" (unsaved)` : `· loaded from "${loaded.name}"`}</span>;
+                    })()}
+                  </div>
+                  <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+                    {/* Update button — only shown when there's a loaded prompt with unsaved edits */}
+                    {loadedPromptId && systemPromptOverride !== loadedPromptOriginal && systemPromptOverride.trim() && (
+                      <button className="btn btn-s" onClick={handleUpdateLoadedPrompt} disabled={promptSaving} style={{fontSize:9,padding:"3px 8px",background:"rgba(245,158,11,.1)",color:"var(--amb)",borderColor:"rgba(245,158,11,.3)"}} title="Overwrite the loaded saved prompt with current edits">{promptSaving?"⏳":"⟳ Update"}</button>
+                    )}
+                    {/* Save button — primary save action */}
+                    {systemPromptOverride.trim() && !loadedPromptId && (
+                      <button className="btn btn-s" onClick={()=>setSavePromptModal({mode:"save",name:""})} disabled={promptSaving} style={{fontSize:9,padding:"3px 8px",background:"rgba(93,168,122,.1)",color:"var(--grn)",borderColor:"rgba(93,168,122,.3)"}} title="Save current prompt to library">{promptSaving?"⏳":"💾 Save"}</button>
+                    )}
+                    {/* Save As — when a prompt is loaded, lets user save edits as a NEW prompt */}
+                    {systemPromptOverride.trim() && loadedPromptId && (
+                      <button className="btn btn-s" onClick={()=>{
+                        const loaded = savedPrompts.find(p=>p.id===loadedPromptId);
+                        setSavePromptModal({mode:"save_as",name:loaded?`${loaded.name} (copy)`:""});
+                      }} style={{fontSize:9,padding:"3px 8px"}} title="Save current prompt as a NEW saved prompt">💾 Save As…</button>
+                    )}
+                    {systemPromptOverride.trim() && (
+                      <button className="btn btn-s" onClick={()=>{if(confirm("Clear custom prompt and use default?")){setSystemPromptOverride("");setLoadedPromptId(null);setLoadedPromptOriginal("");}}} style={{fontSize:9,padding:"3px 8px",color:"var(--red)"}}>✕ Clear</button>
+                    )}
+                  </div>
+                </div>
+                <textarea className="inp" rows="10" placeholder="Leave blank to use default. Switch to '📖 Default Prompt' tab above and click '📥 Load as Custom' to start from the default and edit. Or load a saved prompt from the library above. Make sure your prompt instructs the AI to return all 6 JSON fields shown in the '🔧 Output Schema' tab." value={systemPromptOverride} onChange={e=>setSystemPromptOverride(e.target.value)} style={{fontSize:11,fontFamily:"'JetBrains Mono',monospace",lineHeight:1.5}}/>
+                <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"var(--t3)",marginTop:4}}>
+                  <span>{systemPromptOverride.length} chars</span>
+                  <span>{systemPromptOverride.trim() ? "✓ Custom prompt active" : "⚪ Default prompt active"}</span>
+                </div>
+              </div>
             </div>
           )}
         </div>
+
 
         {/* Auto-cleanup settings — prevents Airtable Tasks table from piling up */}
         <div style={{marginTop:14,padding:12,background:"var(--hover)",borderRadius:6}}>
@@ -4712,6 +5071,50 @@ function LinkedInPostsTab({ baseId, campaign, leads, onCampaignProvisioned }) {
           <strong style={{color:"var(--t1)"}}>Resumable:</strong> progress is saved to Airtable after every lead. If the function times out or crashes mid-scan, hit <em>Resume</em> to continue from where it stopped. No duplicate work, no lost data.
         </div>
       </div>
+
+      {/* Save Prompt modal */}
+      {savePromptModal && (
+        <div onClick={e=>e.target===e.currentTarget&&!promptSaving&&setSavePromptModal(null)} style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.75)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+          <div style={{background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:12,padding:24,width:"100%",maxWidth:480}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:14}}>
+              <div style={{fontSize:15,fontWeight:600,color:"var(--t1)"}}>💾 {savePromptModal.mode==="save_as"?"Save Prompt As…":"Save Prompt"}</div>
+              <button onClick={()=>!promptSaving&&setSavePromptModal(null)} disabled={promptSaving} style={{background:"transparent",border:"none",color:"var(--t3)",cursor:promptSaving?"not-allowed":"pointer",fontSize:20,padding:0,lineHeight:1}}>×</button>
+            </div>
+            <div style={{fontSize:11,color:"var(--t2)",marginBottom:12,lineHeight:1.6}}>
+              Saving to <strong style={{color:"var(--t1)"}}>Prompts</strong> table in this campaign's base, with Task Rule = <code style={{background:"var(--hover)",padding:"1px 4px",borderRadius:3}}>"LinkedIn Posts"</code>. Available across all sessions and devices on this campaign.
+            </div>
+            <div style={{marginBottom:8}}>
+              <label style={{fontSize:10,color:"var(--t3)",display:"block",marginBottom:4}}>Prompt Name</label>
+              <input
+                type="text"
+                className="inp"
+                value={savePromptModal.name}
+                onChange={e=>setSavePromptModal(m=>({...m,name:e.target.value}))}
+                placeholder="e.g. Material — Buying Intent · v2"
+                autoFocus
+                onKeyDown={e=>{
+                  if(e.key==="Enter" && savePromptModal.name.trim() && !promptSaving){
+                    handleSavePrompt(savePromptModal.name).then(success=>{ if(success) setSavePromptModal(null); });
+                  } else if(e.key==="Escape" && !promptSaving){
+                    setSavePromptModal(null);
+                  }
+                }}
+                style={{fontSize:12}}
+              />
+              {savedPrompts.find(p=>p.name.toLowerCase()===savePromptModal.name.trim().toLowerCase()) && (
+                <div style={{fontSize:9,color:"var(--amb)",marginTop:4}}>⚠ A prompt with this name already exists. Saving will overwrite it.</div>
+              )}
+            </div>
+            <div style={{display:"flex",justifyContent:"flex-end",gap:6,marginTop:14}}>
+              <button className="btn btn-s" onClick={()=>setSavePromptModal(null)} disabled={promptSaving}>Cancel</button>
+              <button className="btn btn-s btn-p" onClick={async()=>{
+                const success = await handleSavePrompt(savePromptModal.name);
+                if(success) setSavePromptModal(null);
+              }} disabled={!savePromptModal.name.trim()||promptSaving}>{promptSaving?"⏳ Saving…":"💾 Save"}</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

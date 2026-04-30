@@ -178,11 +178,24 @@ async function fetchArticle(url) {
 // ─── Date Filter ──────────────────────────────────────────────────
 
 const MAX_AGE_DAYS = 7;
+// Jobs are kept longer because non-tech companies post less frequently. A "VP Marketing
+// role open" 3 weeks ago is still actionable. News at 7 days makes sense (old news isn't
+// actionable), but jobs we keep for 30 days. Override via env if needed.
+const MAX_JOB_AGE_DAYS = parseInt(process.env.MAX_JOB_AGE_DAYS) || 30;
 
 function filterRecent(items) {
   const cutoff = Date.now() - MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
   return items.filter(item => {
     if (!item.date) return true; // keep items with no date (let AI handle)
+    const d = new Date(item.date).getTime();
+    return !isNaN(d) && d >= cutoff;
+  });
+}
+
+function filterRecentJobs(items) {
+  const cutoff = Date.now() - MAX_JOB_AGE_DAYS * 24 * 60 * 60 * 1000;
+  return items.filter(item => {
+    if (!item.date) return true;
     const d = new Date(item.date).getTime();
     return !isNaN(d) && d >= cutoff;
   });
@@ -239,18 +252,27 @@ async function scanJobsBatch(companies, taskDefs, threshold = 50) {
 
   // Build URLs — combine ALL f_C IDs into ONE LinkedIn URL
   const urls = [];
+  const combinedIdUrls = []; // track these specifically for retry without time filter
+
+  // f_TPR window (in seconds): r604800 = 7 days, r2592000 = 30 days, r7776000 = 90 days
+  // Loosened default to 30 days because non-tech companies (consumer, retail, hospitality)
+  // post jobs less frequently than tech companies. r604800 (7 days) was returning 0 for
+  // companies that genuinely had postings just slightly older than a week.
+  // Override via APIFY_JOBS_TPR env var if you need a different window.
+  const TPR = process.env.APIFY_JOBS_TPR || "r2592000";
 
   if (withIds.length > 0) {
     // LinkedIn's URL filter syntax uses COMMA-SEPARATED values for repeated dimensions:
     //   f_C=123,456,789  ✓  (filters jobs from any of those companies)
-    //   f_C=123&f_C=456  ✗  (LinkedIn keeps only the last value — Apify will return jobs only for the LAST company, or none at all)
-    // Same pattern applies to f_E (experience), f_PP (location), etc. Confirmed via
-    // LinkedIn's own scraped jobSearchUrl format and the Kondo URL-hacking guide.
+    //   f_C=123&f_C=456  ✗  (LinkedIn keeps only the last value)
+    // Confirmed via LinkedIn's own scraped jobSearchUrl format and the Kondo URL-hacking guide.
     const ids = withIds.map(c => c.linkedinCompanyId).join(",");
-    const combinedUrl = `https://www.linkedin.com/jobs/search/?f_C=${ids}&f_TPR=r604800&sortBy=DD`;
+    const combinedUrl = `https://www.linkedin.com/jobs/search/?f_C=${ids}&f_TPR=${TPR}&sortBy=DD`;
     urls.push(combinedUrl);
-    console.log(`  [JOBS-BATCH] Combined ${withIds.length} company IDs into ONE URL (comma-separated)`);
+    combinedIdUrls.push({ url: combinedUrl, companies: withIds });
+    console.log(`  [JOBS-BATCH] Combined ${withIds.length} company IDs into ONE URL (comma-separated, ${TPR})`);
     withIds.forEach(c => console.log(`    f_C=${c.linkedinCompanyId} (${c.name})`));
+    console.log(`  [JOBS-BATCH] URL: ${combinedUrl}`);
   }
 
   // Each keyword fallback company gets its own URL (can't combine these)
@@ -260,22 +282,66 @@ async function scanJobsBatch(companies, taskDefs, threshold = 50) {
     const topKw = taskDefs.flatMap(t => t.jobTitleKeywords || t.keywords || [])[0] || "marketing";
     const url = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${cleanName}" ${topKw}`)}&sortBy=DD`;
     urls.push(url);
-    console.log(`  [JOBS-BATCH] ${cleanName}: keyword fallback (separate URL)`);
+    console.log(`  [JOBS-BATCH] ${cleanName}: keyword fallback URL: ${url}`);
   }
 
   console.log(`  [JOBS-BATCH] Total URLs: ${urls.length} (was ${companies.length} before combining)`);
 
   const actorId = process.env.APIFY_ACTOR_ID || "curious_coder/linkedin-jobs-scraper";
-  const input = { urls, count: 100, scrapeCompany: false, includeJobDescription: true };
+  const baseInput = { count: 100, scrapeCompany: false, includeJobDescription: true };
 
   // Use fallback helper — tries all 3 tokens automatically
-  const { data, error } = await apifyCallWithFallback(actorId, input, 480000);
-  const allJobs = Array.isArray(data) ? data : [];
+  let { data, error } = await apifyCallWithFallback(actorId, { urls, ...baseInput }, 480000);
+  let allJobs = Array.isArray(data) ? data : [];
 
   if (error) console.error(`  [JOBS-BATCH] ${error}`);
   console.log(`  [JOBS-BATCH] Got ${allJobs.length} total job listings`);
 
+  // ── Retry 1: Drop f_TPR entirely (no time filter) if first attempt returned 0 ──
+  // Reason: even 30-day windows fail for some companies. Without f_TPR, LinkedIn
+  // returns ALL jobs ever posted by the company, sorted by date — newest first via
+  // sortBy=DD. We then filter by date in JS using filterRecent().
+  if (allJobs.length === 0 && combinedIdUrls.length > 0 && !error) {
+    console.log(`  [JOBS-BATCH] 0 results — retrying without time filter (f_TPR)...`);
+    const retryUrls = [];
+    if (withIds.length > 0) {
+      const ids = withIds.map(c => c.linkedinCompanyId).join(",");
+      const noTPRUrl = `https://www.linkedin.com/jobs/search/?f_C=${ids}&sortBy=DD`;
+      retryUrls.push(noTPRUrl);
+      console.log(`  [JOBS-BATCH] Retry URL: ${noTPRUrl}`);
+    }
+    for (const c of withoutIds) {
+      const cleanName = cleanCompanyName(c.name);
+      if (!cleanName) continue;
+      const topKw = taskDefs.flatMap(t => t.jobTitleKeywords || t.keywords || [])[0] || "marketing";
+      retryUrls.push(`https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${cleanName}" ${topKw}`)}&sortBy=DD`);
+    }
+    const retry1 = await apifyCallWithFallback(actorId, { urls: retryUrls, ...baseInput }, 480000);
+    allJobs = Array.isArray(retry1.data) ? retry1.data : [];
+    console.log(`  [JOBS-BATCH] After retry-1 (no time filter): ${allJobs.length} jobs`);
+  }
+
+  // ── Retry 2: Try each company ID individually (rules out comma-separated f_C bug) ──
+  if (allJobs.length === 0 && withIds.length > 1 && !error) {
+    console.log(`  [JOBS-BATCH] Still 0 — retrying with INDIVIDUAL URLs per company (rules out comma-syntax issue)...`);
+    const indivUrls = withIds.map(c => `https://www.linkedin.com/jobs/search/?f_C=${c.linkedinCompanyId}&sortBy=DD`);
+    for (const c of withoutIds) {
+      const cleanName = cleanCompanyName(c.name);
+      if (!cleanName) continue;
+      const topKw = taskDefs.flatMap(t => t.jobTitleKeywords || t.keywords || [])[0] || "marketing";
+      indivUrls.push(`https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${cleanName}" ${topKw}`)}&sortBy=DD`);
+    }
+    indivUrls.forEach(u => console.log(`  [JOBS-BATCH] Indiv URL: ${u}`));
+    const retry2 = await apifyCallWithFallback(actorId, { urls: indivUrls, ...baseInput }, 480000);
+    allJobs = Array.isArray(retry2.data) ? retry2.data : [];
+    console.log(`  [JOBS-BATCH] After retry-2 (individual URLs): ${allJobs.length} jobs`);
+  }
+
   if (allJobs.length === 0) {
+    console.log(`  [JOBS-BATCH] FINAL: 0 jobs after all retries. Possible causes:`);
+    console.log(`    1. Companies have no recent postings`);
+    console.log(`    2. LinkedIn IDs are stale/wrong (verify by pasting one URL above into a browser)`);
+    console.log(`    3. Apify actor blocked by LinkedIn (try rerunning later)`);
     return companies.map(c => ({ company: c.name, signals: [] }));
   }
 
@@ -332,10 +398,11 @@ async function scanJobsBatch(companies, taskDefs, threshold = 50) {
       articleContent: cl(job.descriptionText || job.descriptionHtml || "").slice(0, 800),
     })).filter(j => j.jobTitle.length > 2);
 
-    // Date filter for keyword fallback only (f_C already has f_TPR=r604800)
-    const recent = hasId ? signals : filterRecent(signals);
+    // Always apply 30-day filter post-fetch. The URL's f_TPR is best-effort (may have
+    // been dropped in retry attempts). filterRecentJobs is the authoritative cutoff.
+    const recent = filterRecentJobs(signals);
 
-    console.log(`  [JOBS-BATCH] ${c.name}: ${companyJobs.length} matched → ${recent.length} recent`);
+    console.log(`  [JOBS-BATCH] ${c.name}: ${companyJobs.length} matched → ${recent.length} within ${MAX_JOB_AGE_DAYS} days`);
 
     if (recent.length > 0) {
       const classified = await classify(recent, taskDefs, c.name, "jobs", threshold);
@@ -448,17 +515,21 @@ async function classify(signals, taskDefs, companyName, mode, threshold = 50) {
     const taskName = task.name || "(unnamed task)";
 
     // System prompt: format only. No judgement rules. The user's prompt is authority.
+    // Score tiers are descriptive guideposts — the threshold (set by the user via the
+    // slider in the UI) is the AUTHORITATIVE cutoff. We describe what each band MEANS
+    // but never tell the AI to "reject" or "drop" based on tiers — only based on threshold.
     const sysPrompt = `You are scoring ${mode === "jobs" ? "job postings" : `news articles about "${companyName}"`} against ONE specific task: "${taskName}".
 
 The user has provided their scoring criteria below. Use it AS THE PRIMARY GUIDE — it overrides any generic intuition.
 
-Score each signal 0-100:
+Score each signal 0-100 using these descriptive bands as a calibration guide:
 - 90-100: exact match, immediately actionable
 - 70-89: strong match, likely actionable
 - 50-69: partial / tangential
-- Below 50: reject
+- 30-49: weak relation
+- 0-29: unrelated
 
-Return ONLY signals scoring ${threshold} or higher. Drop everything else.
+The user has set a threshold of ${threshold}. Return ONLY signals scoring ${threshold} or higher. Drop everything below ${threshold}.
 
 Output format (strict JSON, no markdown):
 {
@@ -509,22 +580,28 @@ ${signalBlock}`;
 
   for (const { task, scores, error } of taskOutputs) {
     if (scores === null) {
-      // OpenAI failed for this task — keyword fallback. Score is conservative (60)
-      // since we can't verify quality without AI. Above threshold of 50 by default,
-      // but might be filtered out by frontend's user threshold (default 70).
+      // OpenAI failed for this task — keyword fallback at score 60 (conservative,
+      // since we can't AI-verify). We only emit fallbacks if 60 >= threshold so the
+      // user's slider behavior stays consistent: anything below their threshold
+      // never appears, regardless of whether AI succeeded or fell back.
+      const FALLBACK_SCORE = 60;
+      if (FALLBACK_SCORE < threshold) {
+        console.log(`  [TASK] "${task.name}" → AI ERROR, fallback score ${FALLBACK_SCORE} < threshold ${threshold}, skipping`);
+        continue;
+      }
       let fallbackCount = 0;
       signals.forEach((sig, i) => {
         const t = `${sig.headline} ${sig.description || ""} ${sig.jobTitle || ""}`.toLowerCase();
         const kws = [...(task.keywords || []), ...(task.jobTitleKeywords || [])].filter(k => k && k.length >= 2);
         if (kws.length > 0 && kws.some(kw => t.includes(kw.toLowerCase()))) {
           results[i].matchedTaskIds.push(task.id);
-          results[i].relevanceScores[task.id] = 60;
+          results[i].relevanceScores[task.id] = FALLBACK_SCORE;
           results[i].scoreReasons[task.id] = "AI scoring failed; keyword match fallback";
-          results[i].confidence = Math.max(results[i].confidence, 0.6);
+          results[i].confidence = Math.max(results[i].confidence, FALLBACK_SCORE / 100);
           fallbackCount++;
         }
       });
-      console.log(`  [TASK] "${task.name}" → AI ERROR, ${fallbackCount} keyword fallbacks (score 60 each, may be filtered by user threshold)`);
+      console.log(`  [TASK] "${task.name}" → AI ERROR, ${fallbackCount} keyword fallbacks at score ${FALLBACK_SCORE}`);
       continue;
     }
     let matchCount = 0;
@@ -558,11 +635,14 @@ export async function POST(request) {
   try {
     const body = await request.json();
     const { mode } = body;
-    // The frontend passes the user's configured scoring threshold (default 70).
+    // The frontend passes the user's configured scoring threshold (0-100, default 70).
     // We pass this to the AI so it can drop low-scoring signals at output time
     // instead of returning them and having the frontend filter post-hoc.
-    // Floor at 50 — anything below 50 is "not even tangentially related" by our prompt convention.
-    const threshold = Math.max(50, Math.min(100, parseInt(body.threshold) || 70));
+    // Full 0-100 range — user has a slider in the UI, no artificial floor.
+    // Use ?? not || so 0 is preserved (|| would treat 0 as falsy and use default 70).
+    const rawT = body.threshold;
+    const parsedT = rawT == null ? 70 : Number(rawT);
+    const threshold = Number.isFinite(parsedT) ? Math.max(0, Math.min(100, Math.round(parsedT))) : 70;
 
     if (!process.env.OPENAI_API_KEY) return NextResponse.json({ error: "OPENAI_API_KEY not configured" }, { status: 500 });
 
