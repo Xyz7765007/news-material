@@ -407,6 +407,12 @@ function calculateEngagementScore(m, config) {
 // ═══════════════════════════════════════════════════════════════
 export async function POST(request) {
   try {
+    // SECURITY: Block from /client/[id] pages. Handles Google OAuth tokens.
+    const referer = request.headers.get("referer") || "";
+    if (/\/client\/[^/?#]+/.test(referer)) {
+      console.warn(`[SECURITY] ga blocked from client referer: ${referer}`);
+      return NextResponse.json({ error: "Not authorized in client mode" }, { status: 403 });
+    }
     const body = await request.json();
     const { action, campaignId, baseId } = body;
 

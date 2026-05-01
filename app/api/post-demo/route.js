@@ -315,6 +315,12 @@ async function processRule(k, baseId, rule) {
 // ═══════════════════════════════════════════════════════════════
 export async function POST(request) {
   try {
+    // SECURITY: Block from /client/[id] pages. Uses HubSpot API keys.
+    const referer = request.headers.get("referer") || "";
+    if (/\/client\/[^/?#]+/.test(referer)) {
+      console.warn(`[SECURITY] post-demo blocked from client referer: ${referer}`);
+      return NextResponse.json({ error: "Not authorized in client mode" }, { status: 403 });
+    }
     const body = await request.json();
     const { action, campaignId, baseId } = body;
     const k = body.apiKey || await getHsKey(campaignId);

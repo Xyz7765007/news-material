@@ -107,7 +107,7 @@ td{padding:10px 12px;border-bottom:1px solid var(--bdr);color:var(--t2)}tr:last-
 
 export default function SignalScope({ clientMode = false, fixedCampaignId = null }) {
   const [camp, setCamp] = useState(null); // active campaign object
-  const [campaigns, setCampaigns] = useState(DEFAULT_CAMPAIGNS);
+  const [campaigns, setCampaigns] = useState(clientMode ? [] : DEFAULT_CAMPAIGNS);
   const [tab, setTab] = useState("dashboard");
   const [emailPrefilledLeadId, setEmailPrefilledLeadId] = useState(null);
   // Listen for "open email for lead" event fired from GA tab
@@ -218,6 +218,9 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       })();
       return;
     }
+    // SECURITY: NEVER call list_campaigns in clientMode. Even though clientMode short-circuits
+    // above, defense-in-depth: if clientMode flag is set we don't enumerate campaigns.
+    if (clientMode) return;
     (async () => {
       try {
         const res = await at("list_campaigns", "");
@@ -261,7 +264,14 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const validateClientPw = async () => {
     const res = await fetch("/api/airtable", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "validate_client", campaignId: fixedCampaignId, password: clientPw }) });
     const d = await res.json();
-    if (d.valid) { setClientAuth("ok"); setCamp(window.__pendingCamp || null); }
+    if (d.valid) {
+      // SECURITY: if pendingCamp was lost (page reload, multi-tab, etc), DO NOT fall through
+      // to landing page. Force error state instead.
+      const pending = window.__pendingCamp;
+      if (!pending) { setClientError("Session lost. Please reload the page."); setClientAuth("error"); return; }
+      setClientAuth("ok");
+      setCamp(pending);
+    }
     else setClientPwErr("Incorrect password");
   };
 
@@ -1461,6 +1471,18 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   </div></>);
 
   // ═══ LANDING ═══════════════════════════════════════════════
+  // SECURITY CRITICAL: NEVER render the landing page (which lists ALL campaigns)
+  // in clientMode. If we somehow reach here in clientMode without a campaign set
+  // (clientAuth went to "ok" but camp is null due to lost session, race, or page
+  // navigation), show an error instead of leaking the full campaign list.
+  // This is the bug that exposed all campaigns to a client who reloaded after
+  // password entry.
+  //
+  // IMPORTANT: This must check `!camp` to NOT block the success path (clientMode
+  // with camp set should render the campaign view normally below).
+  if (clientMode && !camp) {
+    return (<><style>{CSS}</style><div className="landing"><div style={{fontSize:40,marginBottom:16}}>⚠️</div><h1 style={{fontSize:18,marginBottom:8}}>Session Expired</h1><div style={{color:"var(--t3)",fontSize:13,marginBottom:8}}>Please reload this page to access your campaign.</div><button className="btn btn-p" style={{marginTop:16}} onClick={()=>window.location.reload()}>Reload</button></div></>);
+  }
   if(!camp){return(<><style>{CSS}</style><div className="landing"><h1>SignalScope</h1><div className="sub">B2B Signal Intelligence Platform</div>
   <div className="cgrid">
     {campaigns.map(c=>(<div key={c.id} className={"ccard"+(c.active?"":" off")} onClick={()=>c.active&&setCamp(c)}>
@@ -1487,6 +1509,11 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const jobsRuleCount = signalRules.filter(r => { const tt=(r.fields||{})["Task Type"]||"news"; return tt==="job_post"||tt==="both"; }).length;
   const topXRules = rules.filter(r => (r.fields||{})["Task Type"] === "top_x");
 
+  // Admin-only tabs hidden from clientMode. These either expose master-base data
+  // (Triggers shows ALL Account Routing across campaigns), integration credentials
+  // (HubSpot, GA), or admin functions. Clients see only their campaign's
+  // operational data + read-only LinkedIn outreach/posts views.
+  const ADMIN_ONLY_TABS = new Set(["triggers", "email_campaign", "google_analytics", "hubspot", "post_demo"]);
   const navs = [
     {id:"dashboard",label:"📊 Dashboard",count:null},
     null,
@@ -1506,7 +1533,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     {id:"hubspot",label:"🔗 HubSpot",count:null},
     {id:"post_demo",label:"🤖 Post-Demo Auto",count:null},
     ...(!clientMode ? [{id:"coming_soon",label:"🚀 Coming Soon",count:null}] : []),
-  ];
+  ].filter(n => n === null || !clientMode || !ADMIN_ONLY_TABS.has(n.id));
 
   return(<><style>{CSS}</style><div className="dash">
   <div className="side"><div className="side-hd"><div className="side-brand">SignalScope</div><div className="side-camp">{camp.name}</div>{!clientMode&&<div className="side-back" onClick={()=>setCamp(null)}><I.Back/> All Campaigns</div>}{clientMode&&camp.desc&&<div style={{fontSize:10,color:"var(--t3)",marginTop:4,lineHeight:1.4}}>{camp.desc}</div>}</div>
@@ -1571,7 +1598,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   {tab==="dashboard"&&!loading&&(<div>
     <div className="ph"><div><div className="pt">{clientMode ? `${camp.emoji||"📊"} ${camp.name}` : "Dashboard"}</div><div className="pd">{clientMode ? "Your campaign workspace — everything in one view" : `${camp.name} — Real-time overview`}</div></div>
       <div style={{display:"flex",gap:6}}>
-        {hasSignals&&<>
+        {hasSignals&&!clientMode&&<>
           <button className="btn btn-s btn-p" onClick={()=>startScan("news")} disabled={scanning||!accounts.length||!newsRuleCount} title={!newsRuleCount?"No news or both-type rules":`Scan ${newsRuleCount} news rule${newsRuleCount===1?"":"s"}`}>{scanning?"⏳ "+Math.round(scanProg)+"%":<>📰 News</>}</button>
           <button className="btn btn-s btn-p" onClick={()=>startScan("jobs")} disabled={scanning||!accounts.length||!jobsRuleCount} title={!jobsRuleCount?"No job_post or both-type rules":`Scan ${jobsRuleCount} jobs rule${jobsRuleCount===1?"":"s"}`}>{scanning?"⏳ "+Math.round(scanProg)+"%":<>📋 Jobs</>}</button>
         </>}
@@ -1931,14 +1958,14 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     </div>)}
   </div>)}
 
-  {/* ════ GOOGLE ANALYTICS ════ */}
-  {tab==="google_analytics"&&!loading&&(<div>
+  {/* ════ GOOGLE ANALYTICS — admin only ════ */}
+  {tab==="google_analytics"&&!loading&&!clientMode&&(<div>
     <div className="ph"><div><div className="pt">📊 Google Analytics</div><div className="pd">Connect GA4 to enrich leads with website engagement data — sliding 7-day window</div></div></div>
     <GoogleAnalyticsCard baseId={bid} campaign={camp} onSyncComplete={()=>at("list","Leads",{},bid).then(r=>setLeads(r.records||[]))} />
   </div>)}
 
-  {/* ════ HUBSPOT ════ */}
-  {tab==="hubspot"&&!loading&&(<div>
+  {/* ════ HUBSPOT — admin only ════ */}
+  {tab==="hubspot"&&!loading&&!clientMode&&(<div>
     <div className="ph"><div><div className="pt">🔗 HubSpot Integration</div><div className="pd">Connect HubSpot, push tasks, manage enrichment</div></div></div>
 
     {/* Connection */}
@@ -2007,8 +2034,8 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     </>)}
   </div>)}
 
-  {/* ════ POST-DEMO AUTOMATION ════ */}
-  {tab==="post_demo"&&!loading&&(<div>
+  {/* ════ POST-DEMO AUTOMATION — admin only ════ */}
+  {tab==="post_demo"&&!loading&&!clientMode&&(<div>
     <div className="ph"><div><div className="pt">🤖 Post-Demo Automation</div><div className="pd">HubSpot deal stage → AI reads full history → SDR tasks</div></div></div>
     {!hsConnected?(
       <div className="empty"><div className="em">🔗</div><p>Connect HubSpot first</p><button className="btn btn-p" onClick={()=>setTab("hubspot")}>Go to HubSpot →</button></div>
@@ -2063,11 +2090,11 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     </>)}
   </div>)}
 
-  {/* ════ EMAIL CAMPAIGN ════ */}
-  {tab==="email_campaign"&&!loading&&(<EmailCampaignTab baseId={bid} campaign={camp} leads={leads} prefilledLeadId={emailPrefilledLeadId} />)}
+  {/* ════ EMAIL CAMPAIGN — admin only ════ */}
+  {tab==="email_campaign"&&!loading&&!clientMode&&(<EmailCampaignTab baseId={bid} campaign={camp} leads={leads} prefilledLeadId={emailPrefilledLeadId} />)}
 
-  {/* ════ TRIGGERS ════ */}
-  {tab==="triggers"&&!loading&&(<TriggersTab baseId={bid} campaign={camp} />)}
+  {/* ════ TRIGGERS — admin only (exposes master-base routing across all campaigns) ════ */}
+  {tab==="triggers"&&!loading&&!clientMode&&(<TriggersTab baseId={bid} campaign={camp} />)}
 
   {/* ════ COMING SOON ════ */}
   {tab==="coming_soon"&&(<div>
@@ -2111,10 +2138,10 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
           <option value="all">All Campaigns ({accounts.length})</option>
           {acctTags.map(t => <option key={t} value={t}>{t} ({accounts.filter(a=>(a.fields||{})["Campaign Tag"]===t).length})</option>)}
         </select>}
-        <label className="btn btn-s" style={{cursor:"pointer"}}><I.Upload/> Upload CSV<input type="file" accept=".csv" hidden onChange={e=>{if(e.target.files[0])handleCSVFile(e.target.files[0],"Accounts",setAccounts)}}/></label>
+        {!clientMode&&<label className="btn btn-s" style={{cursor:"pointer"}}><I.Upload/> Upload CSV<input type="file" accept=".csv" hidden onChange={e=>{if(e.target.files[0])handleCSVFile(e.target.files[0],"Accounts",setAccounts)}}/></label>}
       </div></div>
     {filteredAccts.length===0?<div className="empty"><div className="em">🏢</div><p>{accounts.length>0?"No accounts match this campaign filter.":"Upload a CSV to get started."}</p></div>:
-    <div className="tw"><table><thead><tr>{cols.map(k=><th key={k}>{k}</th>)}<th></th></tr></thead><tbody>{filteredAccts.map(a=>{const f=a.fields||{};return(<tr key={a.id}>{cols.map(k=><td key={k} style={k==="Name"?{color:"var(--t1)",fontWeight:500}:k==="Campaign Tag"?{fontSize:10,color:"var(--acc)"}:{}}>{fmt(f[k])}</td>)}<td><button className="btn btn-d btn-s" onClick={()=>del("Accounts",[a.id],setAccounts)}><I.Trash/></button></td></tr>)})}</tbody></table></div>}</div>);
+    <div className="tw"><table><thead><tr>{cols.map(k=><th key={k}>{k}</th>)}{!clientMode&&<th></th>}</tr></thead><tbody>{filteredAccts.map(a=>{const f=a.fields||{};return(<tr key={a.id}>{cols.map(k=><td key={k} style={k==="Name"?{color:"var(--t1)",fontWeight:500}:k==="Campaign Tag"?{fontSize:10,color:"var(--acc)"}:{}}>{fmt(f[k])}</td>)}{!clientMode&&<td><button className="btn btn-d btn-s" onClick={()=>del("Accounts",[a.id],setAccounts)}><I.Trash/></button></td>}</tr>)})}</tbody></table></div>}</div>);
   })()}
 
   {/* LEADS */}
@@ -2177,15 +2204,15 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
           <option value="all">All Campaigns ({leads.length})</option>
           {leadTags.map(t => <option key={t} value={t}>{t} ({leads.filter(l=>(l.fields||{})["Campaign Tag"]===t).length})</option>)}
         </select>}
-        <label className="btn btn-s" style={{cursor:"pointer"}}><I.Upload/> Upload CSV<input type="file" accept=".csv" hidden onChange={e=>{if(e.target.files[0])handleCSVFile(e.target.files[0],"Leads",setLeads)}}/></label>
+        {!clientMode&&<label className="btn btn-s" style={{cursor:"pointer"}}><I.Upload/> Upload CSV<input type="file" accept=".csv" hidden onChange={e=>{if(e.target.files[0])handleCSVFile(e.target.files[0],"Leads",setLeads)}}/></label>}
       </div></div>
 
     {filteredLeads.length===0?<div className="empty"><div className="em">👤</div><p>{leads.length>0?"No leads match this campaign filter.":"Upload a CSV."}</p></div>:
-    <div className="tw"><table><thead><tr>{cols.map(k=><th key={k}>{k}</th>)}<th></th></tr></thead><tbody>{filteredLeads.map(l=>{const f=l.fields||{};return(<tr key={l.id}>{cols.map(k=><td key={k} style={k==="Name"?{color:"var(--t1)",fontWeight:500}:k==="Email"?{fontSize:10}:k==="Campaign Tag"?{fontSize:10,color:"var(--acc)"}:k==="Custom Code"?{fontSize:10,fontFamily:"'JetBrains Mono',monospace",color:"var(--t3)"}:k==="GA Engagement Score"?{fontWeight:600,color:f[k]>50?"var(--grn)":f[k]>20?"var(--amb)":f[k]>0?"var(--blu)":"var(--t3)",fontSize:11}:k==="GA Last Visit"?{fontSize:10,color:f[k]?"var(--blu)":"var(--t3)"}:k==="GA Engagement Time"||k==="GA Avg Session Duration"?{fontSize:10,color:Number(f[k])>0?"var(--t1)":"var(--t3)"}:k==="GA Sessions"||k==="GA Engaged Sessions"||k==="GA Views"||k==="GA Views Per Session"?{fontSize:10,color:Number(f[k])>0?"var(--t1)":"var(--t3)",textAlign:"center"}:{}}>{fmt(f[k],k)}</td>)}<td><button className="btn btn-d btn-s" onClick={()=>del("Leads",[l.id],setLeads)}><I.Trash/></button></td></tr>)})}</tbody></table></div>}</div>);
+    <div className="tw"><table><thead><tr>{cols.map(k=><th key={k}>{k}</th>)}{!clientMode&&<th></th>}</tr></thead><tbody>{filteredLeads.map(l=>{const f=l.fields||{};return(<tr key={l.id}>{cols.map(k=><td key={k} style={k==="Name"?{color:"var(--t1)",fontWeight:500}:k==="Email"?{fontSize:10}:k==="Campaign Tag"?{fontSize:10,color:"var(--acc)"}:k==="Custom Code"?{fontSize:10,fontFamily:"'JetBrains Mono',monospace",color:"var(--t3)"}:k==="GA Engagement Score"?{fontWeight:600,color:f[k]>50?"var(--grn)":f[k]>20?"var(--amb)":f[k]>0?"var(--blu)":"var(--t3)",fontSize:11}:k==="GA Last Visit"?{fontSize:10,color:f[k]?"var(--blu)":"var(--t3)"}:k==="GA Engagement Time"||k==="GA Avg Session Duration"?{fontSize:10,color:Number(f[k])>0?"var(--t1)":"var(--t3)"}:k==="GA Sessions"||k==="GA Engaged Sessions"||k==="GA Views"||k==="GA Views Per Session"?{fontSize:10,color:Number(f[k])>0?"var(--t1)":"var(--t3)",textAlign:"center"}:{}}>{fmt(f[k],k)}</td>)}{!clientMode&&<td><button className="btn btn-d btn-s" onClick={()=>del("Leads",[l.id],setLeads)}><I.Trash/></button></td>}</tr>)})}</tbody></table></div>}</div>);
   })()}
 
   {/* TASK RULES (unified — signal + top_x) */}
-  {tab==="rules"&&!loading&&(<div><div className="ph"><div><div className="pt">Task Rules</div><div className="pd">{rules.length} rules</div></div><button className="btn btn-s btn-p" onClick={()=>setEditRule({})}><I.Plus/> Add Rule</button></div>
+  {tab==="rules"&&!loading&&(<div><div className="ph"><div><div className="pt">Task Rules</div><div className="pd">{rules.length} rules</div></div>{!clientMode&&<button className="btn btn-s btn-p" onClick={()=>setEditRule({})}><I.Plus/> Add Rule</button>}</div>
 
   {/* Task type guides — show relevant ones based on campaign features */}
   {rules.length===0&&(<div style={{display:"flex",flexDirection:"column",gap:12,marginBottom:20}}>
@@ -2201,7 +2228,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         <div style={{marginBottom:4}}><strong style={{color:"var(--t2)"}}>You define:</strong> Keywords to match, scoring prompt for AI classification</div>
         <div><strong style={{color:"var(--t2)"}}>Creates:</strong> Tasks with headline, source URL, relevance score</div>
       </div>
-      {signalRules.filter(r=>{const tt=(r.fields||{})["Task Type"];return tt==="news"||tt==="both"}).length===0&&(
+      {!clientMode&&signalRules.filter(r=>{const tt=(r.fields||{})["Task Type"];return tt==="news"||tt==="both"}).length===0&&(
         <button className="btn btn-s btn-ai" style={{marginTop:10}} onClick={()=>setEditRule({taskType:"news",sources:["News"]})}><I.Plus/> Create News Rule</button>
       )}
     </div>)}
@@ -2215,7 +2242,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         <div style={{marginBottom:4}}><strong style={{color:"var(--t2)"}}>You define:</strong> Job title keywords to search for</div>
         <div><strong style={{color:"var(--t2)"}}>Creates:</strong> Tasks with job title, posting URL, relevance score</div>
       </div>
-      {signalRules.filter(r=>{const tt=(r.fields||{})["Task Type"];return tt==="job_post"||tt==="both"}).length===0&&(
+      {!clientMode&&signalRules.filter(r=>{const tt=(r.fields||{})["Task Type"];return tt==="job_post"||tt==="both"}).length===0&&(
         <button className="btn btn-s btn-ai" style={{marginTop:10}} onClick={()=>setEditRule({taskType:"job_post",sources:["Job Posts"]})}><I.Plus/> Create Job Post Rule</button>
       )}
     </div>)}
@@ -2229,7 +2256,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         <div style={{marginBottom:4}}><strong style={{color:"var(--t2)"}}>You define:</strong> Which fields to score on, weight per field, how many top results</div>
         <div><strong style={{color:"var(--t2)"}}>Creates:</strong> Tasks for top N leads/accounts with composite score</div>
       </div>
-      {topXRules.length===0&&(
+      {!clientMode&&topXRules.length===0&&(
         <button className="btn btn-s btn-ai" style={{marginTop:10}} onClick={()=>setEditRule({taskType:"top_x"})}><I.Plus/> Create Top X Rule</button>
       )}
     </div>)}
@@ -2240,7 +2267,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   {/* Signal rules table */}
   {signalRules.length>0&&(<div style={{marginBottom:topXRules.length?20:0}}>
   <div style={{fontSize:11,fontWeight:600,color:"var(--t2)",marginBottom:8}}>📰 Signal Rules</div>
-  <div className="tw"><table><thead><tr><th>Name</th><th>Task Type</th><th>Scan Target</th><th>Ease</th><th>Strength</th><th>Keywords</th><th></th></tr></thead><tbody>{signalRules.map(r=>{const f=r.fields||{};const isJobOnly=f["Task Type"]==="job_post";return(<tr key={r.id}><td style={{color:"var(--t1)",fontWeight:500}}>{f.Name}</td><td><span className={"chip "+(f["Task Type"]==="job_post"?"cb":f["Task Type"]==="both"?"ca":"cg")}>{f["Task Type"]||"news"}</span></td><td><span className={"chip "+(f["Scan Target"]==="leads"?"cp":f["Scan Target"]==="both"?"ca":"cg")}>{f["Scan Target"]||"accounts"}</span></td><td>{f.Ease}</td><td>{f.Strength}</td><td style={{fontSize:10,color:"var(--t3)"}}>{(isJobOnly?(f["Job Title Keywords"]||""):(f.Keywords||"")).slice(0,40)}</td><td><div style={{display:"flex",gap:4}}><button className="btn btn-s" onClick={()=>setEditRule({airtableId:r.id,name:f.Name,description:f.Description,taskType:f["Task Type"]||"news",scanTarget:f["Scan Target"]||"accounts",ease:f.Ease,strength:f.Strength,sources:(f.Sources||"").split(",").map(s=>s.trim()).filter(Boolean),keywords:(f.Keywords||"").split(",").map(k=>k.trim()).filter(Boolean),jobTitleKeywords:(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()).filter(Boolean),scoringPrompt:f["Scoring Prompt"]||""})}>Edit</button><button className="btn btn-s" onClick={()=>duplicateRule(r)} title="Duplicate"><I.Copy/></button><button className="btn btn-d btn-s" onClick={()=>del("Task Rules",[r.id],setRules)}><I.Trash/></button></div></td></tr>)})}</tbody></table></div>
+  <div className="tw"><table><thead><tr><th>Name</th><th>Task Type</th><th>Scan Target</th><th>Ease</th><th>Strength</th><th>Keywords</th><th></th></tr></thead><tbody>{signalRules.map(r=>{const f=r.fields||{};const isJobOnly=f["Task Type"]==="job_post";return(<tr key={r.id}><td style={{color:"var(--t1)",fontWeight:500}}>{f.Name}</td><td><span className={"chip "+(f["Task Type"]==="job_post"?"cb":f["Task Type"]==="both"?"ca":"cg")}>{f["Task Type"]||"news"}</span></td><td><span className={"chip "+(f["Scan Target"]==="leads"?"cp":f["Scan Target"]==="both"?"ca":"cg")}>{f["Scan Target"]||"accounts"}</span></td><td>{f.Ease}</td><td>{f.Strength}</td><td style={{fontSize:10,color:"var(--t3)"}}>{(isJobOnly?(f["Job Title Keywords"]||""):(f.Keywords||"")).slice(0,40)}</td><td>{!clientMode&&<div style={{display:"flex",gap:4}}><button className="btn btn-s" onClick={()=>setEditRule({airtableId:r.id,name:f.Name,description:f.Description,taskType:f["Task Type"]||"news",scanTarget:f["Scan Target"]||"accounts",ease:f.Ease,strength:f.Strength,sources:(f.Sources||"").split(",").map(s=>s.trim()).filter(Boolean),keywords:(f.Keywords||"").split(",").map(k=>k.trim()).filter(Boolean),jobTitleKeywords:(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()).filter(Boolean),scoringPrompt:f["Scoring Prompt"]||""})}>Edit</button><button className="btn btn-s" onClick={()=>duplicateRule(r)} title="Duplicate"><I.Copy/></button><button className="btn btn-d btn-s" onClick={()=>del("Task Rules",[r.id],setRules)}><I.Trash/></button></div>}</td></tr>)})}</tbody></table></div>
   </div>)}
 
   {/* Top X rules cards */}
@@ -2272,8 +2299,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       <div className="pt">Scoring Prompts</div>
       <div className="pd">AI scoring criteria (0-100). Your prompt is the SINGLE source of truth — there are no hardcoded judgement rules competing with it.</div>
     </div>
-    <button className="btn btn-ai btn-s" onClick={async()=>{const empty=rules.filter(r=>!(r.fields||{})["Scoring Prompt"]);for(const rule of empty){const f=rule.fields||{};try{const res=await fetch("/api/classify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"generate_scoring_prompt",taskName:f.Name,taskDescription:f.Description,taskKeywords:(f.Keywords||"").split(",").map(k=>k.trim()),taskJobTitleKeywords:(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()),taskSources:(f.Sources||"").split(",").map(s=>s.trim())})});if(res.ok){const d=await res.json();if(d.scoringPrompt){await at("update","Task Rules",{records:[{id:rule.id,fields:{"Scoring Prompt":d.scoringPrompt}}]},bid);setRules(p=>p.map(x=>x.id===rule.id?{...x,fields:{...x.fields,"Scoring Prompt":d.scoringPrompt}}:x))}}}catch(e){console.error(e)}}}}><I.Sparkle/> Generate Missing</button>
-  </div>
+    {!clientMode&&<button className="btn btn-ai btn-s" onClick={async()=>{const empty=rules.filter(r=>!(r.fields||{})["Scoring Prompt"]);for(const rule of empty){const f=rule.fields||{};try{const res=await fetch("/api/classify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"generate_scoring_prompt",taskName:f.Name,taskDescription:f.Description,taskKeywords:(f.Keywords||"").split(",").map(k=>k.trim()),taskJobTitleKeywords:(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()),taskSources:(f.Sources||"").split(",").map(s=>s.trim())})});if(res.ok){const d=await res.json();if(d.scoringPrompt){await at("update","Task Rules",{records:[{id:rule.id,fields:{"Scoring Prompt":d.scoringPrompt}}]},bid);setRules(p=>p.map(x=>x.id===rule.id?{...x,fields:{...x.fields,"Scoring Prompt":d.scoringPrompt}}:x))}}}catch(e){console.error(e)}}}}><I.Sparkle/> Generate Missing</button>}  </div>
 
   {/* PROMPT REFERENCE — collapsible, explains the full prompt contract */}
   <details style={{marginBottom:16,padding:0,border:"1px solid rgba(155,126,216,.3)",borderRadius:8,background:"rgba(155,126,216,.04)"}}>
@@ -2357,8 +2383,8 @@ Output format (strict JSON, no markdown):
 
   <div style={{display:"flex",flexDirection:"column",gap:12}}>{rules.filter(r=>{const tt=(r.fields||{})["Task Type"]||"news";return tt==="news"||tt==="job_post"||tt==="both"}).map(r=>{const f=r.fields||{};const tt=f["Task Type"]||"news";return(<div key={r.id} style={{padding:14,border:"1px solid var(--bdr)",borderRadius:8,background:"var(--card)"}}>
   <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}><div style={{display:"flex",alignItems:"center",gap:8}}><span className={"chip "+(tt==="job_post"?"cb":tt==="top_x"?"cp":"cg")}>{tt.replace(/_/g," ")}</span><span style={{fontSize:13,fontWeight:600}}>{f.Name}</span></div>
-  <button className="btn btn-ai btn-s" onClick={async()=>{try{const res=await fetch("/api/classify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"generate_scoring_prompt",taskName:f.Name,taskDescription:f.Description,taskKeywords:(f.Keywords||"").split(",").map(k=>k.trim()),taskJobTitleKeywords:(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()),taskSources:(f.Sources||"").split(",").map(s=>s.trim())})});if(res.ok){const d=await res.json();if(d.scoringPrompt){await at("update","Task Rules",{records:[{id:r.id,fields:{"Scoring Prompt":d.scoringPrompt}}]},bid);setRules(p=>p.map(x=>x.id===r.id?{...x,fields:{...x.fields,"Scoring Prompt":d.scoringPrompt}}:x))}}}catch(e){console.error(e)}}}><I.Sparkle/> Regen</button></div>
-  <textarea className="inp ta" value={f["Scoring Prompt"]||""} placeholder="No prompt — click Regen, or write one using the reference above" style={{minHeight:90,fontSize:11,background:"var(--bg)"}} onChange={e=>{const v=e.target.value;setRules(p=>p.map(x=>x.id===r.id?{...x,fields:{...x.fields,"Scoring Prompt":v}}:x))}} onBlur={async e=>{try{await at("update","Task Rules",{records:[{id:r.id,fields:{"Scoring Prompt":e.target.value}}]},bid)}catch{}}}/>
+  {!clientMode&&<button className="btn btn-ai btn-s" onClick={async()=>{try{const res=await fetch("/api/classify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"generate_scoring_prompt",taskName:f.Name,taskDescription:f.Description,taskKeywords:(f.Keywords||"").split(",").map(k=>k.trim()),taskJobTitleKeywords:(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()),taskSources:(f.Sources||"").split(",").map(s=>s.trim())})});if(res.ok){const d=await res.json();if(d.scoringPrompt){await at("update","Task Rules",{records:[{id:r.id,fields:{"Scoring Prompt":d.scoringPrompt}}]},bid);setRules(p=>p.map(x=>x.id===r.id?{...x,fields:{...x.fields,"Scoring Prompt":d.scoringPrompt}}:x))}}}catch(e){console.error(e)}}}><I.Sparkle/> Regen</button>}</div>
+  <textarea className="inp ta" readOnly={clientMode} value={f["Scoring Prompt"]||""} placeholder={clientMode?"(Read-only in client view)":"No prompt — click Regen, or write one using the reference above"} style={{minHeight:90,fontSize:11,background:"var(--bg)"}} onChange={clientMode?undefined:(e=>{const v=e.target.value;setRules(p=>p.map(x=>x.id===r.id?{...x,fields:{...x.fields,"Scoring Prompt":v}}:x))})} onBlur={clientMode?undefined:(async e=>{try{await at("update","Task Rules",{records:[{id:r.id,fields:{"Scoring Prompt":e.target.value}}]},bid)}catch{}})}/>
   <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"var(--t3)",marginTop:4}}>
     <span>{f["Scoring Prompt"]?f["Scoring Prompt"].length+" chars":"⚠️ Empty — task name/description will be used"}</span>
     <span>{(f.Keywords||f["Job Title Keywords"])?<>Keywords pre-filter: <strong style={{color:"var(--t2)"}}>{[...(f.Keywords||"").split(",").map(k=>k.trim()).filter(Boolean),...(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()).filter(Boolean)].length}</strong> active</>:<span style={{color:"var(--amb)"}}>⚠ No keywords — all signals go to AI</span>}</span>
@@ -2376,9 +2402,9 @@ Output format (strict JSON, no markdown):
     <div className="ph"><div><div className="pt">Tasks</div><div className="pd">{fTasks.length} tasks{selCount>0&&<span style={{color:"var(--acc)",marginLeft:6}}>· {selCount} selected</span>}</div></div>
     <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
       <button className="btn btn-s" onClick={()=>setShowExportModal(true)} disabled={!tasks.length}><I.Download/> Export{selCount>0?` (${selCount})`:""}</button>
-      <button className="btn btn-s" style={{color:"var(--pur)",borderColor:"rgba(155,126,216,.3)"}} disabled={!tasks.length} onClick={()=>setEnrichModal({mode:"select"})}><I.Sparkle/> Enrich Phones</button>
-      {hsConnected && <button className="btn btn-s" style={{color:"var(--grn)",borderColor:"rgba(93,168,122,.3)"}} disabled={!tasks.length} onClick={()=>setEnrichModal({mode:"push"})}><I.Upload/> Push to HubSpot{selCount>0?` (${selCount})`:""}</button>}
-      {hasSignals&&<>
+      {!clientMode&&<button className="btn btn-s" style={{color:"var(--pur)",borderColor:"rgba(155,126,216,.3)"}} disabled={!tasks.length} onClick={()=>setEnrichModal({mode:"select"})}><I.Sparkle/> Enrich Phones</button>}
+      {!clientMode&&hsConnected && <button className="btn btn-s" style={{color:"var(--grn)",borderColor:"rgba(93,168,122,.3)"}} disabled={!tasks.length} onClick={()=>setEnrichModal({mode:"push"})}><I.Upload/> Push to HubSpot{selCount>0?` (${selCount})`:""}</button>}
+      {hasSignals&&!clientMode&&<>
         <button className="btn btn-p btn-s" onClick={()=>startScan("news")} disabled={scanning||!accounts.length||!newsRuleCount} title={!newsRuleCount?"No news or both-type rules":`Scan ${newsRuleCount} news rule${newsRuleCount===1?"":"s"}`}>{scanning?"Scanning "+Math.round(scanProg)+"%":<>📰 News</>}</button>
         <button className="btn btn-p btn-s" onClick={()=>startScan("jobs")} disabled={scanning||!accounts.length||!jobsRuleCount} title={!jobsRuleCount?"No job_post or both-type rules":`Scan ${jobsRuleCount} jobs rule${jobsRuleCount===1?"":"s"}`}>{scanning?"Scanning "+Math.round(scanProg)+"%":<>📋 Jobs</>}</button>
       </>}
@@ -2410,7 +2436,7 @@ Output format (strict JSON, no markdown):
     {fTasks.length===0?<div className="empty"><div className="em">📡</div><p>{tasks.length===0?"No tasks yet.":"No matches."}</p></div>:
     <div className="tw"><table><thead><tr>
       <th style={{width:32,padding:"10px 8px"}}><input type="checkbox" checked={fTasks.length>0&&fTasks.every(t=>selectedTasks.has(t.id))} onChange={toggleAllVisible} style={{cursor:"pointer",accentColor:"var(--acc)"}}/></th>
-      <th>Company</th><th>Task Rule</th><th>Score</th><th>Target</th><th>Signal</th><th>Type</th><th>Date</th><th>Link</th><th></th>
+      <th>Company</th><th>Task Rule</th><th>Score</th><th>Target</th><th>Signal</th><th>Type</th><th>Date</th><th>Link</th>{!clientMode&&<th></th>}
     </tr></thead><tbody>{fTasks.map(t=>{const f=t.fields||{};const sc=f.Score||0;const sel=selectedTasks.has(t.id);return(<tr key={t.id} style={{background:sel?"rgba(191,163,90,.06)":"transparent"}}>
       <td style={{padding:"10px 8px"}}><input type="checkbox" checked={sel} onChange={()=>toggleTask(t.id)} style={{cursor:"pointer",accentColor:"var(--acc)"}}/></td>
       <td style={{color:"var(--t1)",fontWeight:500}}>{f.Company}</td>
@@ -2421,7 +2447,7 @@ Output format (strict JSON, no markdown):
       <td><span className={"chip "+(f["Task Type"]==="job_post"?"cb":f["Task Type"]==="top_x"?"cp":"cg")}>{(f["Task Type"]||"news").replace(/_/g," ").toUpperCase()}</span></td>
       <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10}}>{f.Date}</td>
       <td>{f.URL?<a href={f.URL} target="_blank" rel="noopener" style={{color:"var(--blu)",fontSize:10}}>↗</a>:"—"}</td>
-      <td><button className="btn btn-d btn-s" onClick={()=>del("Tasks",[t.id],setTasks)}><I.Trash/></button></td>
+      {!clientMode&&<td><button className="btn btn-d btn-s" onClick={()=>del("Tasks",[t.id],setTasks)}><I.Trash/></button></td>}
     </tr>)})}</tbody></table></div>}
   </div>)}
 

@@ -681,6 +681,15 @@ export async function POST(request) {
   // Action can come from URL (frontend pattern: ?action=X) OR from body (legacy)
   const uiAction = body.action || (action !== "ui_action" ? action : null);
 
+  // SECURITY: Block ALL UI actions on this route from /client/[id] pages.
+  // Every action here either reads master-base routing data or modifies it.
+  // Clients should never touch this. Webhook path above is unaffected (it's gated by CRON_SECRET).
+  const referer = request.headers.get("referer") || "";
+  if (/\/client\/[^/?#]+/.test(referer)) {
+    console.warn(`[SECURITY] unipile-triggers action "${uiAction}" blocked from client-mode referer: ${referer}`);
+    return NextResponse.json({ error: "Not authorized in client mode" }, { status: 403 });
+  }
+
   switch (uiAction) {
     case "test_match": {
       // For UI: given a sample LinkedIn URL/slug, find the matching lead

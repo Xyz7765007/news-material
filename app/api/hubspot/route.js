@@ -1418,6 +1418,12 @@ async function backfillHubspotIds(apiKey, baseId, opts = {}) {
 // ═══════════════════════════════════════════════════════════════
 export async function POST(request) {
   try {
+    // SECURITY: Block from /client/[id] pages. Handles HubSpot API keys + integration data.
+    const referer = request.headers.get("referer") || "";
+    if (/\/client\/[^/?#]+/.test(referer)) {
+      console.warn(`[SECURITY] hubspot blocked from client referer: ${referer}`);
+      return NextResponse.json({ error: "Not authorized in client mode" }, { status: 403 });
+    }
     const body = await request.json();
     const { action, campaignId } = body;
 

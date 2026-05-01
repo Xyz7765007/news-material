@@ -957,6 +957,13 @@ ${signalBlock}`;
 
 export async function POST(request) {
   try {
+    // SECURITY: Block from /client/[id] pages. Scans burn OpenAI tokens and
+    // Apify credits — clients shouldn't trigger them on their own.
+    const referer = request.headers.get("referer") || "";
+    if (/\/client\/[^/?#]+/.test(referer)) {
+      console.warn(`[SECURITY] scan blocked from client referer: ${referer}`);
+      return NextResponse.json({ error: "Not authorized in client mode" }, { status: 403 });
+    }
     const body = await request.json();
     const { mode } = body;
     // The frontend passes the user's configured scoring threshold (0-100, default 70).

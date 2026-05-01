@@ -1356,6 +1356,14 @@ export async function POST(request) {
 
   const { action } = body;
 
+  // SECURITY: Block from /client/[id] pages. This route handles LinkedIn auth
+  // tokens, custom prompts, and scan operations that should remain admin-only.
+  const referer = request.headers.get("referer") || "";
+  if (/\/client\/[^/?#]+/.test(referer)) {
+    console.warn(`[SECURITY] linkedin-posts action "${action}" blocked from client referer: ${referer}`);
+    return NextResponse.json({ error: "Not authorized in client mode" }, { status: 403 });
+  }
+
   try {
     switch (action) {
       case "get_progress": {

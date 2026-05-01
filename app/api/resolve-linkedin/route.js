@@ -19,6 +19,12 @@ const BATCH_SIZE = 10; // Process 10 companies at a time to avoid timeouts
 
 export async function POST(request) {
   try {
+    // SECURITY: Block from /client/[id] pages. Uses Apify credits.
+    const referer = request.headers.get("referer") || "";
+    if (/\/client\/[^/?#]+/.test(referer)) {
+      console.warn(`[SECURITY] resolve-linkedin blocked from client referer: ${referer}`);
+      return NextResponse.json({ error: "Not authorized in client mode" }, { status: 403 });
+    }
     const { slugs } = await request.json();
     if (!slugs?.length) return NextResponse.json({ error: "No slugs provided" }, { status: 400 });
 

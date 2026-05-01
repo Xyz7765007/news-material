@@ -290,6 +290,12 @@ async function dedupTasks(taskGroups) {
 
 export async function POST(request) {
   try {
+    // SECURITY: Block from /client/[id] pages. Uses OpenAI API (paid tokens).
+    const referer = request.headers.get("referer") || "";
+    if (/\/client\/[^/?#]+/.test(referer)) {
+      console.warn(`[SECURITY] classify blocked from client referer: ${referer}`);
+      return NextResponse.json({ error: "Not authorized in client mode" }, { status: 403 });
+    }
     const body = await request.json();
     const { action } = body;
 

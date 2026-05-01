@@ -238,6 +238,12 @@ Write the email${config.sequenceLength > 1 ? "s" : ""} now. Return JSON only.`;
 // ═══════════════════════════════════════════════════════════════
 export async function POST(request) {
   try {
+    // SECURITY: Block from /client/[id] pages. Sends emails, handles Smartlead/Gmail tokens.
+    const referer = request.headers.get("referer") || "";
+    if (/\/client\/[^/?#]+/.test(referer)) {
+      console.warn(`[SECURITY] email-campaign blocked from client referer: ${referer}`);
+      return NextResponse.json({ error: "Not authorized in client mode" }, { status: 403 });
+    }
     const body = await request.json();
     const { action, baseId, campaignId } = body;
 

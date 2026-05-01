@@ -1817,10 +1817,45 @@ export async function POST(request) {
       return NextResponse.json({ error: "No baseId provided and no AIRTABLE_BASE_ID configured" }, { status: 500 });
     }
 
+    // SECURITY: Detect requests originating from /client/[id] pages. Used to block
+    // admin-only actions from being called by a client's browser. Referer is not
+    // bulletproof (can be spoofed) but blocks the realistic leak vector — a client's
+    // own browser making calls from their own session. For real defense-in-depth
+    // we'd add server-side auth tokens; this is the minimal patch for the reported leak.
+    const referer = request.headers.get("referer") || "";
+    const isFromClientPage = /\/client\/[^/?#]+/.test(referer);
+    // Actions that must NEVER be callable from a client page. Each of these
+    // either enumerates campaigns, modifies the campaign registry, OR mutates
+    // campaign data. Clients have READ access to their own campaign data via
+    // the data tabs (Accounts, Leads, Tasks, Rules, Prompts) but should not
+    // be able to create/update/delete records or change schema.
+    const ADMIN_ONLY_ACTIONS = new Set([
+      "list_campaigns",
+      "create_campaign",
+      "delete_campaign",
+      "update_campaign",
+      "discover", // exposes base structure of arbitrary URLs
+      "create",   // mutate records
+      "update",   // mutate records
+      "delete",   // delete records
+      "setup",    // schema mutations
+      "ensure_fields", // schema mutations
+      "generate_custom_codes", // batch mutation
+      "compile_topx_rules",    // costs OpenAI tokens
+      "run_topx",              // costs OpenAI tokens
+      "run_topx_smart",        // costs OpenAI tokens
+    ]);
+    if (isFromClientPage && ADMIN_ONLY_ACTIONS.has(action)) {
+      console.warn(`[SECURITY] Action "${action}" blocked from client-mode referer: ${referer}`);
+      return NextResponse.json({ error: "Not authorized in client mode" }, { status: 403 });
+    }
+
     switch (action) {
       // ─── Campaign Registry (always uses master base) ────────
       case "list_campaigns": {
         if (!MASTER_BASE_ID) return NextResponse.json({ records: [] });
+        // SECURITY: This endpoint enumerates ALL campaigns (including base IDs and
+        // names). The referer-based block above protects against the realistic vector.
         const data = await listCampaigns();
         return NextResponse.json({ records: data });
       }
