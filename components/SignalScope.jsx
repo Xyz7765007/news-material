@@ -3239,6 +3239,7 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
   const [msg, setMsg] = useState("");
   const [syncResult, setSyncResult] = useState(null);
   const [engagedLeads, setEngagedLeads] = useState([]);
+  const [unmatchedCodes, setUnmatchedCodes] = useState([]); // GA visits to tracking URLs whose code isn't in any lead
   const [selectedEngagedIds, setSelectedEngagedIds] = useState(new Set());
   const [scoreCfg, setScoreCfg] = useState({ weights: { time: 50, engaged: 30, views: 20 }, tiers: { warmMax: 20, interestedMax: 50 } });
   const [scoreCfgDraft, setScoreCfgDraft] = useState({ weights: { time: 50, engaged: 30, views: 20 }, tiers: { warmMax: 20, interestedMax: 50 } });
@@ -3285,7 +3286,10 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
   const loadEngaged = async () => {
     try {
       const r = await ga("list_engaged_leads", { minScore: 1 });
-      if (r.ok) setEngagedLeads(r.engaged || []);
+      if (r.ok) {
+        setEngagedLeads(r.engaged || []);
+        setUnmatchedCodes(r.unmatchedCodes || []);
+      }
     } catch (e) { console.error(e); }
   };
 
@@ -3597,31 +3601,51 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
   };
 
   const exportEngagedCSV = () => {
-    if (engagedLeads.length === 0) return;
-    const rows = [
-      ["Name","Title","Company","Email","LinkedIn URL","Custom Code","Score","Last Visit","Sessions","Engaged Sessions","Views","Views Per Session","Engagement Time (sec)","Avg Session Duration (sec)"].join(","),
-      ...engagedLeads.map(l => [
-        `"${(l.name||"").replace(/"/g,'""')}"`,
-        `"${(l.title||"").replace(/"/g,'""')}"`,
-        `"${(l.company||"").replace(/"/g,'""')}"`,
-        l.email||"",
-        l.linkedinUrl||"",
-        l.customCode||"",
-        l.score,
-        l.lastVisit||"",
-        l.sessions,
-        l.engagedSessions,
-        l.views,
-        l.viewsPerSession,
-        l.engagementTime,
-        l.avgSessionDuration,
-      ].join(","))
-    ].join("\n");
-    const blob = new Blob([rows], { type: "text/csv;charset=utf-8;" });
+    if (engagedLeads.length === 0 && unmatchedCodes.length === 0) return;
+    const escape = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+    // Single CSV with a "Source" column that distinguishes matched-lead rows from
+    // unknown-code rows. Matched rows have lead identity (name, email, etc); unknown
+    // rows have just the Custom Code + GA Campaign + metrics. This way the user gets
+    // ALL engagement data in one file — they asked specifically not to skip unmatched.
+    const header = ["Source","Name","Title","Company","Email","LinkedIn URL","Custom Code","GA Campaign","Score","Last Visit","Sessions","Engaged Sessions","Views","Views Per Session","Engagement Time (sec)","Avg Session Duration (sec)"].join(",");
+    const matchedRows = engagedLeads.map(l => [
+      "matched_lead",
+      escape(l.name),
+      escape(l.title),
+      escape(l.company),
+      escape(l.email),
+      escape(l.linkedinUrl),
+      escape(l.customCode),
+      escape(l.campaignName), // utm_campaign attribution from GA
+      l.score,
+      escape(l.lastVisit),
+      l.sessions,
+      l.engagedSessions,
+      l.views,
+      l.viewsPerSession,
+      l.engagementTime,
+      l.avgSessionDuration,
+    ].join(","));
+    const unmatchedRows = unmatchedCodes.map(u => [
+      "unknown_code",
+      "", "", "", "", "", // no lead identity for these
+      escape(u.code),
+      escape(u.campaignName),
+      u.score,
+      escape(u.lastVisit),
+      u.sessions,
+      u.engagedSessions,
+      u.views,
+      u.viewsPerSession,
+      u.engagementTime,
+      u.avgSessionDuration,
+    ].join(","));
+    const csv = [header, ...matchedRows, ...unmatchedRows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${campaign?.name || "campaign"}-engaged-leads-${new Date().toISOString().slice(0,10)}.csv`;
+    a.download = `${campaign?.name || "campaign"}-engagement-${new Date().toISOString().slice(0,10)}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -3764,6 +3788,11 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
                           <div style={{fontSize:10,color:"var(--t3)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
                             {l.title ? l.title : ""}{l.title && l.company ? " · " : ""}{l.company || ""}
                           </div>
+                          {l.campaignName && (
+                            <div style={{fontSize:9,color:"var(--blu)",marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={`utm_campaign attribution from GA: ${l.campaignName}`}>
+                              📣 {l.campaignName}
+                            </div>
+                          )}
                         </div>
                         <div style={{textAlign:"right",fontSize:10,color:"var(--t3)",minWidth:180}}>
                           <div style={{color:"var(--t2)"}}>{l.sessions} session{l.sessions!==1?"s":""} · {l.views} view{l.views!==1?"s":""}</div>
@@ -3801,7 +3830,56 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
             </div>
           )}
 
-          {engagedLeads.length === 0 && config.lastSync && (
+          {/* UNMATCHED CODES — GA visits to tracking URLs whose Custom Code isn't
+              in any lead. These are real engagement signals that don't have a
+              lead identity attached. Could be: shared tracking links, leads not
+              yet imported, typos. Surfaced so user doesn't lose visibility. */}
+          {unmatchedCodes.length > 0 && (
+            <div style={{marginTop:24}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+                <div>
+                  <div style={{fontSize:12,fontWeight:600,color:"var(--amb)"}}>❓ Unknown Custom Codes ({unmatchedCodes.length})</div>
+                  <div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>GA tracked these codes but they don't match any lead in Airtable. Could be shared links, leads not imported yet, or typos.</div>
+                </div>
+                {/* Show export button here too if no engaged leads (so the export button isn't only on the engaged list) */}
+                {engagedLeads.length === 0 && (
+                  <button className="btn btn-s" onClick={exportEngagedCSV}>📥 Export CSV</button>
+                )}
+              </div>
+              <div style={{border:"1px solid rgba(245,158,11,.3)",borderRadius:8,overflow:"hidden",background:"rgba(245,158,11,.03)"}}>
+                {unmatchedCodes.map((u, idx) => {
+                  const tier = tierFor(u.score);
+                  return (
+                    <div key={u.code} style={{
+                      padding:"12px 14px",
+                      background: idx%2===0?"transparent":"rgba(255,255,255,0.015)",
+                      borderBottom:idx<unmatchedCodes.length-1?"1px solid rgba(245,158,11,.2)":"none",
+                    }}>
+                      <div style={{display:"grid",gridTemplateColumns:"1fr auto auto auto",gap:14,alignItems:"center"}}>
+                        <div style={{minWidth:0}}>
+                          <div style={{fontSize:12,fontWeight:600,color:"var(--t1)",fontFamily:"'JetBrains Mono',monospace"}}>{u.code}</div>
+                          <div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>No matching lead in Airtable</div>
+                          {u.campaignName && (
+                            <div style={{fontSize:9,color:"var(--blu)",marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={`utm_campaign attribution from GA: ${u.campaignName}`}>
+                              📣 {u.campaignName}
+                            </div>
+                          )}
+                        </div>
+                        <div style={{textAlign:"right",fontSize:10,color:"var(--t3)",minWidth:180}}>
+                          <div style={{color:"var(--t2)"}}>{u.sessions} session{u.sessions!==1?"s":""} · {u.views} view{u.views!==1?"s":""}</div>
+                          <div>{fmtEngTime(u.engagementTime)} · last visit {u.lastVisit || "—"}</div>
+                        </div>
+                        <div style={{fontSize:10,fontWeight:600,color:tier.color,minWidth:90,textAlign:"center"}}>{tier.label}</div>
+                        <div style={{fontSize:20,fontWeight:700,color:tier.color,minWidth:36,textAlign:"right"}}>{u.score}</div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {engagedLeads.length === 0 && unmatchedCodes.length === 0 && config.lastSync && (
             <div style={{marginTop:18,padding:24,background:"var(--hover)",borderRadius:8,textAlign:"center"}}>
               <div style={{fontSize:24,marginBottom:6}}>🌱</div>
               <div style={{fontSize:12,color:"var(--t2)",fontWeight:500}}>No engaged leads this week yet</div>

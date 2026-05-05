@@ -44,6 +44,7 @@ async function ensureTableFields(baseId, tableName, missingFieldNames) {
     "GA Last Visit": "singleLineText",
     "GA Engagement Score": { type: "number", options: { precision: 0 } },
     "GA Last Synced At": "singleLineText",
+    "GA Campaign": "singleLineText", // utm_campaign attribution from GA — most recent wins
   };
   try {
     const tablesRes = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables`, { headers: atHdr });
@@ -125,6 +126,16 @@ async function patchCampaign(campaignId, fields) {
   });
 }
 
+// Read campaign fields by ID (from master Campaigns table). Returns the fields
+// object directly (not wrapped). Used by list_engaged_leads to read the cached
+// unmatched-codes JSON written during sync.
+async function getCampaignFields(campaignId) {
+  const res = await fetch(`${AT_API}/${MASTER_BASE_ID}/${encodeURIComponent("Campaigns")}/${campaignId}`, { headers: atHdr });
+  if (!res.ok) throw new Error(`Campaign fetch failed: ${res.status}`);
+  const data = await res.json();
+  return data.fields || {};
+}
+
 // Auto-create missing fields on the Campaigns table (handles upgrades without re-running Setup)
 async function ensureCampaignFields(missingFieldNames) {
   // Map field name → type
@@ -135,6 +146,7 @@ async function ensureCampaignFields(missingFieldNames) {
     "GA OAuth Email": "singleLineText",
     "GA Last Sync": "singleLineText",
     "GA Score Config": "multilineText",
+    "GA Unmatched Codes": "multilineText", // JSON cache of codes seen in GA but not matched to any lead
   };
   try {
     const tablesRes = await fetch(`https://api.airtable.com/v0/meta/bases/${MASTER_BASE_ID}/tables`, { headers: atHdr });
@@ -291,13 +303,17 @@ async function resolveAuth(campaignFields) {
   throw new Error("No auth configured. Sign in with Google to connect GA.");
 }
 
-// Pull last N days of GA data, broken down by Session campaign ID
+// Pull last N days of GA data, broken down by Session campaign ID + name
+// Returns metricsMap: { customCode → { sessions, engagedSessions, views, ..., campaignName } }
+// campaignName is the utm_campaign value from the tracking URL (most recent wins
+// when a Custom Code has multiple campaign attributions).
 async function fetchGADataByCustomCode(propertyId, auth, daysBack = 7) {
   const today = new Date();
   const startDate = new Date(today);
   startDate.setDate(today.getDate() - daysBack);
   const fmt = (d) => d.toISOString().slice(0, 10);
 
+  // Main metrics report — aggregated by code only (so totals are clean per-code)
   const requestBody = {
     dateRanges: [{ startDate: fmt(startDate), endDate: fmt(today) }],
     dimensions: [{ name: "sessionCampaignId" }],
@@ -320,10 +336,15 @@ async function fetchGADataByCustomCode(propertyId, auth, daysBack = 7) {
 
   const data = await auth.callApi(propertyId, requestBody);
 
-  // Also fetch last visit date per Custom Code
+  // Last visit date + campaign name per Custom Code. Broken down by date so we can
+  // pick the most recent campaign attribution. campaignName comes from utm_campaign.
   const lastVisitBody = {
     dateRanges: [{ startDate: fmt(startDate), endDate: fmt(today) }],
-    dimensions: [{ name: "sessionCampaignId" }, { name: "date" }],
+    dimensions: [
+      { name: "sessionCampaignId" },
+      { name: "date" },
+      { name: "sessionCampaignName" }, // utm_campaign — null if not set on the URL
+    ],
     metrics: [{ name: "sessions" }],
     dimensionFilter: requestBody.dimensionFilter,
     limit: 50000,
@@ -335,12 +356,24 @@ async function fetchGADataByCustomCode(propertyId, auth, daysBack = 7) {
   const lvRows = lvData.rows || [];
 
   // Build last-visit map: code -> latest date
+  // Build campaign attribution map: code -> { date, campaignName } (most recent wins)
   const lastVisitMap = {};
+  const campaignMap = {};
   for (const row of lvRows) {
     const code = row.dimensionValues?.[0]?.value || "";
     const date = row.dimensionValues?.[1]?.value || ""; // YYYYMMDD
+    const campaignName = row.dimensionValues?.[2]?.value || "";
     if (!code || !date) continue;
     if (!lastVisitMap[code] || date > lastVisitMap[code]) lastVisitMap[code] = date;
+    // Most-recent wins. If a code has multiple campaigns on the same day, the
+    // GA API returns them as separate rows; we keep whichever has the latest
+    // date (or for ties, whichever was last in the response — usually highest sessions).
+    if (campaignName && campaignName !== "(not set)" && campaignName !== "(direct)") {
+      const existing = campaignMap[code];
+      if (!existing || date > existing.date) {
+        campaignMap[code] = { date, campaignName };
+      }
+    }
   }
 
   // Build per-code metrics map
@@ -357,6 +390,7 @@ async function fetchGADataByCustomCode(propertyId, auth, daysBack = 7) {
       engagementTime: parseInt(m[4]?.value || 0), // seconds
       avgSessionDuration: parseFloat(m[5]?.value || 0), // seconds
       lastVisit: lastVisitMap[code] || null, // YYYYMMDD
+      campaignName: campaignMap[code]?.campaignName || "", // utm_campaign — empty if not set
     };
   }
 
@@ -640,7 +674,7 @@ export async function POST(request) {
               const requiredFields = [
                 "GA Sessions", "GA Engaged Sessions", "GA Views", "GA Views Per Session",
                 "GA Engagement Time", "GA Avg Session Duration", "GA Last Visit",
-                "GA Engagement Score", "GA Last Synced At",
+                "GA Engagement Score", "GA Last Synced At", "GA Campaign",
               ];
               const missing = requiredFields.filter(f => !existingFieldNames.has(f));
               if (missing.length > 0) {
@@ -669,9 +703,37 @@ export async function POST(request) {
           const code = lead.fields?.["Custom Code"];
           const m = metricsMap[code];
 
-          // Skip leads with no GA activity — don't waste writes on them
-          // Their existing GA fields (if any from a past sync) stay untouched
-          if (!m) continue;
+          if (!m) {
+            // Lead has NO activity in the current 7-day window. Clear any stale
+            // GA fields so this lead drops out of the engaged list. Without this,
+            // a lead who visited 3 weeks ago and got scored 60 then would keep
+            // showing as engaged forever — that's the bug the user reported as
+            // "previous weeks are still showing up". The GA fields should always
+            // reflect CURRENT 7-day window state, not historical state.
+            //
+            // We only push a clearing update if the lead had stale GA data to
+            // begin with — saves writes on leads who were never tracked.
+            const f = lead.fields || {};
+            const hadStaleData = f["GA Engagement Score"] || f["GA Sessions"] || f["GA Last Visit"];
+            if (hadStaleData) {
+              updates.push({
+                id: lead.id,
+                fields: {
+                  "GA Last Synced At": nowISO,
+                  "GA Sessions": 0,
+                  "GA Engaged Sessions": 0,
+                  "GA Views": 0,
+                  "GA Views Per Session": 0,
+                  "GA Engagement Time": 0,
+                  "GA Avg Session Duration": 0,
+                  "GA Last Visit": "",
+                  "GA Engagement Score": 0,
+                  "GA Campaign": "",
+                },
+              });
+            }
+            continue;
+          }
 
           // Lead has GA activity in last 7 days
           const score = calculateEngagementScore(m, scoreConfig);
@@ -686,6 +748,7 @@ export async function POST(request) {
             "GA Avg Session Duration": Math.round(m.avgSessionDuration * 10) / 10,
             "GA Last Visit": lastVisit,
             "GA Engagement Score": score,
+            "GA Campaign": m.campaignName || "", // utm_campaign attribution
           };
           matched++;
           updates.push({ id: lead.id, fields });
@@ -701,8 +764,78 @@ export async function POST(request) {
           return NextResponse.json({ error: `Airtable update failed: ${e.message}` }, { status: 500 });
         }
 
-        // 5. Update campaign's last sync timestamp
-        try { await patchCampaign(campaignId, { "GA Last Sync": nowISO }); } catch {}
+        // 5. Compute unmatched codes — codes that appear in GA but don't map to any
+        // lead. These represent traffic to tracking URLs whose Custom Code isn't in
+        // the Leads table. Could be: shared tracking links, leads not yet imported,
+        // typos in custom codes, or expired campaigns. We surface them so the user
+        // can see the engagement signal even when there's no lead identity attached.
+        const knownCodes = new Set(leadsWithCodes.map(l => l.fields["Custom Code"]));
+        const unmatchedCodeData = Object.keys(metricsMap)
+          .filter(code => !knownCodes.has(code))
+          .map(code => {
+            const m = metricsMap[code];
+            const score = calculateEngagementScore(m, scoreConfig);
+            const lastVisit = m.lastVisit ? `${m.lastVisit.slice(0,4)}-${m.lastVisit.slice(4,6)}-${m.lastVisit.slice(6,8)}` : "";
+            return {
+              code,
+              campaignName: m.campaignName || "",
+              sessions: m.sessions,
+              engagedSessions: m.engagedSessions,
+              views: m.views,
+              viewsPerSession: Math.round(m.viewsPerSession * 100) / 100,
+              engagementTime: m.engagementTime,
+              avgSessionDuration: Math.round(m.avgSessionDuration * 10) / 10,
+              lastVisit,
+              score,
+            };
+          })
+          .sort((a, b) => b.score - a.score);
+
+        // 6. Update campaign's last sync timestamp + cache unmatched codes.
+        // Capped at 200 entries (~50KB JSON) to stay well under Airtable cell limits.
+        // We have to check res.ok manually since patchCampaign returns a raw Response
+        // (it doesn't throw on HTTP errors — that's needed by other callers that
+        // detect 422 to auto-create missing fields). If we get a 422 here, it almost
+        // certainly means the GA Unmatched Codes field doesn't exist yet on this
+        // campaign base, so we create it and retry once.
+        const cacheUnmatched = JSON.stringify(unmatchedCodeData.slice(0, 200));
+        if (unmatchedCodeData.length > 200) {
+          console.log(`[GA] Truncating ${unmatchedCodeData.length} unmatched codes to top 200 by score for cache. Lowest cached score: ${unmatchedCodeData[199]?.score}, dropped: ${unmatchedCodeData.length - 200}`);
+        }
+        let cacheRes;
+        try {
+          cacheRes = await patchCampaign(campaignId, { "GA Last Sync": nowISO, "GA Unmatched Codes": cacheUnmatched });
+        } catch (e) {
+          // Network error — log and degrade to timestamp-only
+          console.error("[GA] Cache write network error:", e.message);
+          try { await patchCampaign(campaignId, { "GA Last Sync": nowISO }); } catch {}
+          cacheRes = null;
+        }
+        // Check HTTP status — patchCampaign returns the raw Response, doesn't throw on 4xx/5xx
+        if (cacheRes && !cacheRes.ok) {
+          const errText = await cacheRes.text().catch(() => "");
+          const isFieldMissing = cacheRes.status === 422 && /[Uu]nknown field name|GA Unmatched Codes/.test(errText);
+          if (isFieldMissing) {
+            console.log("[GA] GA Unmatched Codes field missing on campaign — creating and retrying...");
+            try {
+              await ensureCampaignFields(["GA Unmatched Codes"]);
+              await new Promise(r => setTimeout(r, 1500));
+              const retryRes = await patchCampaign(campaignId, { "GA Last Sync": nowISO, "GA Unmatched Codes": cacheUnmatched });
+              if (!retryRes.ok) {
+                console.error("[GA] Retry after field-create still failed:", retryRes.status);
+                // Last resort: write timestamp without cache
+                try { await patchCampaign(campaignId, { "GA Last Sync": nowISO }); } catch {}
+              }
+            } catch (e2) {
+              console.error("[GA] ensureCampaignFields failed:", e2.message);
+              try { await patchCampaign(campaignId, { "GA Last Sync": nowISO }); } catch {}
+            }
+          } else {
+            console.error(`[GA] Cache write failed (${cacheRes.status}):`, errText.slice(0, 200));
+            // Other error type — try to at least save the timestamp
+            try { await patchCampaign(campaignId, { "GA Last Sync": nowISO }); } catch {}
+          }
+        }
 
         // If ALL updates failed, return as error so UI shows it clearly
         if (updateResult.failCount > 0 && updateResult.successCount === 0) {
@@ -718,7 +851,8 @@ export async function POST(request) {
           leadsTracked,
           activeThisWeek: matched,
           inactive: cleared,
-          unmatchedCodes: Object.keys(metricsMap).filter(code => !leadsWithCodes.find(l => l.fields?.["Custom Code"] === code)).length,
+          unmatchedCodes: unmatchedCodeData.length,
+          unmatchedCodeData, // full list with metrics + campaign — surfaces in UI
           syncedAt: nowISO,
           updatesSucceeded: updateResult.successCount,
           updatesFailed: updateResult.failCount,
@@ -731,11 +865,15 @@ export async function POST(request) {
         if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
         const minScore = typeof body.minScore === "number" ? body.minScore : 1;
 
-        let leads, outreach;
+        let leads, outreach, campaignFields;
         try {
-          [leads, outreach] = await Promise.all([
+          [leads, outreach, campaignFields] = await Promise.all([
             atList(baseId, "Leads"),
             atList(baseId, "Outreach").catch(() => []),
+            // Load campaign fields too — we need the cached unmatched codes.
+            // Skip fetch if campaignId missing (caller didn't provide it) — avoids
+            // a guaranteed 404 on /Campaigns/undefined.
+            campaignId ? getCampaignFields(campaignId).catch(() => ({})) : Promise.resolve({}),
           ]);
         } catch (e) { return NextResponse.json({ error: e.message }, { status: 500 }); }
 
@@ -757,8 +895,27 @@ export async function POST(request) {
           }
         }
 
+        // Defensive 7-day filter: even though sync now clears stale data, an old
+        // sync (pre-fix) may have left scored leads with Last Visit > 7 days ago.
+        // We filter at read time so the UI is always correct regardless of when
+        // the last sync ran. Use Date math against the lead's GA Last Visit field.
+        //
+        // Window is 8 days (not 7) to absorb timezone offset between the GA
+        // property's reporting timezone and the Vercel server's UTC. Without
+        // this, a lead who visited yesterday in their local timezone could be
+        // filtered out when the dates straddle UTC midnight.
+        const cutoff = new Date();
+        cutoff.setDate(cutoff.getDate() - 8);
+        const cutoffStr = cutoff.toISOString().slice(0, 10); // YYYY-MM-DD
+
         const engaged = leads
           .filter(l => (l.fields?.["GA Engagement Score"] || 0) >= minScore)
+          .filter(l => {
+            // Drop leads whose last visit was outside the window (stale data from old sync)
+            const lv = l.fields?.["GA Last Visit"];
+            if (!lv) return false; // no visit recorded → not engaged
+            return lv >= cutoffStr; // YYYY-MM-DD lex comparison works
+          })
           .map(l => {
             const f = l.fields || {};
             const liUrl = (f["LinkedIn URL"] || "").toLowerCase().trim();
@@ -771,6 +928,7 @@ export async function POST(request) {
               email: f.Email || "",
               linkedinUrl: f["LinkedIn URL"] || "",
               customCode: f["Custom Code"] || "",
+              campaignName: f["GA Campaign"] || "", // utm_campaign attribution from GA
               score: f["GA Engagement Score"] || 0,
               lastVisit: f["GA Last Visit"] || "",
               sessions: f["GA Sessions"] || 0,
@@ -788,7 +946,31 @@ export async function POST(request) {
             };
           })
           .sort((a, b) => b.score - a.score);
-        return NextResponse.json({ ok: true, engaged, count: engaged.length });
+
+        // Parse cached unmatched codes from campaign record. These are GA visits to
+        // tracking URLs whose Custom Code doesn't map to any lead in Airtable.
+        // We surface them so the user can see ALL engagement signals, not just the
+        // matched ones — they may indicate shared tracking links, leads to import, etc.
+        //
+        // IMPORTANT: filter out any cached codes that NOW match a lead. The cache is
+        // written at sync time, but leads can be imported between syncs — those
+        // previously-unknown codes become known and shouldn't appear in both lists
+        // (matched + unmatched). User would have to re-sync to refresh otherwise.
+        let unmatchedCodes = [];
+        try {
+          const raw = campaignFields["GA Unmatched Codes"];
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+              const knownCodesNow = new Set(leads.map(l => l.fields?.["Custom Code"]).filter(Boolean));
+              unmatchedCodes = parsed
+                .filter(u => (u.score || 0) >= minScore)
+                .filter(u => !knownCodesNow.has(u.code)); // exclude codes that NOW have a matching lead
+            }
+          }
+        } catch (e) { console.error("[GA] Failed to parse unmatched codes cache:", e.message); }
+
+        return NextResponse.json({ ok: true, engaged, count: engaged.length, unmatchedCodes });
       }
 
       // ─── CONVERT ENGAGED LEADS TO TASKS ─────────────────────────
