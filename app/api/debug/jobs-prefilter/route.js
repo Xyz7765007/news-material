@@ -111,7 +111,7 @@ export async function POST(request) {
     const cleanName = cleanCompanyName(account.name);
     const TPR = process.env.APIFY_JOBS_TPR || "r2592000";
     const url = account.linkedinCompanyId
-      ? `https://www.linkedin.com/jobs/search/?f_C=${account.linkedinCompanyId}&f_TPR=${TPR}&sortBy=DD`
+      ? `https://www.linkedin.com/jobs/search/?f_C=${account.linkedinCompanyId}&f_TPR=${TPR}&keywords=marketing&sortBy=DD`
       : `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${cleanName}" marketing`)}&sortBy=DD`;
     diagnostics.push({ stage: "url", url });
 

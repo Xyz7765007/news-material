@@ -135,7 +135,7 @@ export async function POST(request) {
     const urls = [];
     if (withIds.length > 0) {
       const ids = withIds.map(c => c.linkedinCompanyId).join(",");
-      urls.push(`https://www.linkedin.com/jobs/search/?f_C=${ids}&f_TPR=${TPR}&sortBy=DD`);
+      urls.push(`https://www.linkedin.com/jobs/search/?f_C=${ids}&f_TPR=${TPR}&keywords=marketing&sortBy=DD`);
     }
     for (const c of withoutIds) {
       const cleanName = cleanCompanyName(c.name);
@@ -164,7 +164,7 @@ export async function POST(request) {
       const retryUrls = [];
       if (withIds.length > 0) {
         const ids = withIds.map(c => c.linkedinCompanyId).join(",");
-        retryUrls.push(`https://www.linkedin.com/jobs/search/?f_C=${ids}&sortBy=DD`);
+        retryUrls.push(`https://www.linkedin.com/jobs/search/?f_C=${ids}&keywords=marketing&sortBy=DD`);
       }
       for (const c of withoutIds) {
         const cleanName = cleanCompanyName(c.name);
@@ -178,7 +178,7 @@ export async function POST(request) {
 
     // ── Attempt 3: individual URLs per company ──
     if (allJobs.length === 0 && withIds.length > 1 && !r1.error) {
-      const indivUrls = withIds.map(c => `https://www.linkedin.com/jobs/search/?f_C=${c.linkedinCompanyId}&sortBy=DD`);
+      const indivUrls = withIds.map(c => `https://www.linkedin.com/jobs/search/?f_C=${c.linkedinCompanyId}&keywords=marketing&sortBy=DD`);
       for (const c of withoutIds) {
         const cleanName = cleanCompanyName(c.name);
         if (!cleanName) continue;

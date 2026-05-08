@@ -598,7 +598,7 @@ async function scanJobsBatch(companies, taskDefs, threshold = 50, campaignId = n
   // post jobs less frequently than tech companies. r604800 (7 days) was returning 0 for
   // companies that genuinely had postings just slightly older than a week.
   // Override via APIFY_JOBS_TPR env var if you need a different window.
-  const TPR = process.env.APIFY_JOBS_TPR || "r2592000";
+  const TPR = process.env.APIFY_JOBS_TPR || "r604800"; // 604800s = 7 days, matches MAX_JOB_AGE_DAYS=7
 
   if (withIds.length > 0) {
     // LinkedIn's URL filter syntax uses COMMA-SEPARATED values for repeated dimensions:
@@ -606,7 +606,7 @@ async function scanJobsBatch(companies, taskDefs, threshold = 50, campaignId = n
     //   f_C=123&f_C=456  ✗  (LinkedIn keeps only the last value)
     // Confirmed via LinkedIn's own scraped jobSearchUrl format and the Kondo URL-hacking guide.
     const ids = withIds.map(c => c.linkedinCompanyId).join(",");
-    const combinedUrl = `https://www.linkedin.com/jobs/search/?f_C=${ids}&f_TPR=${TPR}&sortBy=DD`;
+    const combinedUrl = `https://www.linkedin.com/jobs/search/?f_C=${ids}&f_TPR=${TPR}&keywords=marketing&sortBy=DD`;
     urls.push(combinedUrl);
     combinedIdUrls.push({ url: combinedUrl, companies: withIds });
     console.log(`  [JOBS-BATCH] Combined ${withIds.length} company IDs into ONE URL (comma-separated, ${TPR})`);
@@ -645,7 +645,7 @@ async function scanJobsBatch(companies, taskDefs, threshold = 50, campaignId = n
     const retryUrls = [];
     if (withIds.length > 0) {
       const ids = withIds.map(c => c.linkedinCompanyId).join(",");
-      const noTPRUrl = `https://www.linkedin.com/jobs/search/?f_C=${ids}&sortBy=DD`;
+      const noTPRUrl = `https://www.linkedin.com/jobs/search/?f_C=${ids}&keywords=marketing&sortBy=DD`;
       retryUrls.push(noTPRUrl);
       console.log(`  [JOBS-BATCH] Retry URL: ${noTPRUrl}`);
     }
@@ -663,7 +663,7 @@ async function scanJobsBatch(companies, taskDefs, threshold = 50, campaignId = n
   // ── Retry 2: Try each company ID individually (rules out comma-separated f_C bug) ──
   if (allJobs.length === 0 && withIds.length > 1 && !error) {
     console.log(`  [JOBS-BATCH] Still 0 — retrying with INDIVIDUAL URLs per company (rules out comma-syntax issue)...`);
-    const indivUrls = withIds.map(c => `https://www.linkedin.com/jobs/search/?f_C=${c.linkedinCompanyId}&sortBy=DD`);
+    const indivUrls = withIds.map(c => `https://www.linkedin.com/jobs/search/?f_C=${c.linkedinCompanyId}&keywords=marketing&sortBy=DD`);
     for (const c of withoutIds) {
       const cleanName = cleanCompanyName(c.name);
       if (!cleanName) continue;
