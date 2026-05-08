@@ -110,9 +110,9 @@ export async function POST(request) {
     // ── Fetch jobs from Apify (single-company URL) ──
     const cleanName = cleanCompanyName(account.name);
     const TPR = process.env.APIFY_JOBS_TPR || "r2592000";
-    const url = account.linkedinCompanyId
-      ? `https://www.linkedin.com/jobs/search/?f_C=${account.linkedinCompanyId}&f_TPR=${TPR}&keywords=marketing&sortBy=DD`
-      : `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${cleanName}" marketing`)}&sortBy=DD`;
+    // Match production: keyword-based URL (drop f_C since LinkedIn ignores
+    // keywords filter when f_C is set, returning all-jobs feed).
+    const url = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${cleanName}" marketing`)}&f_TPR=${TPR}&sortBy=DD`;
     diagnostics.push({ stage: "url", url });
 
     const actorId = process.env.APIFY_ACTOR_ID || "curious_coder/linkedin-jobs-scraper";

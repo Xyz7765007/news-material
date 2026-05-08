@@ -129,24 +129,20 @@ export async function POST(request) {
     }
 
     // ── Build URLs (same logic as scanJobsBatch) ──
-    const withIds = accounts.filter(a => a.linkedinCompanyId);
-    const withoutIds = accounts.filter(a => !a.linkedinCompanyId);
-    const TPR = process.env.APIFY_JOBS_TPR || "r2592000";
+    // Keyword-based per-company URLs. f_C dropped because LinkedIn ignores
+    // the keywords param when f_C is set (returns all-jobs feed).
+    const TPR = process.env.APIFY_JOBS_TPR || "r604800";
     const urls = [];
-    if (withIds.length > 0) {
-      const ids = withIds.map(c => c.linkedinCompanyId).join(",");
-      urls.push(`https://www.linkedin.com/jobs/search/?f_C=${ids}&f_TPR=${TPR}&keywords=marketing&sortBy=DD`);
-    }
-    for (const c of withoutIds) {
+    for (const c of accounts) {
       const cleanName = cleanCompanyName(c.name);
       if (!cleanName) continue;
-      urls.push(`https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${cleanName}" marketing`)}&sortBy=DD`);
+      urls.push(`https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${cleanName}" marketing`)}&f_TPR=${TPR}&sortBy=DD`);
     }
     diagnostics.push({ stage: "url_construction", urls, urlCount: urls.length });
 
     if (urls.length === 0) {
       return NextResponse.json({
-        verdict: "FAIL: no URLs could be constructed (accounts missing both linkedinCompanyId and resolvable name).",
+        verdict: "FAIL: no URLs could be constructed (accounts have no resolvable name).",
         diagnostics,
       });
     }
@@ -160,13 +156,9 @@ export async function POST(request) {
     diagnostics.push({ stage: "after_attempt_1", jobCount: allJobs.length });
 
     // ── Attempt 2: drop f_TPR ──
-    if (allJobs.length === 0 && !r1.error && withIds.length > 0) {
+    if (allJobs.length === 0 && !r1.error) {
       const retryUrls = [];
-      if (withIds.length > 0) {
-        const ids = withIds.map(c => c.linkedinCompanyId).join(",");
-        retryUrls.push(`https://www.linkedin.com/jobs/search/?f_C=${ids}&keywords=marketing&sortBy=DD`);
-      }
-      for (const c of withoutIds) {
+      for (const c of accounts) {
         const cleanName = cleanCompanyName(c.name);
         if (!cleanName) continue;
         retryUrls.push(`https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${cleanName}" marketing`)}&sortBy=DD`);
@@ -176,18 +168,7 @@ export async function POST(request) {
       diagnostics.push({ stage: "after_attempt_2", jobCount: allJobs.length });
     }
 
-    // ── Attempt 3: individual URLs per company ──
-    if (allJobs.length === 0 && withIds.length > 1 && !r1.error) {
-      const indivUrls = withIds.map(c => `https://www.linkedin.com/jobs/search/?f_C=${c.linkedinCompanyId}&keywords=marketing&sortBy=DD`);
-      for (const c of withoutIds) {
-        const cleanName = cleanCompanyName(c.name);
-        if (!cleanName) continue;
-        indivUrls.push(`https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${cleanName}" marketing`)}&sortBy=DD`);
-      }
-      const r3 = await apifyCallVerbose(actorId, { urls: indivUrls, ...baseInput }, diagnostics, "fetch_individual");
-      allJobs = Array.isArray(r3.data) ? r3.data : [];
-      diagnostics.push({ stage: "after_attempt_3", jobCount: allJobs.length });
-    }
+    // (Old attempt 3 — individual URLs per company — removed since we're already per-company.)
 
     // ── Sample of raw jobs (first 5) for manual inspection ──
     diagnostics.push({

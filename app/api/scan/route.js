@@ -585,43 +585,39 @@ async function scanJobsBatch(companies, taskDefs, threshold = 50, campaignId = n
     return companies.map(c => ({ company: c.name, signals: [] }));
   }
 
-  // Split companies into those with IDs (can combine) and those without (need individual URLs)
-  const withIds = companies.filter(c => c.linkedinCompanyId);
-  const withoutIds = companies.filter(c => !c.linkedinCompanyId);
-
-  // Build URLs — combine ALL f_C IDs into ONE LinkedIn URL
+  // Build URLs — keyword-based per-company URLs (no batching).
+  // Drop the prior withIds/withoutIds split since both paths now use the
+  // same shape of URL. f_C as a filter has been retired (see comment below).
   const urls = [];
-  const combinedIdUrls = []; // track these specifically for retry without time filter
 
   // f_TPR window (in seconds): r604800 = 7 days, r2592000 = 30 days, r7776000 = 90 days
-  // Loosened default to 30 days because non-tech companies (consumer, retail, hospitality)
-  // post jobs less frequently than tech companies. r604800 (7 days) was returning 0 for
-  // companies that genuinely had postings just slightly older than a week.
   // Override via APIFY_JOBS_TPR env var if you need a different window.
   const TPR = process.env.APIFY_JOBS_TPR || "r604800"; // 604800s = 7 days, matches MAX_JOB_AGE_DAYS=7
 
-  if (withIds.length > 0) {
-    // LinkedIn's URL filter syntax uses COMMA-SEPARATED values for repeated dimensions:
-    //   f_C=123,456,789  ✓  (filters jobs from any of those companies)
-    //   f_C=123&f_C=456  ✗  (LinkedIn keeps only the last value)
-    // Confirmed via LinkedIn's own scraped jobSearchUrl format and the Kondo URL-hacking guide.
-    const ids = withIds.map(c => c.linkedinCompanyId).join(",");
-    const combinedUrl = `https://www.linkedin.com/jobs/search/?f_C=${ids}&f_TPR=${TPR}&keywords=marketing&sortBy=DD`;
-    urls.push(combinedUrl);
-    combinedIdUrls.push({ url: combinedUrl, companies: withIds });
-    console.log(`  [JOBS-BATCH] Combined ${withIds.length} company IDs into ONE URL (comma-separated, ${TPR})`);
-    withIds.forEach(c => console.log(`    f_C=${c.linkedinCompanyId} (${c.name})`));
-    console.log(`  [JOBS-BATCH] URL: ${combinedUrl}`);
-  }
+  // 2026-05-08: Empirical evidence (Mastercard debug runs) showed that
+  // f_C=<id>&keywords=marketing returns the ALL-JOBS feed for a company,
+  // not marketing-only jobs. LinkedIn ignores `keywords` when `f_C` is
+  // present. The all-jobs feed contains ~2 marketing roles out of every 25
+  // (most are product/sales/ops/finance), and our keyword prefilter then
+  // drops everything → 0 tasks.
+  //
+  // Fix: drop f_C entirely. Use keyword-based URLs for every company,
+  // pattern: keywords="${name}" marketing — the same shape that the
+  // existing `withoutIds` fallback has been using (and getting marketing-
+  // focused results from). Downstream company-name matching filters out
+  // any cross-pollution from companies that mention "Mastercard" in JDs.
+  //
+  // Trade-off: lose batching (was 5 companies → 1 URL, now 5 → 5 URLs).
+  // Apify cost increases ~5×, but each company gets its own 100-result
+  // ceiling instead of sharing 100 across the batch, so per-company
+  // recall improves. Net cost vs accuracy is favorable.
 
-  // Each keyword fallback company gets its own URL (can't combine these)
-  for (const c of withoutIds) {
+  for (const c of companies) {
     const cleanName = cleanCompanyName(c.name);
     if (!cleanName) continue;
-    const topKw = taskDefs.flatMap(t => t.jobTitleKeywords || t.keywords || [])[0] || "marketing";
-    const url = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${cleanName}" ${topKw}`)}&sortBy=DD`;
+    const url = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${cleanName}" marketing`)}&f_TPR=${TPR}&sortBy=DD`;
     urls.push(url);
-    console.log(`  [JOBS-BATCH] ${cleanName}: keyword fallback URL: ${url}`);
+    console.log(`  [JOBS-BATCH] ${cleanName}: keyword URL ${url}`);
   }
 
   console.log(`  [JOBS-BATCH] Total URLs: ${urls.length} (was ${companies.length} before combining)`);
@@ -636,44 +632,24 @@ async function scanJobsBatch(companies, taskDefs, threshold = 50, campaignId = n
   if (error) console.error(`  [JOBS-BATCH] ${error}`);
   console.log(`  [JOBS-BATCH] Got ${allJobs.length} total job listings`);
 
-  // ── Retry 1: Drop f_TPR entirely (no time filter) if first attempt returned 0 ──
+  // ── Retry: Drop f_TPR entirely (no time filter) if first attempt returned 0 ──
   // Reason: even 30-day windows fail for some companies. Without f_TPR, LinkedIn
   // returns ALL jobs ever posted by the company, sorted by date — newest first via
-  // sortBy=DD. We then filter by date in JS using filterRecent().
-  if (allJobs.length === 0 && combinedIdUrls.length > 0 && !error) {
+  // sortBy=DD. We then filter by date in JS using filterRecentJobs().
+  //
+  // (Old retry-2 "individual URLs per company" is no longer needed — we're already
+  // per-company since dropping f_C batching, so the retry just removes the time filter.)
+  if (allJobs.length === 0 && urls.length > 0 && !error) {
     console.log(`  [JOBS-BATCH] 0 results — retrying without time filter (f_TPR)...`);
     const retryUrls = [];
-    if (withIds.length > 0) {
-      const ids = withIds.map(c => c.linkedinCompanyId).join(",");
-      const noTPRUrl = `https://www.linkedin.com/jobs/search/?f_C=${ids}&keywords=marketing&sortBy=DD`;
-      retryUrls.push(noTPRUrl);
-      console.log(`  [JOBS-BATCH] Retry URL: ${noTPRUrl}`);
-    }
-    for (const c of withoutIds) {
+    for (const c of companies) {
       const cleanName = cleanCompanyName(c.name);
       if (!cleanName) continue;
-      const topKw = taskDefs.flatMap(t => t.jobTitleKeywords || t.keywords || [])[0] || "marketing";
-      retryUrls.push(`https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${cleanName}" ${topKw}`)}&sortBy=DD`);
+      retryUrls.push(`https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${cleanName}" marketing`)}&sortBy=DD`);
     }
     const retry1 = await apifyCallWithFallback(actorId, { urls: retryUrls, ...baseInput }, 480000);
     allJobs = Array.isArray(retry1.data) ? retry1.data : [];
-    console.log(`  [JOBS-BATCH] After retry-1 (no time filter): ${allJobs.length} jobs`);
-  }
-
-  // ── Retry 2: Try each company ID individually (rules out comma-separated f_C bug) ──
-  if (allJobs.length === 0 && withIds.length > 1 && !error) {
-    console.log(`  [JOBS-BATCH] Still 0 — retrying with INDIVIDUAL URLs per company (rules out comma-syntax issue)...`);
-    const indivUrls = withIds.map(c => `https://www.linkedin.com/jobs/search/?f_C=${c.linkedinCompanyId}&keywords=marketing&sortBy=DD`);
-    for (const c of withoutIds) {
-      const cleanName = cleanCompanyName(c.name);
-      if (!cleanName) continue;
-      const topKw = taskDefs.flatMap(t => t.jobTitleKeywords || t.keywords || [])[0] || "marketing";
-      indivUrls.push(`https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${cleanName}" ${topKw}`)}&sortBy=DD`);
-    }
-    indivUrls.forEach(u => console.log(`  [JOBS-BATCH] Indiv URL: ${u}`));
-    const retry2 = await apifyCallWithFallback(actorId, { urls: indivUrls, ...baseInput }, 480000);
-    allJobs = Array.isArray(retry2.data) ? retry2.data : [];
-    console.log(`  [JOBS-BATCH] After retry-2 (individual URLs): ${allJobs.length} jobs`);
+    console.log(`  [JOBS-BATCH] After retry (no time filter): ${allJobs.length} jobs`);
   }
 
   if (allJobs.length === 0) {
