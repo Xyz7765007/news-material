@@ -308,7 +308,35 @@ async function fetchArticle(url) {
         const jsLocation = html.match(/(?:window\.location|location\.href|location\.replace)\s*=?\s*\(?\s*["']([^"']+)["']/i);
         const dataUrl = html.match(/data-n-au=["']([^"']+)["']/); // Google News' own tracker
         const canonical = html.match(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i);
-        const redirectUrl = (metaRefresh?.[1] || jsLocation?.[1] || dataUrl?.[1] || canonical?.[1] || "").replace(/&amp;/g, "&");
+        let redirectUrl = (metaRefresh?.[1] || jsLocation?.[1] || dataUrl?.[1] || canonical?.[1] || "").replace(/&amp;/g, "&");
+
+        // ── 2026-05-08: firstExternalLink fallback ──
+        // After 4 production scans showed 100% thin_extraction (which under the
+        // corrected error logic means "never escaped redirector"), it's clear the
+        // 4 patterns above don't match Google News' current redirect mechanism.
+        // Modern Google News interstitial pages are 8-30KB and use JS-driven
+        // navigation that doesn't appear in static HTML as meta-refresh or
+        // location.href. But they DO contain the publisher URL as an <a href>
+        // somewhere in the page (for fallback no-JS rendering, share UI, etc.).
+        //
+        // We look for the FIRST external anchor whose host is not Google itself
+        // and not a known social/share/ad destination. Strict filtering required
+        // because Google News pages also contain footer links to other Google
+        // properties and Twitter/Facebook share buttons.
+        if (!redirectUrl) {
+          const SKIP_HOSTS = /(?:^|\/\/)(?:[a-z0-9-]+\.)?(?:google|gstatic|youtube|googleusercontent|googleapis|googletagmanager|doubleclick|twitter|x\.com|facebook|linkedin|instagram|pinterest|reddit|whatsapp|t\.me|telegram|tiktok|threads|truthsocial|bsky|mastodon|sharethis|addthis|email-share)\./i;
+          // Match all external anchors. Only consider href values that look like full URLs.
+          const anchors = html.matchAll(/<a[^>]+href=["'](https?:\/\/[^"']+)["']/gi);
+          for (const m of anchors) {
+            const candidate = m[1];
+            if (SKIP_HOSTS.test(candidate)) continue;
+            // Avoid obvious share/utm endpoints
+            if (/[?&](share|utm_source=share|via=)/i.test(candidate)) continue;
+            redirectUrl = candidate.replace(/&amp;/g, "&");
+            break;
+          }
+        }
+
         if (redirectUrl && /^https?:\/\//i.test(redirectUrl) && !redirectUrl.includes("news.google.com") && redirectUrl !== currentUrl) {
           // Found a redirect target — follow it ONCE
           currentUrl = redirectUrl;
@@ -351,14 +379,17 @@ async function fetchArticle(url) {
       if (cleaned.length < 50) {
         // Too thin to be useful — don't retry (the page genuinely has no extractable text).
         // Split into 3 codes so the scan summary tells us WHICH stage failed:
-        //   - thin_redirect: small HTML, redirect detection ran but found nothing → likely
-        //     a Google News interstitial whose redirect mechanism isn't in our pattern list
-        //   - thin_extraction: full-size HTML reached, but no article container matched →
-        //     likely a JS-rendered SPA where the body is in React state, not static HTML
-        //   - thin_body: fallback for everything else (paywall landings, bot pages, etc.)
+        //   - thin_redirect: we never escaped the redirector (Google News interstitial,
+        //     etc.) — followedRedirect is false. Means our redirect detection patterns
+        //     didn't match whatever mechanism the redirector uses.
+        //   - thin_extraction: we DID escape the redirector and reached the publisher,
+        //     but no article container matched on the publisher page. Likely a JS-rendered
+        //     SPA where the body is in React state, not static HTML.
+        //   - thin_body: very short HTML (< 2KB), too small to even attempt extraction.
+        //     Likely a 200-OK error page or a tracking pixel response.
         let errCode = "thin_body";
-        if (html.length < 8000 && !followedRedirect) errCode = "thin_redirect";
-        else if (html.length >= 8000) errCode = "thin_extraction";
+        if (!followedRedirect) errCode = "thin_redirect";
+        else if (html.length >= 2000) errCode = "thin_extraction";
         return { content: cleaned, error: errCode };
       }
       return { content: cleaned, error: null };
@@ -378,7 +409,7 @@ const MAX_AGE_DAYS = 7;
 // Jobs are kept longer because non-tech companies post less frequently. A "VP Marketing
 // role open" 3 weeks ago is still actionable. News at 7 days makes sense (old news isn't
 // actionable), but jobs we keep for 30 days. Override via env if needed.
-const MAX_JOB_AGE_DAYS = parseInt(process.env.MAX_JOB_AGE_DAYS) || 30;
+const MAX_JOB_AGE_DAYS = parseInt(process.env.MAX_JOB_AGE_DAYS) || 7;
 
 function filterRecent(items) {
   const cutoff = Date.now() - MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
