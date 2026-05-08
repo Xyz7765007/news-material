@@ -1,11 +1,12 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
+import { trackOpenAIUsage } from "@/lib/ai-usage";
 
 let _openai;
 function getOpenAI() { if (!_openai) _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY }); return _openai; }
 
 // Classify a news item against task definitions
-async function classifyNews(newsItem, taskDefs, companyName) {
+async function classifyNews(newsItem, taskDefs, companyName, campaignId = null) {
   const taskList = taskDefs
     .map(
       (t) =>
@@ -41,6 +42,7 @@ If no tasks match (WHICH IS OFTEN THE CORRECT ANSWER), return: {"matchedTaskIds"
         },
       ],
     });
+    trackOpenAIUsage({ campaignId, completion, action: "classify_news" });
 
     const text = completion.choices[0]?.message?.content || "{}";
     const cleaned = text.replace(/```json\n?|```/g, "").trim();
@@ -52,7 +54,7 @@ If no tasks match (WHICH IS OFTEN THE CORRECT ANSWER), return: {"matchedTaskIds"
 }
 
 // Refine a vague task description into a structured task definition
-async function refineTask(userInput) {
+async function refineTask(userInput, campaignId = null) {
   try {
     const completion = await getOpenAI().chat.completions.create({
       model: "gpt-5.4",
@@ -81,6 +83,7 @@ IMPORTANT: If the signal is about hiring, job openings, or specific roles being 
         },
       ],
     });
+    trackOpenAIUsage({ campaignId, completion, action: "refine_task" });
 
     const text = completion.choices[0]?.message?.content || "{}";
     const cleaned = text.replace(/```json\n?|```/g, "").trim();
@@ -92,7 +95,7 @@ IMPORTANT: If the signal is about hiring, job openings, or specific roles being 
 }
 
 // Generate AI insights for a specific task
-async function generateInsights(task, companyName) {
+async function generateInsights(task, companyName, campaignId = null) {
   try {
     const completion = await getOpenAI().chat.completions.create({
       model: "gpt-5.4",
@@ -115,6 +118,7 @@ async function generateInsights(task, companyName) {
         },
       ],
     });
+    trackOpenAIUsage({ campaignId, completion, action: "generate_insights" });
 
     const text = completion.choices[0]?.message?.content || "{}";
     const cleaned = text.replace(/```json\n?|```/g, "").trim();
@@ -126,7 +130,7 @@ async function generateInsights(task, companyName) {
 }
 
 // Generate optimal LinkedIn search keywords for a job task
-async function generateJobKeywords(taskName, taskDescription) {
+async function generateJobKeywords(taskName, taskDescription, campaignId = null) {
   try {
     const completion = await getOpenAI().chat.completions.create({
       model: "gpt-5.4",
@@ -151,6 +155,7 @@ RULES:
         },
       ],
     });
+    trackOpenAIUsage({ campaignId, completion, action: "generate_job_keywords" });
 
     const text = completion.choices[0]?.message?.content || "{}";
     const cleaned = text.replace(/```json\n?|```/g, "").trim();
@@ -164,7 +169,7 @@ RULES:
   }
 }
 
-async function generateScoringPrompt(taskName, taskDescription, taskKeywords, taskSources, taskJobTitleKeywords) {
+async function generateScoringPrompt(taskName, taskDescription, taskKeywords, taskSources, taskJobTitleKeywords, campaignId = null) {
   const isJobPost = (taskSources || []).some(s => s === "Job Posts");
   const isNews = (taskSources || []).some(s => ["News","New Hires","Social","Exits / Promotions","Custom","Earnings","SEC Filings"].includes(s));
   const sourceType = isJobPost && isNews ? "news articles AND job postings" : isJobPost ? "job postings" : "news articles";
@@ -229,6 +234,7 @@ Signal Sources: ${(taskSources || []).join(", ") || "N/A"}`,
         },
       ],
     });
+    trackOpenAIUsage({ campaignId, completion, action: "generate_scoring_prompt" });
     const prompt = completion.choices[0]?.message?.content?.trim() || "";
     return { scoringPrompt: prompt };
   } catch (e) {
@@ -241,7 +247,7 @@ Signal Sources: ${(taskSources || []).join(", ") || "N/A"}`,
 }
 
 // AI-powered deduplication — groups tasks by company, identifies semantic duplicates
-async function dedupTasks(taskGroups) {
+async function dedupTasks(taskGroups, campaignId = null) {
   // taskGroups: [{company, tasks: [{signal, taskRule, score, taskType, url, idx}]}]
   const results = []; // indices to KEEP
 
@@ -265,6 +271,7 @@ async function dedupTasks(taskGroups) {
           { role: "user", content: `Company: ${group.company}\n\nTasks:\n${taskList}` }
         ],
       });
+      trackOpenAIUsage({ campaignId, completion, action: "dedup_tasks" });
 
       const text = completion.choices[0]?.message?.content || "{}";
       const cleaned = text.replace(/```json\n?|```/g, "").trim();
@@ -298,6 +305,9 @@ export async function POST(request) {
     }
     const body = await request.json();
     const { action } = body;
+    // Optional — if missing, tracking is skipped silently in the helper.
+    // Frontend should send campaignId for any classify call so we can attribute cost.
+    const campaignId = body.campaignId || null;
 
     if (!process.env.OPENAI_API_KEY) {
       return NextResponse.json(
@@ -309,37 +319,37 @@ export async function POST(request) {
     switch (action) {
       case "classify": {
         const { newsItem, taskDefs, companyName } = body;
-        const result = await classifyNews(newsItem, taskDefs, companyName);
+        const result = await classifyNews(newsItem, taskDefs, companyName, campaignId);
         return NextResponse.json(result);
       }
 
       case "refine": {
         const { userInput } = body;
-        const result = await refineTask(userInput);
+        const result = await refineTask(userInput, campaignId);
         return NextResponse.json(result);
       }
 
       case "insights": {
         const { task, companyName } = body;
-        const result = await generateInsights(task, companyName);
+        const result = await generateInsights(task, companyName, campaignId);
         return NextResponse.json(result);
       }
 
       case "generate_job_keywords": {
         const { taskName, taskDescription } = body;
-        const result = await generateJobKeywords(taskName, taskDescription);
+        const result = await generateJobKeywords(taskName, taskDescription, campaignId);
         return NextResponse.json(result);
       }
 
       case "generate_scoring_prompt": {
         const { taskName, taskDescription, taskKeywords, taskSources, taskJobTitleKeywords } = body;
-        const result = await generateScoringPrompt(taskName, taskDescription, taskKeywords, taskSources, taskJobTitleKeywords);
+        const result = await generateScoringPrompt(taskName, taskDescription, taskKeywords, taskSources, taskJobTitleKeywords, campaignId);
         return NextResponse.json(result);
       }
 
       case "dedup_tasks": {
         const { taskGroups } = body;
-        const result = await dedupTasks(taskGroups || []);
+        const result = await dedupTasks(taskGroups || [], campaignId);
         return NextResponse.json(result);
       }
 

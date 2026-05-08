@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
+import { trackOpenAIUsage } from "@/lib/ai-usage";
 
 // 5-minute Vercel function timeout. News scan per company:
 //   - 1 RSS fetch (~1-2s)
@@ -341,7 +342,7 @@ function filterRecentJobs(items) {
 // MODE: NEWS — Google News RSS → article fetch → classify
 // ═══════════════════════════════════════════════════════════════════
 
-async function scanNews(company, taskDefs, threshold = 50) {
+async function scanNews(company, taskDefs, threshold = 50, campaignId = null) {
   const cleanName = cleanCompanyName(company.name);
   if (!cleanName) {
     console.log(`  [NEWS] Skipping ${company.name} — empty name after cleaning`);
@@ -475,7 +476,7 @@ async function scanNews(company, taskDefs, threshold = 50) {
     console.warn(`  [NEWS] ${cleanName}: ⚠ LOW FETCH SUCCESS RATE (${successRate}%). Some signals will be scored on headline alone — accuracy may be lower than usual.`);
   }
 
-  const classified = await classify(enriched, taskDefs, cleanName, "news", threshold);
+  const classified = await classify(enriched, taskDefs, cleanName, "news", threshold, campaignId);
   return { signals: classified, fetchStats: { succeeded: stats.succeeded, total: stats.total, successRate, errors: stats.errors, secondPassRecovered: stats.secondPassRecovered } };
 }
 
@@ -486,7 +487,7 @@ async function scanNews(company, taskDefs, threshold = 50) {
 // Returns results grouped by company for the frontend to process
 // ═══════════════════════════════════════════════════════════════════
 
-async function scanJobsBatch(companies, taskDefs, threshold = 50) {
+async function scanJobsBatch(companies, taskDefs, threshold = 50, campaignId = null) {
   const tokens = getApifyTokens();
   if (tokens.length === 0) {
     console.log("  [JOBS-BATCH] No Apify tokens configured — skipping");
@@ -652,7 +653,7 @@ async function scanJobsBatch(companies, taskDefs, threshold = 50) {
     console.log(`  [JOBS-BATCH] ${c.name}: ${companyJobs.length} matched → ${recent.length} within ${MAX_JOB_AGE_DAYS} days`);
 
     if (recent.length > 0) {
-      const classified = await classify(recent, taskDefs, c.name, "jobs", threshold);
+      const classified = await classify(recent, taskDefs, c.name, "jobs", threshold, campaignId);
       results.push({ company: c.name, signals: classified });
     } else {
       results.push({ company: c.name, signals: [] });
@@ -761,7 +762,7 @@ function formatSignalForAI(sig, idx, mode) {
   return lines.join("\n");
 }
 
-async function classify(signals, taskDefs, companyName, mode, threshold = 50) {
+async function classify(signals, taskDefs, companyName, mode, threshold = 50, campaignId = null) {
   if (!signals.length || !taskDefs.length) return [];
 
   // Initialize results — each signal starts with no matches
@@ -848,6 +849,8 @@ ${signalBlock}`;
           { role: "user", content: userMessage },
         ],
       });
+      // Fire-and-forget cost tracking. Never throws, never blocks.
+      trackOpenAIUsage({ campaignId, completion: c, action: `scan_${mode}_${task.name}` });
       const text = c.choices[0]?.message?.content || "{}";
       const finishReason = c.choices[0]?.finish_reason;
       if (finishReason === "length") {
@@ -966,6 +969,10 @@ export async function POST(request) {
     }
     const body = await request.json();
     const { mode } = body;
+    // campaignId comes from the frontend so the AI usage helper can attribute
+    // OpenAI token costs to the right Campaign record for per-client billing.
+    // Optional — if missing, tracking is skipped silently (no error).
+    const campaignId = body.campaignId || null;
     // The frontend passes the user's configured scoring threshold (0-100, default 70).
     // We pass this to the AI so it can drop low-scoring signals at output time
     // instead of returning them and having the frontend filter post-hoc.
@@ -984,7 +991,7 @@ export async function POST(request) {
       if (!taskDefs?.length) return NextResponse.json({ error: "No task definitions provided" }, { status: 400 });
 
       console.log(`\n── Jobs Batch: ${companies.length} companies (threshold: ${threshold}) ──`);
-      const results = await scanJobsBatch(companies, taskDefs, threshold);
+      const results = await scanJobsBatch(companies, taskDefs, threshold, campaignId);
       return NextResponse.json({ results, threshold });
     }
 
@@ -994,7 +1001,7 @@ export async function POST(request) {
     if (!taskDefs?.length) return NextResponse.json({ error: "Task definitions required" }, { status: 400 });
 
     console.log(`\n── Scanning: ${company.name} [${mode}] (threshold: ${threshold}) ──`);
-    const { signals, fetchStats } = await scanNews(company, taskDefs, threshold);
+    const { signals, fetchStats } = await scanNews(company, taskDefs, threshold, campaignId);
 
     return NextResponse.json({
       news: signals,

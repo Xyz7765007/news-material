@@ -53,6 +53,7 @@ export async function GET(request) {
           body: JSON.stringify({
             action: "process_queue",
             baseId,
+            campaignId: camp.id, // for AI cost tracking — billing attribution
             accountId: config.accountId,
             ruleConfig: { ...config, name: rf.Name },
           }),

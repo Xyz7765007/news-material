@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
+import { trackOpenAIUsage } from "@/lib/ai-usage";
 
 let _openai;
 function getOpenAI() { if (!_openai) _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY }); return _openai; }
@@ -170,7 +171,7 @@ async function getConversionPatterns(k) {
 // AI TASK GENERATION
 // ═══════════════════════════════════════════════════════════════
 
-async function generateTasks(contact, deal, timeline, conversionPatterns, rule) {
+async function generateTasks(contact, deal, timeline, conversionPatterns, rule, campaignId = null) {
   const openai = getOpenAI();
   const p = contact.properties || {};
   const dp = deal.properties || {};
@@ -211,6 +212,7 @@ Rules:
         { role: "user", content: `SDR Instructions:\n${prompt}\n\n── CONTACT ──\n${contactInfo}\n\n── DEAL ──\n${dealInfo}\n\n── ENGAGEMENT HISTORY ──\n${timelineSummary}\n\n── CONVERSION PATTERNS (what worked for won deals) ──\n${conversionPatterns}` },
       ],
     });
+    trackOpenAIUsage({ campaignId, completion: c, action: "post_demo_generate_tasks" });
     const text = c.choices[0]?.message?.content || "[]";
     try { return JSON.parse(text.replace(/```json\n?|```/g, "").trim()); }
     catch { const m = text.match(/\[[\s\S]*?\]/); return m ? JSON.parse(m[0]) : []; }
@@ -223,7 +225,7 @@ Rules:
 // PROCESS: find deals at stage → get contacts → get history → AI
 // ═══════════════════════════════════════════════════════════════
 
-async function processRule(k, baseId, rule) {
+async function processRule(k, baseId, rule, campaignId = null) {
   const { stageId, stageName } = rule;
   console.log(`[POST-DEMO] Trigger: deals at stage "${stageName}" (${stageId})`);
 
@@ -264,7 +266,7 @@ async function processRule(k, baseId, rule) {
 
       console.log(`[POST-DEMO] Processing: ${name} (${p.company || "?"})`);
       const timeline = await getContactTimeline(k, contact.id);
-      const followUps = await generateTasks(contact, deal, timeline, conversionPatterns, rule);
+      const followUps = await generateTasks(contact, deal, timeline, conversionPatterns, rule, campaignId);
 
       for (const task of followUps) {
         newTasks.push({
@@ -350,7 +352,7 @@ export async function POST(request) {
 
       case "run": {
         if (!process.env.OPENAI_API_KEY) return NextResponse.json({ error: "OPENAI_API_KEY not set" }, { status: 500 });
-        const result = await processRule(k, baseId, body.rule);
+        const result = await processRule(k, baseId, body.rule, campaignId);
         return NextResponse.json(result);
       }
 

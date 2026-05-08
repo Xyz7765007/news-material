@@ -151,6 +151,11 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const [showExportModal, setShowExportModal] = useState(false);
   const [linkedinAccount, setLinkedinAccount] = useState(null);
   const [outreachStats, setOutreachStats] = useState(null);
+  // AI usage stats — populated from the campaign record after each load.
+  // Used to display per-client OpenAI cost on the dashboard for billing transparency.
+  // Hidden in clientMode (admin-only billing data).
+  const [aiUsage, setAiUsage] = useState(null); // {inputTokens, outputTokens, totalCostUSD, callsCount, lastCallAt, resetAt}
+  const [aiUsageLoading, setAiUsageLoading] = useState(false);
   const [outreachItems, setOutreachItems] = useState([]);
   const [outreachLoading, setOutreachLoading] = useState(false);
   // HubSpot
@@ -316,7 +321,8 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
 
   // ─── Outreach helpers ──────────────────────────────────────
   const outreachAPI = async (action, data = {}) => {
-    const res = await fetch("/api/outreach", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, baseId: bid, ...data }) });
+    // campaignId for AI cost tracking — billing attribution
+    const res = await fetch("/api/outreach", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, baseId: bid, campaignId: camp?.airtableId, ...data }) });
     const text = await res.text();
     let body; try { body = JSON.parse(text); } catch { body = { error: text.slice(0, 300) }; }
     if (!res.ok) return { ...body, _httpStatus: res.status, _httpOk: false };
@@ -542,6 +548,69 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     } catch (e) { console.error("Outreach stats error:", e); }
     setOutreachLoading(false);
   };
+
+  // Load AI usage stats from the Campaign record. Read the same get_campaign
+  // endpoint used elsewhere — fields are passed through (except HubSpot key/pw).
+  // Hidden in clientMode; admin sees per-client cost on dashboard for billing.
+  const loadAIUsage = async () => {
+    if (clientMode) return; // never load billing data in client mode
+    if (!camp?.airtableId) return;
+    try {
+      setAiUsageLoading(true);
+      const res = await fetch("/api/airtable", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "get_campaign", campaignId: camp.airtableId }),
+      });
+      if (!res.ok) { setAiUsage(null); return; }
+      const data = await res.json();
+      const f = data.fields || {};
+      setAiUsage({
+        inputTokens: f["AI Total Input Tokens"] || 0,
+        outputTokens: f["AI Total Output Tokens"] || 0,
+        totalCostUSD: f["AI Total Cost USD"] || 0,
+        callsCount: f["AI Calls Count"] || 0,
+        lastCallAt: f["AI Last Call At"] || null,
+        resetAt: f["AI Usage Reset At"] || null,
+      });
+    } catch (e) {
+      console.error("AI usage load error:", e);
+      setAiUsage(null);
+    } finally {
+      setAiUsageLoading(false);
+    }
+  };
+
+  // Reset the AI usage counters back to zero. Used after monthly invoicing.
+  // Confirmation dialog because this is destructive (lost reset history is unrecoverable).
+  const resetAIUsage = async () => {
+    if (clientMode) return;
+    if (!camp?.airtableId) return;
+    if (!confirm("Reset AI usage counters to zero?\n\nThis is for billing cycles — typically you'd run this AFTER invoicing the client for the previous period. The reset is permanent.")) return;
+    try {
+      const res = await fetch("/api/airtable", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "reset_ai_usage", campaignId: camp.airtableId }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        setMsg("✅ AI usage counters reset");
+        await loadAIUsage();
+      } else {
+        setMsg("❌ Reset failed: " + (data.error || "unknown error"));
+      }
+    } catch (e) {
+      setMsg("❌ Reset failed: " + e.message);
+    }
+  };
+
+  // Load AI usage when dashboard is shown — refresh on every tab visit so cost
+  // updates show immediately after a scan/AI operation. Skipped in clientMode.
+  useEffect(() => {
+    if (tab === "dashboard" && !clientMode && camp?.airtableId) {
+      loadAIUsage();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, camp?.airtableId, clientMode]);
 
   const enqueueLeads = async (ruleConfig) => {
     try {
@@ -1178,7 +1247,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     if (toDedup.length === 0) return newTasks;
 
     try {
-      const res = await fetch("/api/classify", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "dedup_tasks", taskGroups: toDedup }) });
+      const res = await fetch("/api/classify", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "dedup_tasks", taskGroups: toDedup, campaignId: camp?.airtableId }) });
       if (res.ok) {
         const { keepIndices } = await res.json();
         const keepSet = new Set(keepIndices || []);
@@ -1335,10 +1404,10 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     // so user knows if poor fetch rates may have caused signal loss this run.
     const aggFetchStats = { totalArticles: 0, succeededArticles: 0, errorBreakdown: {}, lowFetchCompanies: [], failedCompanies: [] };
     // ── NEWS phase ──
-    if(mode!=="jobs"&&nT.length>0){for(let i=0;i<companies.length;i++){if(!scanRef.current)break;setScanText("📰 "+companies[i].name);setScanProg(Math.round(i/total*newsRange));try{const res=await fetch("/api/scan",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({company:companies[i],taskDefs:nT,mode:"news",threshold})});if(res.ok){const d=await res.json();bufferSignals(d.news||[],companies[i],taskDefs);if(d.fetchStats){aggFetchStats.totalArticles+=d.fetchStats.total||0;aggFetchStats.succeededArticles+=d.fetchStats.succeeded||0;for(const[k,v]of Object.entries(d.fetchStats.errors||{})){aggFetchStats.errorBreakdown[k]=(aggFetchStats.errorBreakdown[k]||0)+v}if(d.fetchStats.total>=5&&d.fetchStats.successRate<50){aggFetchStats.lowFetchCompanies.push(`${companies[i].name} (${d.fetchStats.successRate}%)`)}}}else{aggFetchStats.failedCompanies.push(`${companies[i].name} (HTTP ${res.status})`);console.error(`[Scan] ${companies[i].name} failed: HTTP ${res.status}`)}}catch(e){aggFetchStats.failedCompanies.push(`${companies[i].name} (${e.message||"network error"})`);console.error(`[Scan] ${companies[i].name} threw:`,e)}await sleep(100)}}
+    if(mode!=="jobs"&&nT.length>0){for(let i=0;i<companies.length;i++){if(!scanRef.current)break;setScanText("📰 "+companies[i].name);setScanProg(Math.round(i/total*newsRange));try{const res=await fetch("/api/scan",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({company:companies[i],taskDefs:nT,mode:"news",threshold,campaignId:camp?.airtableId})});if(res.ok){const d=await res.json();bufferSignals(d.news||[],companies[i],taskDefs);if(d.fetchStats){aggFetchStats.totalArticles+=d.fetchStats.total||0;aggFetchStats.succeededArticles+=d.fetchStats.succeeded||0;for(const[k,v]of Object.entries(d.fetchStats.errors||{})){aggFetchStats.errorBreakdown[k]=(aggFetchStats.errorBreakdown[k]||0)+v}if(d.fetchStats.total>=5&&d.fetchStats.successRate<50){aggFetchStats.lowFetchCompanies.push(`${companies[i].name} (${d.fetchStats.successRate}%)`)}}}else{aggFetchStats.failedCompanies.push(`${companies[i].name} (HTTP ${res.status})`);console.error(`[Scan] ${companies[i].name} failed: HTTP ${res.status}`)}}catch(e){aggFetchStats.failedCompanies.push(`${companies[i].name} (${e.message||"network error"})`);console.error(`[Scan] ${companies[i].name} threw:`,e)}await sleep(100)}}
     // ── JOBS phase ──
     if(scanRef.current&&mode!=="news"&&jT.length>0){const need=companies.filter(c=>c.linkedinSlug&&!c.linkedinCompanyId);if(need.length>0){setScanText("🔗 Resolving LinkedIn IDs...");try{const res=await fetch("/api/resolve-linkedin",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({slugs:need.map(c=>c.linkedinSlug)})});if(res.ok){const{ids}=await res.json();for(const c of companies){if(c.linkedinSlug&&!c.linkedinCompanyId&&ids[c.linkedinSlug.toLowerCase()])c.linkedinCompanyId=ids[c.linkedinSlug.toLowerCase()]}}}catch(e){console.error(e)}}
-    const BS=5;for(let b=0;b<companies.length;b+=BS){if(!scanRef.current)break;const batch=companies.slice(b,b+BS);setScanText("📋 Jobs — Batch "+(Math.floor(b/BS)+1));setScanProg(jobsBase+Math.round(b/companies.length*jobsRange));try{const res=await fetch("/api/scan",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({companies:batch,taskDefs:jT,mode:"jobs-batch",threshold})});if(res.ok){const d=await res.json();for(const result of(d.results||[])){const co=batch.find(c=>c.name===result.company);if(co)bufferSignals(result.signals||[],co,taskDefs)}}}catch(e){console.error(e)}await sleep(200)}}
+    const BS=5;for(let b=0;b<companies.length;b+=BS){if(!scanRef.current)break;const batch=companies.slice(b,b+BS);setScanText("📋 Jobs — Batch "+(Math.floor(b/BS)+1));setScanProg(jobsBase+Math.round(b/companies.length*jobsRange));try{const res=await fetch("/api/scan",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({companies:batch,taskDefs:jT,mode:"jobs-batch",threshold,campaignId:camp?.airtableId})});if(res.ok){const d=await res.json();for(const result of(d.results||[])){const co=batch.find(c=>c.name===result.company);if(co)bufferSignals(result.signals||[],co,taskDefs)}}}catch(e){console.error(e)}await sleep(200)}}
 
     // ─── Post-scan: AI dedup + save ───────────────────────────
     const buffered = scanBufferRef.current;
@@ -1903,6 +1972,67 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
             </div>
           ))}
         </div>
+
+        {/* ───── AI USAGE & COST (admin-only — for client billing) ─────
+            Tracks per-campaign OpenAI token usage and dollar cost. Used to bill
+            clients for their share of the shared OpenAI key. Hidden in
+            clientMode (clients shouldn't see billing internals or each other's
+            costs). Reset button stamps a new billing cycle — typically run
+            after invoicing the previous period. */}
+        {!clientMode && (
+          <div style={{marginTop:24}}>
+            <SectionHeader title="💰 AI Usage & Cost" sub="OpenAI tokens billed to this campaign" />
+            {aiUsage === null && aiUsageLoading ? (
+              <div style={{padding:24,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,textAlign:"center",color:"var(--t3)",fontSize:11}}>Loading usage…</div>
+            ) : aiUsage === null ? (
+              <div style={{padding:24,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,textAlign:"center",color:"var(--t3)",fontSize:11}}>
+                No AI usage data yet. Counters initialize on the first OpenAI call (any scan, AI scoring, or post-demo run).
+              </div>
+            ) : (
+              <>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(160px,1fr))",gap:10,marginBottom:10}}>
+                  <StatTile
+                    label="Total cost"
+                    value={`$${(aiUsage.totalCostUSD || 0).toFixed(4)}`}
+                    sub={aiUsage.resetAt ? `Since ${new Date(aiUsage.resetAt).toLocaleDateString()}` : "All-time"}
+                    emoji="💵"
+                    color={aiUsage.totalCostUSD > 5 ? "var(--amb)" : "var(--grn)"}
+                  />
+                  <StatTile
+                    label="API calls"
+                    value={(aiUsage.callsCount || 0).toLocaleString()}
+                    sub={aiUsage.lastCallAt ? `Last: ${new Date(aiUsage.lastCallAt).toLocaleString()}` : "No calls yet"}
+                    emoji="🔄"
+                    color="var(--blu)"
+                  />
+                  <StatTile
+                    label="Input tokens"
+                    value={(aiUsage.inputTokens || 0).toLocaleString()}
+                    sub={`Avg ${aiUsage.callsCount > 0 ? Math.round((aiUsage.inputTokens || 0) / aiUsage.callsCount).toLocaleString() : 0}/call`}
+                    emoji="📥"
+                    color="var(--t2)"
+                  />
+                  <StatTile
+                    label="Output tokens"
+                    value={(aiUsage.outputTokens || 0).toLocaleString()}
+                    sub={`Avg ${aiUsage.callsCount > 0 ? Math.round((aiUsage.outputTokens || 0) / aiUsage.callsCount).toLocaleString() : 0}/call`}
+                    emoji="📤"
+                    color="var(--pur)"
+                  />
+                </div>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 14px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,fontSize:10,color:"var(--t3)"}}>
+                  <div>
+                    <span style={{color:"var(--t2)"}}>For billing:</span> after invoicing the client for this period, click Reset to start a fresh accumulation cycle. Reset stamps "AI Usage Reset At" so you have a paper trail.
+                  </div>
+                  <div style={{display:"flex",gap:6}}>
+                    <button className="btn btn-s" onClick={loadAIUsage} disabled={aiUsageLoading} title="Refresh from Airtable">{aiUsageLoading ? "⏳" : "🔄"} Refresh</button>
+                    <button className="btn btn-s btn-d" onClick={resetAIUsage} disabled={!aiUsage.callsCount} title={!aiUsage.callsCount ? "Nothing to reset" : "Zero out the counters and stamp a new cycle"}>↺ Reset Counters</button>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        )}
       </>);
     })()}
 
@@ -2299,7 +2429,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       <div className="pt">Scoring Prompts</div>
       <div className="pd">AI scoring criteria (0-100). Your prompt is the SINGLE source of truth — there are no hardcoded judgement rules competing with it.</div>
     </div>
-    {!clientMode&&<button className="btn btn-ai btn-s" onClick={async()=>{const empty=rules.filter(r=>!(r.fields||{})["Scoring Prompt"]);for(const rule of empty){const f=rule.fields||{};try{const res=await fetch("/api/classify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"generate_scoring_prompt",taskName:f.Name,taskDescription:f.Description,taskKeywords:(f.Keywords||"").split(",").map(k=>k.trim()),taskJobTitleKeywords:(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()),taskSources:(f.Sources||"").split(",").map(s=>s.trim())})});if(res.ok){const d=await res.json();if(d.scoringPrompt){await at("update","Task Rules",{records:[{id:rule.id,fields:{"Scoring Prompt":d.scoringPrompt}}]},bid);setRules(p=>p.map(x=>x.id===rule.id?{...x,fields:{...x.fields,"Scoring Prompt":d.scoringPrompt}}:x))}}}catch(e){console.error(e)}}}}><I.Sparkle/> Generate Missing</button>}  </div>
+    {!clientMode&&<button className="btn btn-ai btn-s" onClick={async()=>{const empty=rules.filter(r=>!(r.fields||{})["Scoring Prompt"]);for(const rule of empty){const f=rule.fields||{};try{const res=await fetch("/api/classify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"generate_scoring_prompt",campaignId:camp?.airtableId,taskName:f.Name,taskDescription:f.Description,taskKeywords:(f.Keywords||"").split(",").map(k=>k.trim()),taskJobTitleKeywords:(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()),taskSources:(f.Sources||"").split(",").map(s=>s.trim())})});if(res.ok){const d=await res.json();if(d.scoringPrompt){await at("update","Task Rules",{records:[{id:rule.id,fields:{"Scoring Prompt":d.scoringPrompt}}]},bid);setRules(p=>p.map(x=>x.id===rule.id?{...x,fields:{...x.fields,"Scoring Prompt":d.scoringPrompt}}:x))}}}catch(e){console.error(e)}}}}><I.Sparkle/> Generate Missing</button>}  </div>
 
   {/* PROMPT REFERENCE — collapsible, explains the full prompt contract */}
   <details style={{marginBottom:16,padding:0,border:"1px solid rgba(155,126,216,.3)",borderRadius:8,background:"rgba(155,126,216,.04)"}}>
@@ -2383,7 +2513,7 @@ Output format (strict JSON, no markdown):
 
   <div style={{display:"flex",flexDirection:"column",gap:12}}>{rules.filter(r=>{const tt=(r.fields||{})["Task Type"]||"news";return tt==="news"||tt==="job_post"||tt==="both"}).map(r=>{const f=r.fields||{};const tt=f["Task Type"]||"news";return(<div key={r.id} style={{padding:14,border:"1px solid var(--bdr)",borderRadius:8,background:"var(--card)"}}>
   <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}><div style={{display:"flex",alignItems:"center",gap:8}}><span className={"chip "+(tt==="job_post"?"cb":tt==="top_x"?"cp":"cg")}>{tt.replace(/_/g," ")}</span><span style={{fontSize:13,fontWeight:600}}>{f.Name}</span></div>
-  {!clientMode&&<button className="btn btn-ai btn-s" onClick={async()=>{try{const res=await fetch("/api/classify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"generate_scoring_prompt",taskName:f.Name,taskDescription:f.Description,taskKeywords:(f.Keywords||"").split(",").map(k=>k.trim()),taskJobTitleKeywords:(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()),taskSources:(f.Sources||"").split(",").map(s=>s.trim())})});if(res.ok){const d=await res.json();if(d.scoringPrompt){await at("update","Task Rules",{records:[{id:r.id,fields:{"Scoring Prompt":d.scoringPrompt}}]},bid);setRules(p=>p.map(x=>x.id===r.id?{...x,fields:{...x.fields,"Scoring Prompt":d.scoringPrompt}}:x))}}}catch(e){console.error(e)}}}><I.Sparkle/> Regen</button>}</div>
+  {!clientMode&&<button className="btn btn-ai btn-s" onClick={async()=>{try{const res=await fetch("/api/classify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"generate_scoring_prompt",campaignId:camp?.airtableId,taskName:f.Name,taskDescription:f.Description,taskKeywords:(f.Keywords||"").split(",").map(k=>k.trim()),taskJobTitleKeywords:(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()),taskSources:(f.Sources||"").split(",").map(s=>s.trim())})});if(res.ok){const d=await res.json();if(d.scoringPrompt){await at("update","Task Rules",{records:[{id:r.id,fields:{"Scoring Prompt":d.scoringPrompt}}]},bid);setRules(p=>p.map(x=>x.id===r.id?{...x,fields:{...x.fields,"Scoring Prompt":d.scoringPrompt}}:x))}}}catch(e){console.error(e)}}}><I.Sparkle/> Regen</button>}</div>
   <textarea className="inp ta" readOnly={clientMode} value={f["Scoring Prompt"]||""} placeholder={clientMode?"(Read-only in client view)":"No prompt — click Regen, or write one using the reference above"} style={{minHeight:90,fontSize:11,background:"var(--bg)"}} onChange={clientMode?undefined:(e=>{const v=e.target.value;setRules(p=>p.map(x=>x.id===r.id?{...x,fields:{...x.fields,"Scoring Prompt":v}}:x))})} onBlur={clientMode?undefined:(async e=>{try{await at("update","Task Rules",{records:[{id:r.id,fields:{"Scoring Prompt":e.target.value}}]},bid)}catch{}})}/>
   <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"var(--t3)",marginTop:4}}>
     <span>{f["Scoring Prompt"]?f["Scoring Prompt"].length+" chars":"⚠️ Empty — task name/description will be used"}</span>

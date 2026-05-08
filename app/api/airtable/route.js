@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
+import { trackOpenAIUsage, resetCampaignAIUsage } from "@/lib/ai-usage";
 
 // 5-minute timeout: required for Top X scans on large lead lists (5K-10K records).
 // At 10K leads:
@@ -667,7 +668,7 @@ async function updateCampaign(records) {
 // TOP X SCORING ENGINE
 // ═══════════════════════════════════════════════════════════════
 
-async function runTopXScoring(baseId, rule) {
+async function runTopXScoring(baseId, rule, campaignId = null) {
   const scanTarget = rule.scanTarget || "leads";
   const topN = rule.topN || 10;
   const scoringFields = rule.scoringFields || [];
@@ -835,6 +836,7 @@ Return ONLY JSON: [{"idx":0,"score":85,"reason":"max 15 words explaining which d
             { role: "user", content: `Scoring Criteria:\n${scoringPrompt}\n\n${scoringFields.length > 0 ? "Scoring Fields (weighted): " + scoringFields.map(sf => sf.field + " (" + sf.weight + "%)").join(", ") + "\n\n" : ""}Records:\n${recordSummaries}` }
           ],
         });
+        trackOpenAIUsage({ campaignId, completion, action: "topx_score_batch" });
 
         const text = completion.choices[0]?.message?.content || "[]";
         const cleaned = text.replace(/```json\n?|```/g, "").trim();
@@ -898,6 +900,7 @@ Return ONLY JSON: [{"idx":0,"score":85,"reason":"max 15 words explaining which d
                 { role: "user", content: `Criteria:\n${scoringPrompt}\n\nRecord: ${item.name} — ${dataStr}` }
               ],
             });
+            trackOpenAIUsage({ campaignId, completion: retry, action: "topx_score_retry" });
             const rt = (retry.choices[0]?.message?.content || "").replace(/```json\n?|```/g, "").trim();
             const rd = JSON.parse(rt);
             if (rd.score !== undefined) {
@@ -1062,7 +1065,7 @@ CRITICAL RULES:
 
 Return only the JSON. No explanations outside the "notes" field.`;
 
-async function compileTopXRules(baseId, { prompt, scanTarget }) {
+async function compileTopXRules(baseId, { prompt, scanTarget }, campaignId = null) {
   if (!OPENAI_KEY) return { error: "OPENAI_API_KEY not set in Vercel env" };
   if (!prompt || !prompt.trim()) return { error: "Prompt required" };
 
@@ -1138,6 +1141,7 @@ async function compileTopXRules(baseId, { prompt, scanTarget }) {
         { role: "user", content: userMessageParts.join("") },
       ],
     });
+    trackOpenAIUsage({ campaignId, completion, action: "compile_topx_rules" });
 
     const text = completion.choices[0]?.message?.content || "{}";
     const cleaned = text.replace(/```json\n?|```/g, "").trim();
@@ -1508,7 +1512,7 @@ function compiledRulesReferenceAccounts(compiled) {
 // Smart-compile mode runner: scores deterministically + optionally runs AI fuzzy adjustment
 // on borderline candidates. Total AI calls scale with O(1) for compile + O(N/15) for fuzzy
 // (where N is candidates in the borderline window), instead of O(records/15).
-async function runTopXSmartCompile(baseId, rule, compiled) {
+async function runTopXSmartCompile(baseId, rule, compiled, campaignId = null) {
   const scanTarget = rule.scanTarget || "leads";
   const topN = rule.topN || 10;
   const table = scanTarget === "accounts" ? "Accounts" : "Leads";
@@ -1638,6 +1642,7 @@ async function runTopXSmartCompile(baseId, rule, compiled) {
               { role: "user", content: `Criterion: ${fuzzyCheck.criterion}\n\nRecords (read ${fieldsToRead.join(", ")}):\n${summaries}` },
             ],
           });
+          trackOpenAIUsage({ campaignId, completion, action: "topx_fuzzy_check" });
           const text = completion.choices[0]?.message?.content || "[]";
           const cleaned = text.replace(/```json\n?|```/g, "").trim();
           try {
@@ -1812,6 +1817,11 @@ export async function POST(request) {
     const { action, table, records, recordIds, params, fieldNames, rule } = body;
     // baseId: use provided, else fall back to master
     const baseId = body.baseId || MASTER_BASE_ID;
+    // campaignId: optional. Used to attribute OpenAI usage costs to the right
+    // campaign for per-client billing. Frontend should send this for any action
+    // that triggers OpenAI calls (run_topx, compile_topx_rules, run_topx_smart).
+    // If missing, tracking is skipped silently — no error.
+    const campaignId = body.campaignId || null;
 
     if (!baseId) {
       return NextResponse.json({ error: "No baseId provided and no AIRTABLE_BASE_ID configured" }, { status: 500 });
@@ -1844,6 +1854,7 @@ export async function POST(request) {
       "compile_topx_rules",    // costs OpenAI tokens
       "run_topx",              // costs OpenAI tokens
       "run_topx_smart",        // costs OpenAI tokens
+      "reset_ai_usage",        // billing/admin operation — clients cannot reset their own meter
     ]);
     if (isFromClientPage && ADMIN_ONLY_ACTIONS.has(action)) {
       console.warn(`[SECURITY] Action "${action}" blocked from client-mode referer: ${referer}`);
@@ -2090,23 +2101,31 @@ export async function POST(request) {
         // If rule has Smart Compile enabled and a fresh compiled JSON, use that path.
         // Otherwise fall through to the legacy per-record AI scoring.
         if (rule.useSmartCompile && rule.compiledRules) {
-          const result = await runTopXSmartCompile(baseId, rule, rule.compiledRules);
+          const result = await runTopXSmartCompile(baseId, rule, rule.compiledRules, campaignId);
           return NextResponse.json(result);
         }
-        const result = await runTopXScoring(baseId, rule);
+        const result = await runTopXScoring(baseId, rule, campaignId);
         return NextResponse.json(result);
       }
       case "compile_topx_rules": {
         // Body shape: { prompt, scanTarget }
         if (!body.prompt) return NextResponse.json({ error: "prompt required" }, { status: 400 });
-        const result = await compileTopXRules(baseId, { prompt: body.prompt, scanTarget: body.scanTarget || "leads" });
+        const result = await compileTopXRules(baseId, { prompt: body.prompt, scanTarget: body.scanTarget || "leads" }, campaignId);
         return NextResponse.json(result);
       }
       case "run_topx_smart": {
         // Body shape: { rule, compiledRules } — caller passes the (possibly user-edited) compiled JSON
         if (!rule) return NextResponse.json({ error: "rule required" }, { status: 400 });
         if (!body.compiledRules) return NextResponse.json({ error: "compiledRules required" }, { status: 400 });
-        const result = await runTopXSmartCompile(baseId, rule, body.compiledRules);
+        const result = await runTopXSmartCompile(baseId, rule, body.compiledRules, campaignId);
+        return NextResponse.json(result);
+      }
+      case "reset_ai_usage": {
+        // Reset the campaign's accumulated AI usage counters back to zero.
+        // Used for monthly billing cycles — reset after invoicing the client.
+        // Stamps "AI Usage Reset At" so we know when the new accumulation period started.
+        if (!campaignId) return NextResponse.json({ error: "campaignId required" }, { status: 400 });
+        const result = await resetCampaignAIUsage(campaignId);
         return NextResponse.json(result);
       }
       default:

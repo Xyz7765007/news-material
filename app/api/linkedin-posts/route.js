@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
+import { trackOpenAIUsage } from "@/lib/ai-usage";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LINKEDIN POSTS — FETCH + SCORE + CREATE TASKS
@@ -761,7 +762,7 @@ OUTPUT JSON (no other text, no markdown):
 }`;
 }
 
-async function scorePost({ post, lead, campaignContext, systemPromptOverride, categoryHint }) {
+async function scorePost({ post, lead, campaignContext, systemPromptOverride, categoryHint, campaignId = null }) {
   const openai = new OpenAI({ apiKey: OPENAI_KEY });
   const f = lead.fields || {};
   const fullName = f.Name || f["Full Name"] || ((f["First Name"] || "") + " " + (f["Last Name"] || "")).trim() || "Unknown";
@@ -792,6 +793,7 @@ async function scorePost({ post, lead, campaignContext, systemPromptOverride, ca
         { role: "user", content: JSON.stringify(userPayload, null, 2) },
       ],
     });
+    trackOpenAIUsage({ campaignId, completion: c, action: "score_linkedin_post" });
     const raw = c.choices?.[0]?.message?.content || "{}";
     let parsed;
     try { parsed = JSON.parse(raw); } catch (e) {
@@ -1159,6 +1161,7 @@ async function runLinkedInPostScan({
       const scored = await scorePost({
         post, lead, campaignContext, systemPromptOverride,
         categoryHint: cat.category,
+        campaignId: campaignAirtableId,
       });
       progress.posts_scored++;
 

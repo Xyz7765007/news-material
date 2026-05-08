@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
+import { trackOpenAIUsage } from "@/lib/ai-usage";
 
 const UNIPILE_DSN = process.env.UNIPILE_DSN; // e.g. https://api1.unipile.com:13371
 const UNIPILE_KEY = process.env.UNIPILE_API_KEY;
@@ -284,7 +285,7 @@ async function atUpdate(baseId, table, records) {
 // AI: SELECT LEADS + PERSONALIZE MESSAGES
 // ═══════════════════════════════════════════════════════════════
 
-async function aiSelectLeads(leads, prompt, count) {
+async function aiSelectLeads(leads, prompt, count, campaignId = null) {
   if (!OPENAI_KEY || !leads.length) return leads.slice(0, count);
   const openai = new OpenAI({ apiKey: OPENAI_KEY });
   const leadList = leads.map((l, i) => {
@@ -304,6 +305,7 @@ async function aiSelectLeads(leads, prompt, count) {
         { role: "user", content: `Criteria:\n${prompt}\n\nLeads:\n${leadList}` },
       ],
     });
+    trackOpenAIUsage({ campaignId, completion: c, action: "ai_select_leads" });
     const text = c.choices[0]?.message?.content || "[]";
     const indices = JSON.parse(text.replace(/```json\n?|```/g, "").trim());
     return indices.filter(i => leads[i]).map(i => leads[i]).slice(0, count);
@@ -313,7 +315,7 @@ async function aiSelectLeads(leads, prompt, count) {
   }
 }
 
-async function aiPersonalizeMessageWithMeta(template, lead, signal, companyName) {
+async function aiPersonalizeMessageWithMeta(template, lead, signal, companyName, campaignId = null) {
   // Always do deterministic merge first — this is our safety net
   const deterministic = fillMergeFields(template, lead, signal, companyName);
 
@@ -418,6 +420,7 @@ RULES:
         { role: "user", content: userPrompt },
       ],
     });
+    trackOpenAIUsage({ campaignId, completion: c, action: "personalize_message" });
 
     const aiMsg = c.choices?.[0]?.message?.content?.trim();
     if (!aiMsg) {
@@ -450,9 +453,9 @@ RULES:
 }
 
 // Backward-compat wrapper: returns just the string (most callers use this)
-async function aiPersonalizeMessage(template, lead, signal, companyName) {
+async function aiPersonalizeMessage(template, lead, signal, companyName, campaignId = null) {
   try {
-    const result = await aiPersonalizeMessageWithMeta(template, lead, signal, companyName);
+    const result = await aiPersonalizeMessageWithMeta(template, lead, signal, companyName, campaignId);
     return result?.text || fillMergeFields(template, lead, signal, companyName);
   } catch (e) {
     console.error("[MERGE] aiPersonalizeMessage wrapper threw:", e.message);
@@ -467,7 +470,7 @@ async function aiPersonalizeMessage(template, lead, signal, companyName) {
 //   summary: 1-line summary of what they said
 //   suggested_action: 1 short sentence on what to do next
 //   confidence: 0-100 (how confident the classifier is)
-async function classifyReplyIntent(replyText, context = {}) {
+async function classifyReplyIntent(replyText, context = {}, campaignId = null) {
   if (!replyText || !replyText.trim()) {
     return { intent: "unclear", urgency: "low", summary: "Empty reply", suggested_action: "Wait for follow-up", confidence: 0 };
   }
@@ -537,6 +540,7 @@ Return JSON: {
         },
       ],
     });
+    trackOpenAIUsage({ campaignId, completion: c, action: "classify_reply" });
 
     const raw = c.choices?.[0]?.message?.content || "{}";
     let parsed;
@@ -658,7 +662,7 @@ function validateMessage(msg, context = "message") {
 // QUEUE PROCESSING — THE AUTOMATION ENGINE
 // ═══════════════════════════════════════════════════════════════
 
-async function processOutreachQueue(baseId, accountId, ruleConfig) {
+async function processOutreachQueue(baseId, accountId, ruleConfig, campaignId = null) {
   const now = new Date();
   const today = now.toISOString().slice(0, 10);
   const log = [];
@@ -701,7 +705,7 @@ async function processOutreachQueue(baseId, accountId, ruleConfig) {
         if (!linkedinUrl) continue;
 
         const connMsg = ruleConfig.connectionMessage
-          ? await aiPersonalizeMessage(ruleConfig.connectionMessage, f, f.Signal || "", f.Company || "")
+          ? await aiPersonalizeMessage(ruleConfig.connectionMessage, f, f.Signal || "", f.Company || "", campaignId)
           : undefined;
 
         const res = await sendInvitation(accountId, linkedinUrl, connMsg);
@@ -757,7 +761,7 @@ async function processOutreachQueue(baseId, accountId, ruleConfig) {
 
         const step = sequence[dmStep];
         const msg = step.aiGenerate
-          ? await aiPersonalizeMessage(step.message, f, f.Signal || "", f.Company || "")
+          ? await aiPersonalizeMessage(step.message, f, f.Signal || "", f.Company || "", campaignId)
           : fillMergeFields(step.message, f, f.Signal || "", f.Company || "");
 
         // If we have an existing chat, send a follow-up message there instead of starting new
@@ -810,7 +814,7 @@ async function processOutreachQueue(baseId, accountId, ruleConfig) {
 // ENQUEUE LEADS — auto mode (AI-selected) or manual mode
 // ═══════════════════════════════════════════════════════════════
 
-async function enqueueLeads(baseId, ruleConfig, options = {}) {
+async function enqueueLeads(baseId, ruleConfig, options = {}, campaignId = null) {
   const { mode = "auto", selectedIds = [], count = 10 } = options;
 
   // Load all leads
@@ -850,7 +854,7 @@ async function enqueueLeads(baseId, ruleConfig, options = {}) {
     if (!eligible.length) return { error: "No eligible leads (all already in outreach or missing LinkedIn URL)", enqueued: 0, skippedDupes };
 
     // AI selects the best leads
-    eligible = await aiSelectLeads(eligible, ruleConfig.leadPrompt || "", count);
+    eligible = await aiSelectLeads(eligible, ruleConfig.leadPrompt || "", count, campaignId);
   }
 
   if (!eligible.length) return { error: "No eligible leads after dedup", enqueued: 0, skippedDupes };
@@ -909,7 +913,7 @@ async function enqueueLeads(baseId, ruleConfig, options = {}) {
 // MANUAL CONNECTIONS — send X connection requests to selected leads
 // ═══════════════════════════════════════════════════════════════
 
-async function sendManualConnections(baseId, accountId, outreachItemIds, ruleConfig) {
+async function sendManualConnections(baseId, accountId, outreachItemIds, ruleConfig, campaignId = null) {
   const now = new Date();
   const queue = await atList(baseId, "Outreach");
   const items = queue.filter(q => outreachItemIds.includes(q.id));
@@ -924,7 +928,7 @@ async function sendManualConnections(baseId, accountId, outreachItemIds, ruleCon
     if (f.Status !== "queued") continue;
     if (!f["LinkedIn URL"]) continue;
     const connMsg = ruleConfig.connectionMessage
-      ? await aiPersonalizeMessage(ruleConfig.connectionMessage, f, f.Signal || "", f.Company || "")
+      ? await aiPersonalizeMessage(ruleConfig.connectionMessage, f, f.Signal || "", f.Company || "", campaignId)
       : undefined;
     if (connMsg) {
       const v = validateMessage(connMsg, "connection_note");
@@ -1003,7 +1007,7 @@ async function triggerManualDMs(baseId, accountId, outreachItemIds, ruleConfig) 
       continue;
     }
     const msg = step.aiGenerate
-      ? await aiPersonalizeMessage(step.message, f, f.Signal || "", f.Company || "")
+      ? await aiPersonalizeMessage(step.message, f, f.Signal || "", f.Company || "", campaignId)
       : fillMergeFields(step.message, f, f.Signal || "", f.Company || "");
     const v = validateMessage(msg, `dm_step_${dmStep + 1}`);
     if (!v.ok) {
@@ -1124,6 +1128,8 @@ export async function POST(request) {
     }
     const body = await request.json();
     const { action, baseId, accountId } = body;
+    // campaignId for AI cost tracking — optional, silent skip if missing
+    const campaignId = body.campaignId || null;
 
     // Test_unipile is a diagnostic — let it run even without env vars to tell user what's missing
     if (action === "test_unipile") {
@@ -1274,7 +1280,7 @@ export async function POST(request) {
         // Safety: hard cap manual/auto adds
         const count = Math.min(body.count || body.ruleConfig?.leadsPerBatch || 10, 100);
         const options = { mode: body.mode || "auto", selectedIds: body.selectedIds || [], count };
-        const result = await enqueueLeads(baseId, body.ruleConfig || {}, options);
+        const result = await enqueueLeads(baseId, body.ruleConfig || {}, options, campaignId);
         return NextResponse.json(result);
       }
 
@@ -1298,7 +1304,7 @@ export async function POST(request) {
           // Default template if ruleConfig doesn't provide one
           const template = body.template || `Hi {first_name}, noticed you've been exploring our site — figured it's worth connecting. Happy to share what we've been working on if useful.`;
 
-          const result = await aiPersonalizeMessageWithMeta(template, leadRecord, signal, f.Company || "");
+          const result = await aiPersonalizeMessageWithMeta(template, leadRecord, signal, f.Company || "", campaignId);
 
           return NextResponse.json({
             ok: true,
@@ -1425,7 +1431,7 @@ export async function POST(request) {
 
         // Step 1: enqueue this single lead
         const enqueueOptions = { mode: "manual", selectedIds: [body.leadId], count: 1 };
-        const enqueueResult = await enqueueLeads(baseId, body.ruleConfig || {}, enqueueOptions);
+        const enqueueResult = await enqueueLeads(baseId, body.ruleConfig || {}, enqueueOptions, campaignId);
         if (enqueueResult.error) return NextResponse.json({ error: `Enqueue failed: ${enqueueResult.error}` }, { status: 400 });
 
         // Find the newly created outreach record for this lead
@@ -1440,7 +1446,7 @@ export async function POST(request) {
         if (!outreachItem) return NextResponse.json({ error: "Could not find queued outreach item — might already be in a different state" }, { status: 400 });
 
         // Step 2: send the connection immediately
-        const sendResult = await sendManualConnections(baseId, accountId, [outreachItem.id], body.ruleConfig || {});
+        const sendResult = await sendManualConnections(baseId, accountId, [outreachItem.id], body.ruleConfig || {}, campaignId);
         return NextResponse.json({ ok: true, sent: sendResult.sent || 0, failed: sendResult.failed || 0, result: sendResult });
       }
 
@@ -1461,7 +1467,7 @@ export async function POST(request) {
         if (ids.length > SAFE_DAILY_CAP) {
           return NextResponse.json({ error: `Safety limit: max ${SAFE_DAILY_CAP} connection requests per batch to protect the account`, attempted: ids.length }, { status: 400 });
         }
-        const result = await sendManualConnections(baseId, accountId, ids, body.ruleConfig || {});
+        const result = await sendManualConnections(baseId, accountId, ids, body.ruleConfig || {}, campaignId);
         return NextResponse.json(result);
       }
 
@@ -1531,7 +1537,7 @@ export async function POST(request) {
               leadTitle: f.Title || "",
               leadCompany: f.Company || "",
               priorMessage,
-            });
+            }, campaignId);
           }
 
           // Build the Airtable update — include classification fields if we got them
@@ -1630,7 +1636,7 @@ export async function POST(request) {
       case "classify_reply_text": {
         const { replyText, leadName, leadTitle, leadCompany, priorMessage } = body;
         if (!replyText) return NextResponse.json({ error: "replyText required" }, { status: 400 });
-        const result = await classifyReplyIntent(replyText, { leadName, leadTitle, leadCompany, priorMessage });
+        const result = await classifyReplyIntent(replyText, { leadName, leadTitle, leadCompany, priorMessage }, campaignId);
         return NextResponse.json({ ok: true, ...result });
       }
 
@@ -1648,7 +1654,7 @@ export async function POST(request) {
           leadTitle: f.Title || "",
           leadCompany: f.Company || "",
           priorMessage: body.priorMessage || "",
-        });
+        }, campaignId);
         try {
           await atUpdate(baseId, "Outreach", [{ id: body.outreachId, fields: {
             "Reply Intent": classification.intent,
@@ -1665,7 +1671,7 @@ export async function POST(request) {
 
       case "process_queue": {
         if (!baseId || !accountId) return NextResponse.json({ error: "baseId and accountId required" }, { status: 400 });
-        const result = await processOutreachQueue(baseId, accountId, body.ruleConfig || {});
+        const result = await processOutreachQueue(baseId, accountId, body.ruleConfig || {}, campaignId);
         return NextResponse.json(result);
       }
 
