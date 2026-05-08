@@ -14,6 +14,29 @@ export const maxDuration = 300;
 let _openai;
 function getOpenAI() { if (!_openai) _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY }); return _openai; }
 
+// ─── Neutral System Prompt Feature Flag ──────────────────────────────
+// The default system prompt prepends a 5-band calibration scale (90-100 exact
+// match, 70-89 strong match, etc.) and instructs the AI to "drop everything
+// below threshold." That fights user prompts with hard caps (e.g. V4 marketing
+// signal: "no marketing entity → score ≤25") because the AI resolves the
+// conflict by anchoring at the threshold floor (clusters at 70-72) and
+// silently overriding the user's gating logic.
+//
+// Setting NEUTRAL_PROMPT_ENABLED=true OR adding the campaign's Airtable record
+// ID to NEUTRAL_PROMPT_CAMPAIGN_IDS (comma-separated) switches that campaign
+// to a neutral system prompt that:
+//   1. Drops the calibration bands (user prompt is sole authority)
+//   2. Stops telling the AI to drop below threshold (server filters post-hoc)
+//   3. Explicitly asks the AI to apply user-defined caps mechanically
+//
+// Roll out per-campaign first via NEUTRAL_PROMPT_CAMPAIGN_IDS to validate
+// before flipping NEUTRAL_PROMPT_ENABLED globally.
+function isNeutralPromptEnabled(campaignId) {
+  if (process.env.NEUTRAL_PROMPT_ENABLED === "true") return true;
+  const list = (process.env.NEUTRAL_PROMPT_CAMPAIGN_IDS || "").split(",").map(s => s.trim()).filter(Boolean);
+  return campaignId && list.includes(campaignId);
+}
+
 // ─── Apify Token Fallback ─────────────────────────────────────────
 // Supports 3 Apify accounts. If one is exhausted, falls back to the next.
 // Env vars: APIFY_TOKEN, APIFY_TOKEN_2, APIFY_TOKEN_3
@@ -273,7 +296,13 @@ async function fetchArticle(url) {
       // returns an HTML page that meta-refreshes or JS-redirects to the actual
       // publisher URL. fetch() doesn't follow these by default. We extract the
       // destination URL and re-fetch ONCE (avoid loops with followedRedirect flag).
-      if (!followedRedirect && html.length < 8000) {
+      //
+      // 2026-05-08: Bumped threshold from 8000 → 30000. Google News interstitial
+      // pages have grown over time (now include inline JS bundles for analytics +
+      // consent management). At 8KB cap we were skipping redirect detection on
+      // pages that genuinely WERE redirectors, falling through to extraction
+      // which produced thin_body. 30KB still excludes real article pages.
+      if (!followedRedirect && html.length < 30000) {
         // Try multiple redirect patterns publishers/Google News use
         const metaRefresh = html.match(/<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["'][^"']*?url=([^"'\s>]+)/i);
         const jsLocation = html.match(/(?:window\.location|location\.href|location\.replace)\s*=?\s*\(?\s*["']([^"']+)["']/i);
@@ -287,8 +316,30 @@ async function fetchArticle(url) {
           continue; // retry loop with new URL, doesn't count against maxAttempts intent (but does count as attempt)
         }
       }
-      const art = html.match(/<article[^>]*>([\s\S]*?)<\/article>/i);
-      let text = art ? art[1] : (html.match(/<p[^>]*>([\s\S]*?)<\/p>/gi) || []).join(" ");
+      // ── Article body extraction ──
+      // Try multiple container patterns in order of specificity:
+      //   1. <article> tag (most semantically correct, used by most publishers)
+      //   2. <main> tag (HTML5 main content landmark)
+      //   3. <div role="article"> or [itemtype*="Article"] (ARIA / schema.org)
+      //   4. Common article-body class names (wp/medium/substack/cms patterns)
+      //   5. Fallback: all <p> tags joined (catches sites with non-standard markup)
+      //
+      // 2026-05-08: was only #1 + #5. Sites using Next.js / React article shells
+      // often render the body inside a <div class="article-body"> with no
+      // <article> tag and <p> tags scattered across nav/footer/related-articles
+      // — the all-<p>-tags fallback then pulled in nav text and produced thin
+      // off-topic bodies. The intermediate selectors recover those cases.
+      const tryExtract = (pattern) => {
+        const m = html.match(pattern);
+        return m ? m[1] : null;
+      };
+      let text =
+        tryExtract(/<article[^>]*>([\s\S]*?)<\/article>/i) ||
+        tryExtract(/<main[^>]*>([\s\S]*?)<\/main>/i) ||
+        tryExtract(/<div[^>]+role=["']article["'][^>]*>([\s\S]*?)<\/div>\s*(?:<\/div>|<footer|<aside)/i) ||
+        tryExtract(/<[^>]+itemtype=["'][^"']*Article[^"']*["'][^>]*>([\s\S]*?)<\/(?:div|article|section)>/i) ||
+        tryExtract(/<div[^>]+class=["'][^"']*(?:article-body|article-content|story-body|story-content|post-content|entry-content|article__body|c-article-body)[^"']*["'][^>]*>([\s\S]*?)<\/div>\s*(?:<\/div>|<footer|<aside)/i) ||
+        (html.match(/<p[^>]*>([\s\S]*?)<\/p>/gi) || []).join(" ");
       const cleaned = text
         .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
         .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
@@ -298,8 +349,17 @@ async function fetchArticle(url) {
         .trim()
         .slice(0, 800);
       if (cleaned.length < 50) {
-        // Too thin to be useful — don't retry (the page genuinely has no extractable text)
-        return { content: cleaned, error: "thin_body" };
+        // Too thin to be useful — don't retry (the page genuinely has no extractable text).
+        // Split into 3 codes so the scan summary tells us WHICH stage failed:
+        //   - thin_redirect: small HTML, redirect detection ran but found nothing → likely
+        //     a Google News interstitial whose redirect mechanism isn't in our pattern list
+        //   - thin_extraction: full-size HTML reached, but no article container matched →
+        //     likely a JS-rendered SPA where the body is in React state, not static HTML
+        //   - thin_body: fallback for everything else (paywall landings, bot pages, etc.)
+        let errCode = "thin_body";
+        if (html.length < 8000 && !followedRedirect) errCode = "thin_redirect";
+        else if (html.length >= 8000) errCode = "thin_extraction";
+        return { content: cleaned, error: errCode };
       }
       return { content: cleaned, error: null };
     } catch (e) {
@@ -800,7 +860,35 @@ async function classify(signals, taskDefs, companyName, mode, threshold = 50, ca
     // Score tiers are descriptive guideposts — the threshold (set by the user via the
     // slider in the UI) is the AUTHORITATIVE cutoff. We describe what each band MEANS
     // but never tell the AI to "reject" or "drop" based on tiers — only based on threshold.
-    const sysPrompt = `You are scoring ${mode === "jobs" ? "job postings" : `news articles about "${companyName}"`} against ONE specific task: "${taskName}".
+    //
+    // FEATURE-FLAGGED NEUTRAL PROMPT: when NEUTRAL_PROMPT_ENABLED=true or the
+    // campaign is in NEUTRAL_PROMPT_CAMPAIGN_IDS, we use a neutral prompt that
+    // drops the calibration bands (which fight V4-style user prompts with hard
+    // caps) and stops asking the AI to filter on threshold. See isNeutralPromptEnabled
+    // comment block at top of file for full reasoning.
+    const useNeutralPrompt = isNeutralPromptEnabled(campaignId);
+    const sysPrompt = useNeutralPrompt
+      ? `You are scoring ${mode === "jobs" ? "job postings" : `news articles about "${companyName}"`} against ONE specific task: "${taskName}".
+
+The user's scoring criteria below is the COMPLETE and AUTHORITATIVE guide to how scores are assigned. Apply it MECHANICALLY — including:
+- Hard caps (e.g. "if X is missing, score must be ≤25")
+- Multi-step procedures that must be applied in order
+- Self-verification checks the criteria require you to perform before returning a score
+- Specific score bands tied to specific evidence in the criteria
+
+Do NOT substitute your own intuition about what counts as a "strong match" — the user has defined that. Do NOT anchor your scores at any particular value. Score each signal HONESTLY per the user's criteria — return the score the criteria actually produce, even if that means returning low scores for most signals.
+
+The server applies the user's threshold as a post-hoc filter. Score every signal you receive; the server will drop signals below threshold. Do NOT pre-filter on threshold. Do NOT nudge scores up to meet the threshold or down to be safe.
+
+Output format (strict JSON, no markdown):
+{
+  "matches": [
+    { "idx": <original index from input>, "score": <0-100 integer>, "reason": "<1 sentence, max 140 chars>" }
+  ]
+}
+
+Return one entry per signal you have scored (one per [N] index in the input). Use the score the user's criteria produce.`
+      : `You are scoring ${mode === "jobs" ? "job postings" : `news articles about "${companyName}"`} against ONE specific task: "${taskName}".
 
 The user has provided their scoring criteria below. Use it AS THE PRIMARY GUIDE — it overrides any generic intuition.
 

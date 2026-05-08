@@ -7770,8 +7770,12 @@ function RuleEditor({rule,onSave,onClose,availableFields,baseId}){
 // ═══════════════════════════════════════════════════════════════
 function ExportModal({ tasks, accounts, leads, onClose }) {
   // Task columns
-  const allTaskCols = [...new Set(tasks.flatMap(t => Object.keys(t.fields || {})))];
-  const defaultCols = ["Company","Task Rule","Score","Scan Target","Signal","Source","Task Type","Date","URL"];
+  const defaultCols = ["Company","Task Rule","Score","Score Reason","Scan Target","Signal","Source","Task Type","Date","URL"];
+  // Union of fields seen on existing tasks AND the default column list, so columns
+  // like "Score Reason" appear as selectable even when no current task has the
+  // field populated yet (Airtable strips empty-string fields from API responses).
+  const seenCols = [...new Set(tasks.flatMap(t => Object.keys(t.fields || {})))];
+  const allTaskCols = [...new Set([...seenCols, ...defaultCols])];
   const [selectedCols, setSelectedCols] = useState(() => allTaskCols.filter(c => defaultCols.includes(c)));
 
   // Enrichment columns from Accounts/Leads (exclude join keys)
