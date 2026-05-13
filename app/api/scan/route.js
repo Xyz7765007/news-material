@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import { trackOpenAIUsage } from "@/lib/ai-usage";
+import { decodeGoogleNewsUrl } from "@/lib/google-news-decoder";
 
 // 5-minute Vercel function timeout. News scan per company:
 //   - 1 RSS fetch (~1-2s)
@@ -503,7 +504,44 @@ async function scanNews(company, taskDefs, threshold = 50, campaignId = null) {
   ).length;
   if (googleNewsRedirectorCount > 0) {
     const pct = Math.round((googleNewsRedirectorCount / dedupedRecent.length) * 100);
-    console.log(`  [NEWS] ${cleanName}: ${googleNewsRedirectorCount}/${dedupedRecent.length} URLs (${pct}%) are Google News redirectors — these may fail to fetch body content`);
+    console.log(`  [NEWS] ${cleanName}: ${googleNewsRedirectorCount}/${dedupedRecent.length} URLs (${pct}%) are Google News redirectors — decoding to publisher URLs...`);
+  }
+
+  // ── DECODE Google News redirector URLs to publisher URLs ──
+  // Google News RSS returns links of the form:
+  //   https://news.google.com/rss/articles/CBM...?oc=5
+  // The page at that URL is a JS-driven redirect (no HTTP 30x), so server-side
+  // fetch never reaches the publisher. The decoder unpacks the protobuf payload
+  // embedded in the URL (or falls back to a batchexecute RPC for newer URLs)
+  // to recover the real publisher URL. Once we have that, the existing
+  // fetchArticle pipeline works normally.
+  //
+  // We decode IN-PLACE (replace item.url) so the rest of the scan is unchanged.
+  // Concurrency is moderate (4) because the batchexecute RPC hits Google's
+  // own infra and we want to be polite. Simple base64 decode is local-only.
+  const DECODE_CONCURRENCY = 4;
+  let decodeStats = { attempted: 0, decoded: 0, failed: 0 };
+  for (let i = 0; i < dedupedRecent.length; i += DECODE_CONCURRENCY) {
+    const batch = dedupedRecent.slice(i, i + DECODE_CONCURRENCY);
+    await Promise.all(batch.map(async item => {
+      if (!item.url || !item.url.includes("news.google.com/rss/articles/")) return;
+      decodeStats.attempted++;
+      try {
+        const decoded = await decodeGoogleNewsUrl(item.url);
+        if (decoded) {
+          item.url = decoded;
+          decodeStats.decoded++;
+        } else {
+          decodeStats.failed++;
+        }
+      } catch (_) {
+        decodeStats.failed++;
+      }
+    }));
+  }
+  if (decodeStats.attempted > 0) {
+    const pct = Math.round((decodeStats.decoded / decodeStats.attempted) * 100);
+    console.log(`  [NEWS] ${cleanName}: Google News URL decode ${decodeStats.decoded}/${decodeStats.attempted} (${pct}%) — failures will fall back to legacy redirector handling`);
   }
 
   // Slice to 50. With 3-attempt fetcher (worst case ~26s per article) and
