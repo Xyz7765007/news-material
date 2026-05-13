@@ -4,7 +4,13 @@
   "installCommand": "npm install",
   "functions": {
     "app/api/**/*.js": {
-      "maxDuration": 299
+      "maxDuration": 600
     }
-  }
+  },
+  "crons": [
+    {
+      "path": "/api/cron/outreach",
+      "schedule": "0 6 * * *"
+    }
+  ]
 }

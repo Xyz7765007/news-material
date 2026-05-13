@@ -1,7 +1,17 @@
 import { NextResponse } from "next/server";
 
-// Vercel Cron — runs every 4 hours to process outreach queues
+// Force dynamic so Next.js doesn't cache the response. Without this,
+// Vercel's cron logs view may not show invocations because cached responses
+// are not logged as fresh invocations.
+export const dynamic = "force-dynamic";
+
+// Vercel Cron — runs daily at 6am UTC (11:30am IST) to process outreach queues
 // Reads active outreach rules from master base, processes each campaign's queue
+//
+// Hobby plan limit: 1 invocation per day. Pro plan can change schedule to
+// "0 */4 * * *" (every 4 hours) or finer.
+// For more frequent runs while on Hobby, use GitHub Actions cron pointing at
+// this same endpoint with the same CRON_SECRET Bearer token (see GITHUB_ACTIONS_CRON.md).
 
 const AIRTABLE_KEY = process.env.AIRTABLE_API_KEY;
 const MASTER_BASE_ID = process.env.AIRTABLE_BASE_ID;

@@ -202,6 +202,62 @@ async function getRelations(accountId, limit = 100) {
   return unipileReq(`/users/relations?account_id=${accountId}&limit=${limit}`);
 }
 
+// ─── Connection acceptance helpers ──────────────────────────────
+// Pre-2026-05-12 behavior: the `connection_sent` handler in processOutreachQueue
+// did NOT actually check Unipile for acceptance — it only bumped Next Action Date
+// to tomorrow, so records sat at `connection_sent` forever and DM sequences never
+// fired automatically. The only way to advance was clicking "Mark as Connected"
+// manually in the UI.
+//
+// New behavior: at the start of each queue run, if any items are at
+// `connection_sent`, we fetch the LinkedIn account's relations list ONCE
+// (paginated) and build a Set of normalized profile URLs. Each connection_sent
+// item is then checked against the Set in O(1). Found → flip to `connected` +
+// schedule DM #1. Not found → keep waiting (same behavior as before).
+//
+// Pagination notes:
+//  - Unipile's /users/relations endpoint accepts limit ≤ 100 and returns a
+//    `cursor` for the next page when more results exist.
+//  - We cap at MAX_PAGES (10) = up to 1000 relations. Accounts with more than
+//    1000 connections may have very old/deep relations that get missed; in
+//    practice the recently-accepted leads will be near the top of the feed
+//    (Unipile sorts most-recent first), so the cap is safe for our use case.
+
+const MAX_RELATIONS_PAGES = 10;
+
+function normalizeLinkedInUrl(url) {
+  if (!url || typeof url !== "string") return null;
+  let u = url.trim().toLowerCase();
+  if (!u) return null;
+  u = u.replace(/^https?:\/\//, "")
+       .replace(/^www\./, "")
+       .replace(/\/$/, "")
+       .split("?")[0]
+       .split("#")[0];
+  return u || null;
+}
+
+async function fetchRelationsLookup(accountId) {
+  const lookup = new Set();
+  let cursor = null;
+  let pageCount = 0;
+  do {
+    const params = new URLSearchParams({ account_id: accountId, limit: "100" });
+    if (cursor) params.set("cursor", cursor);
+    const res = await unipileReq(`/users/relations?${params.toString()}`);
+    if (!res.ok || !Array.isArray(res.data?.items)) break;
+    for (const rel of res.data.items) {
+      // Unipile returns relations with `profile_url` (most common) or
+      // `public_profile_url`. Both should normalize to the same thing.
+      const url = normalizeLinkedInUrl(rel.profile_url || rel.public_profile_url || "");
+      if (url) lookup.add(url);
+    }
+    cursor = res.data.cursor || res.data.next_cursor || null;
+    pageCount++;
+  } while (cursor && pageCount < MAX_RELATIONS_PAGES);
+  return lookup;
+}
+
 // ═══════════════════════════════════════════════════════════════
 // AIRTABLE HELPERS (direct, not via /api/airtable)
 // ═══════════════════════════════════════════════════════════════
@@ -683,6 +739,23 @@ async function processOutreachQueue(baseId, accountId, ruleConfig, campaignId = 
 
   let connSent = 0, dmsSent = 0, errors = 0;
 
+  // Pre-fetch the LinkedIn account's relations list once, if any items are
+  // pending acceptance check. Lets us flip `connection_sent` → `connected`
+  // automatically without N redundant Unipile API calls inside the loop.
+  let relationsLookup = null;
+  const hasConnSentItems = items.some(i => (i.fields?.Status || "queued") === "connection_sent");
+  if (hasConnSentItems) {
+    try {
+      relationsLookup = await fetchRelationsLookup(accountId);
+      console.log(`[OUTREACH] Pre-fetched ${relationsLookup.size} relations for acceptance check`);
+    } catch (e) {
+      console.error("[OUTREACH] Failed to fetch relations for acceptance check:", e.message);
+      // Fall through with relationsLookup=null → connection_sent items just
+      // get their Next Action Date bumped (same as old behavior). Safer than
+      // throwing — DM sequence for already-connected items still runs.
+    }
+  }
+
   for (const item of items) {
     // SAFETY: stop if caps hit
     if (connSent >= MAX_CONNECTIONS_PER_RUN && dmsSent >= MAX_DMS_PER_RUN) break;
@@ -726,12 +799,29 @@ async function processOutreachQueue(baseId, accountId, ruleConfig, campaignId = 
       }
       else if (status === "connection_sent") {
         // ─── Check if connection was accepted ────────────
-        // We check by trying to start a chat — if it works, they're connected
-        // For now, mark as connected if enough time has passed and move to DM phase
-        // The cron will re-check periodically
-        const daysGap = ruleConfig.daysAfterConnect || 2;
-        const nextDate = new Date(now.getTime() + 1 * 86400000).toISOString().slice(0, 10); // check again tomorrow
-        await atUpdate(baseId, "Outreach", [{ id: item.id, fields: { "Next Action Date": nextDate }}]);
+        // Look up the lead's LinkedIn URL in the pre-fetched relations Set.
+        // Found → they accepted → flip to `connected` and schedule first DM.
+        // Not found → either they haven't accepted yet OR they're beyond the
+        // first MAX_RELATIONS_PAGES * 100 connections in their LinkedIn list
+        // (rare; recent acceptances are at the top of Unipile's feed).
+        const linkedinUrl = f["LinkedIn URL"] || "";
+        const normalizedUrl = normalizeLinkedInUrl(linkedinUrl);
+        const isConnected = relationsLookup && normalizedUrl && relationsLookup.has(normalizedUrl);
+
+        if (isConnected) {
+          const daysGap = ruleConfig.daysAfterConnect || 2;
+          const nextDate = new Date(now.getTime() + daysGap * 86400000).toISOString().slice(0, 10);
+          await atUpdate(baseId, "Outreach", [{ id: item.id, fields: {
+            Status: "connected",
+            "Connection Accepted At": now.toISOString(),
+            "Next Action Date": nextDate,
+          }}]);
+          log.push(`✅ ${f.Name || "Lead"} accepted connection — DM in ${daysGap}d`);
+        } else {
+          // Not accepted yet — check again tomorrow. Same as old behavior.
+          const nextDate = new Date(now.getTime() + 1 * 86400000).toISOString().slice(0, 10);
+          await atUpdate(baseId, "Outreach", [{ id: item.id, fields: { "Next Action Date": nextDate }}]);
+        }
       }
       else if (status === "connected" || status.startsWith("dm_")) {
         // ─── REPLY GUARDRAIL: stop if lead already replied ─
