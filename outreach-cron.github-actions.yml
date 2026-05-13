@@ -1,0 +1,48 @@
+name: Outreach Cron (4-hour)
+
+# Runs every 4 hours, hits the production /api/cron/outreach endpoint.
+# Use this INSTEAD of (or IN ADDITION to) Vercel's built-in cron when you're
+# on Hobby plan and need more than 1 invocation per day.
+#
+# Setup:
+#   1. Place this file at .github/workflows/outreach-cron.yml in your news-material repo
+#   2. Add a repo secret: CRON_SECRET = signalscope_7765007 (or whatever your Vercel CRON_SECRET is)
+#      GitHub → Settings → Secrets and variables → Actions → New repository secret
+#   3. Commit + push. GitHub Actions runs the workflow automatically.
+#
+# Cost: free for public repos. Private repos get 2000 min/mo free; this workflow uses ~6 sec per run × 6 runs/day = ~10 min/month. Effectively free.
+#
+# To verify: GitHub repo → Actions tab → "Outreach Cron (4-hour)" workflow → see run history with timestamps and status.
+
+on:
+  schedule:
+    # Every 4 hours. Cron syntax in GitHub Actions is UTC.
+    # 0 */4 * * * = 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC
+    # = 5:30am, 9:30am, 1:30pm, 5:30pm, 9:30pm, 1:30am IST
+    - cron: "0 */4 * * *"
+  # Allow manual trigger from GitHub UI for testing
+  workflow_dispatch:
+
+jobs:
+  trigger-outreach-cron:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Hit Vercel outreach cron endpoint
+        run: |
+          response=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            https://news-material-eta.vercel.app/api/cron/outreach)
+          
+          # Extract HTTP status from response
+          http_status=$(echo "$response" | tail -n1 | sed 's/HTTP_STATUS://')
+          body=$(echo "$response" | sed '$d')
+          
+          echo "Status: $http_status"
+          echo "Response: $body"
+          
+          # Fail the workflow if status is not 2xx
+          if [ "$http_status" -lt 200 ] || [ "$http_status" -ge 300 ]; then
+            echo "::error::Cron endpoint returned $http_status"
+            exit 1
+          fi
