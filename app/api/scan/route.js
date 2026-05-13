@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import { trackOpenAIUsage } from "@/lib/ai-usage";
-import { decodeGoogleNewsUrl } from "@/lib/google-news-decoder";
+import { decodeGoogleNewsUrl, drainFailureStats } from "@/lib/google-news-decoder";
 
 // 5-minute Vercel function timeout. News scan per company:
 //   - 1 RSS fetch (~1-2s)
@@ -542,6 +542,14 @@ async function scanNews(company, taskDefs, threshold = 50, campaignId = null) {
   if (decodeStats.attempted > 0) {
     const pct = Math.round((decodeStats.decoded / decodeStats.attempted) * 100);
     console.log(`  [NEWS] ${cleanName}: Google News URL decode ${decodeStats.decoded}/${decodeStats.attempted} (${pct}%) — failures will fall back to legacy redirector handling`);
+    // If decoder failed for every URL, surface WHY. Without this the failure is
+    // silent and we can't diagnose. Logs only on 0% success — happy path stays quiet.
+    if (decodeStats.decoded === 0) {
+      const failures = drainFailureStats();
+      if (failures) {
+        console.log(`  [NEWS] ${cleanName}: decoder failure breakdown: ${JSON.stringify(failures)}`);
+      }
+    }
   }
 
   // Slice to 50. With 3-attempt fetcher (worst case ~26s per article) and
