@@ -183,6 +183,15 @@ export default function LeadMovementScanModal({ open, onClose, campaign, leads =
         batches++;
         setProgress({ ...acc, batchesCompleted: batches });
 
+        // Fatal upstream error (e.g. monthly quota exhausted) — stop and show clear msg
+        if (data.fatalError) {
+          acc.errors.push(data.fatalError);
+          setProgress({ ...acc, batchesCompleted: batches });
+          setPhase("error");
+          setErrorMsg(data.fatalError);
+          return;
+        }
+
         // Check cancel AGAIN before firing the next batch
         if (localCancel.value) {
           setPhase("done");

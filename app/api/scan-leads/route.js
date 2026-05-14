@@ -444,10 +444,17 @@ async function handleScan({
   console.log(`[lead-movement] Processing ${leadsToProcess.length} leads (concurrency ${concurrency})`);
 
   let apiCallsMade = 0;
+  let fatalQuotaError = false; // flips true on monthly_quota_exhausted; aborts remaining work
   const perCallCost = await getRapidAPICost(campaignId);
 
   // Process with concurrency control
   for (let i = 0; i < leadsToProcess.length; i += concurrency) {
+    // Abort the entire batch on fatal quota error — no point firing more calls
+    // that will all 429. Already-fired calls in this slice still complete.
+    if (fatalQuotaError) {
+      console.warn(`[lead-movement] aborting batch after ${apiCallsMade} calls — RapidAPI monthly quota exhausted`);
+      break;
+    }
     const slice = leadsToProcess.slice(i, i + concurrency);
     await Promise.all(slice.map(async (leadRec) => {
       const f = leadRec.fields || {};
@@ -479,6 +486,12 @@ async function handleScan({
       // Fire RapidAPI call
       const fetchResult = await fetchLinkedInProfile(lead.linkedinUrl);
       apiCallsMade++;
+
+      // Detect fatal API state (monthly quota exhausted) and signal the
+      // outer loop to stop firing more calls — we'd just waste them
+      if (fetchResult.fatal) {
+        fatalQuotaError = true;
+      }
 
       if (!fetchResult.ok) {
         processed.total++;
@@ -573,8 +586,12 @@ async function handleScan({
     leadsUpdated: updateResult.updated,
     costUSD: Math.round(batchCostUSD * 10000) / 10000,
     errors: errors.slice(0, 20), // cap to avoid response bloat
-    nextCursor: continuationCursor,
-    done: !continuationCursor,
+    nextCursor: fatalQuotaError ? null : continuationCursor,
+    done: fatalQuotaError || !continuationCursor,
+    // Surface fatal state so UI can show the right message
+    fatalError: fatalQuotaError
+      ? "RapidAPI monthly quota exhausted. Upgrade your plan at https://rapidapi.com/freshdata-freshdata-default/api/fresh-linkedin-profile-data or wait until your next billing cycle."
+      : null,
   };
 }
 
