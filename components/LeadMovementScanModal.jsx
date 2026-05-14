@@ -21,6 +21,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
  *   4. Show final summary with link to Tasks
  */
 export default function LeadMovementScanModal({ open, onClose, campaign, leads = [] }) {
+  console.log("[LeadMovementScanModal] FUNCTION CALLED — open prop =", open, "campaign =", campaign);
   const [phase, setPhase] = useState("preview"); // preview | scanning | done | error
   const [preview, setPreview] = useState(null);
   const [windowDays, setWindowDays] = useState(90);

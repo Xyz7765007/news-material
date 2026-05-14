@@ -2337,7 +2337,20 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
           {leadTags.map(t => <option key={t} value={t}>{t} ({leads.filter(l=>(l.fields||{})["Campaign Tag"]===t).length})</option>)}
         </select>}
         {!clientMode&&<label className="btn btn-s" style={{cursor:"pointer"}}><I.Upload/> Upload CSV<input type="file" accept=".csv" hidden onChange={e=>{if(e.target.files[0])handleCSVFile(e.target.files[0],"Leads",setLeads)}}/></label>}
-        {!clientMode&&<button className="btn btn-s btn-p" onClick={()=>{alert("Movement Scan button clicked! Opening modal now…");console.log("[Movement Scan] button clicked, opening modal");setShowLeadMovementModal(true);}} title="Scan LinkedIn for newly hired / promoted / exited leads">🧭 Movement Scan</button>}
+        {!clientMode&&<button className="btn btn-s btn-p" onClick={()=>{
+          console.log("="+"=".repeat(60));
+          console.log("[Movement Scan] STEP 1: click handler entered (build DEBUG-3)");
+          // DIRECT DOM marker — bypasses React entirely, proves click reaches this point
+          const marker = document.createElement('div');
+          marker.style.cssText = 'position:fixed;top:20px;right:20px;background:#0a0;color:#fff;padding:15px 25px;border-radius:8px;z-index:99999;font-family:monospace;font-size:14px;box-shadow:0 4px 16px rgba(0,0,0,0.5);';
+          marker.textContent = '✓ Click handler fired (DEBUG-3)';
+          document.body.appendChild(marker);
+          setTimeout(()=>marker.remove(), 8000);
+          console.log("[Movement Scan] STEP 2: DOM marker inserted (top-right of page, green box)");
+          console.log("[Movement Scan] STEP 3: about to call setShowLeadMovementModal(true)");
+          setShowLeadMovementModal(true);
+          console.log("[Movement Scan] STEP 4: setShowLeadMovementModal called — next render should show modal");
+        }} title="Scan LinkedIn for newly hired / promoted / exited leads">🧭 Movement Scan</button>}
       </div></div>
 
     {filteredLeads.length===0?<div className="empty"><div className="em">👤</div><p>{leads.length>0?"No leads match this campaign filter.":"Upload a CSV."}</p></div>:
@@ -4192,7 +4205,7 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
       {msg && <div style={{marginTop:14,padding:10,background:msg.startsWith("✅")?"var(--grn-d)":msg.startsWith("⏳")||msg.startsWith("🔗")?"var(--hover)":"var(--red-d)",color:msg.startsWith("✅")?"var(--grn)":msg.startsWith("⏳")||msg.startsWith("🔗")?"var(--t2)":"var(--red)",borderRadius:6,fontSize:11,whiteSpace:"pre-wrap"}}>{msg}</div>}
 
       {/* Lead Movement Scan Modal — RapidAPI Fresh LinkedIn Profile Data */}
-      {showLeadMovementModal && console.log("[Movement Scan] modal rendering, camp=", camp?.airtableId, "baseId=", camp?.baseId, "leads.length=", leads?.length)}
+      {(()=>{ console.log("[Movement Scan] RENDER (SignalScope JSX): showLeadMovementModal =", showLeadMovementModal); return null; })()}
       <LeadMovementScanModal
         open={showLeadMovementModal}
         onClose={()=>{
