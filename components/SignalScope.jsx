@@ -3271,6 +3271,28 @@ Output format (strict JSON, no markdown):
     <I.Upload/> {csvModal.mode==="update"?"Update & Import":"Import"} {csvModal.rows.length} rows
   </button></div>
   </div></div>)}
+
+  {/* Lead Movement Scan Modal — RapidAPI Fresh LinkedIn Profile Data */}
+  {(()=>{ console.log("[Movement Scan] RENDER (SignalScope JSX): showLeadMovementModal =", showLeadMovementModal); return null; })()}
+  <LeadMovementScanModal
+    open={showLeadMovementModal}
+    onClose={()=>{
+      setShowLeadMovementModal(false);
+      // Refresh tasks + leads so new movement tasks and updated lead fields show in UI
+      (async()=>{
+        try{
+          const [t,l] = await Promise.all([
+            at("list","Tasks",{},bid),
+            at("list","Leads",{},bid),
+          ]);
+          setTasks((t.records||[]).sort((a,b)=>((b.fields?.Created||"")>(a.fields?.Created||"")?1:-1)));
+          setLeads(l.records||[]);
+        }catch(e){console.error("Post-scan refresh failed",e);}
+      })();
+    }}
+    campaign={camp ? { airtableId: camp.airtableId, baseId: camp.baseId } : null}
+    leads={leads}
+  />
   </>);
 }
 
@@ -4207,28 +4229,6 @@ function GoogleAnalyticsCard({ baseId, campaign, onSyncComplete }) {
 
       {/* STATUS MESSAGE */}
       {msg && <div style={{marginTop:14,padding:10,background:msg.startsWith("✅")?"var(--grn-d)":msg.startsWith("⏳")||msg.startsWith("🔗")?"var(--hover)":"var(--red-d)",color:msg.startsWith("✅")?"var(--grn)":msg.startsWith("⏳")||msg.startsWith("🔗")?"var(--t2)":"var(--red)",borderRadius:6,fontSize:11,whiteSpace:"pre-wrap"}}>{msg}</div>}
-
-      {/* Lead Movement Scan Modal — RapidAPI Fresh LinkedIn Profile Data */}
-      {(()=>{ console.log("[Movement Scan] RENDER (SignalScope JSX): showLeadMovementModal =", showLeadMovementModal); return null; })()}
-      <LeadMovementScanModal
-        open={showLeadMovementModal}
-        onClose={()=>{
-          setShowLeadMovementModal(false);
-          // Refresh tasks + leads so the new movement tasks and updated lead fields show in the UI
-          (async()=>{
-            try{
-              const [t,l] = await Promise.all([
-                at("list","Tasks",{},bid),
-                at("list","Leads",{},bid),
-              ]);
-              setTasks((t.records||[]).sort((a,b)=>((b.fields?.Created||"")>(a.fields?.Created||"")?1:-1)));
-              setLeads(l.records||[]);
-            }catch(e){console.error("Post-scan refresh failed",e);}
-          })();
-        }}
-        campaign={camp ? { airtableId: camp.airtableId, baseId: camp.baseId } : null}
-        leads={leads}
-      />
     </div>
   );
 }
