@@ -2338,18 +2338,22 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         </select>}
         {!clientMode&&<label className="btn btn-s" style={{cursor:"pointer"}}><I.Upload/> Upload CSV<input type="file" accept=".csv" hidden onChange={e=>{if(e.target.files[0])handleCSVFile(e.target.files[0],"Leads",setLeads)}}/></label>}
         {!clientMode&&<button className="btn btn-s btn-p" onClick={()=>{
-          console.log("="+"=".repeat(60));
-          console.log("[Movement Scan] STEP 1: click handler entered (build DEBUG-3)");
-          // DIRECT DOM marker — bypasses React entirely, proves click reaches this point
-          const marker = document.createElement('div');
-          marker.style.cssText = 'position:fixed;top:20px;right:20px;background:#0a0;color:#fff;padding:15px 25px;border-radius:8px;z-index:99999;font-family:monospace;font-size:14px;box-shadow:0 4px 16px rgba(0,0,0,0.5);';
-          marker.textContent = '✓ Click handler fired (DEBUG-3)';
-          document.body.appendChild(marker);
-          setTimeout(()=>marker.remove(), 8000);
-          console.log("[Movement Scan] STEP 2: DOM marker inserted (top-right of page, green box)");
-          console.log("[Movement Scan] STEP 3: about to call setShowLeadMovementModal(true)");
-          setShowLeadMovementModal(true);
-          console.log("[Movement Scan] STEP 4: setShowLeadMovementModal called — next render should show modal");
+          try {
+            console.log("[Movement Scan DEBUG-4] STEP 1: handler started");
+            const banner = document.createElement('div');
+            banner.id = '_lmm_test_banner_v4';
+            banner.textContent = 'MOVEMENT SCAN CLICKED — DEBUG-4 BUILD';
+            banner.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:red;color:white;padding:40px 60px;font-size:24px;font-weight:bold;z-index:2147483647;border-radius:12px;box-shadow:0 0 40px rgba(255,0,0,0.8);';
+            document.body.appendChild(banner);
+            setTimeout(()=>{const el=document.getElementById('_lmm_test_banner_v4');if(el)el.remove();}, 6000);
+            console.log("[Movement Scan DEBUG-4] STEP 2: banner inserted");
+            console.log("[Movement Scan DEBUG-4] STEP 3: about to setState");
+            setShowLeadMovementModal(true);
+            console.log("[Movement Scan DEBUG-4] STEP 4: setState called");
+          } catch (err) {
+            console.error("[Movement Scan DEBUG-4] ❌ EXCEPTION:", err);
+            alert("Movement Scan error: " + err.message);
+          }
         }} title="Scan LinkedIn for newly hired / promoted / exited leads">🧭 Movement Scan</button>}
       </div></div>
 
