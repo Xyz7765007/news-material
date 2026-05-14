@@ -357,6 +357,7 @@ async function handleScan({
 }) {
   const errors = [];
   const processed = { total: 0, hired: 0, promoted: 0, exited: 0, none: 0, stale: 0, unavailable: 0 };
+  const errorTallies = {}; // error code → count, surfaced in batch summary
   const tasksToCreate = [];
   const leadsToUpdate = [];
 
@@ -482,6 +483,9 @@ async function handleScan({
       if (!fetchResult.ok) {
         processed.total++;
         processed.unavailable++;
+        // Tally per-error-code so the batch summary reveals what's actually failing
+        const code = fetchResult.error || "unknown";
+        errorTallies[code] = (errorTallies[code] || 0) + 1;
         leadsToUpdate.push({
           id: lead.id,
           fields: {
@@ -554,6 +558,13 @@ async function handleScan({
     `${processed.none}N / ${processed.stale}S / ${processed.unavailable}U; ` +
     `tasks created: ${taskResult.created}; cost: $${batchCostUSD.toFixed(4)}`
   );
+  if (Object.keys(errorTallies).length > 0) {
+    const breakdown = Object.entries(errorTallies)
+      .sort((a, b) => b[1] - a[1])
+      .map(([code, count]) => `${code}=${count}`)
+      .join(", ");
+    console.log(`[lead-movement] error breakdown: ${breakdown}`);
+  }
 
   return {
     ok: true,

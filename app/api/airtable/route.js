@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import { trackOpenAIUsage, resetCampaignAIUsage } from "@/lib/ai-usage";
+import { resetCampaignRapidAPIUsage } from "@/lib/rapidapi-usage";
 
 // 5-minute timeout: required for Top X scans on large lead lists (5K-10K records).
 // At 10K leads:
@@ -1872,6 +1873,7 @@ export async function POST(request) {
       "run_topx",              // costs OpenAI tokens
       "run_topx_smart",        // costs OpenAI tokens
       "reset_ai_usage",        // billing/admin operation — clients cannot reset their own meter
+      "reset_rapidapi_usage",  // same protection for the RapidAPI billing meter
     ]);
     if (isFromClientPage && ADMIN_ONLY_ACTIONS.has(action)) {
       console.warn(`[SECURITY] Action "${action}" blocked from client-mode referer: ${referer}`);
@@ -2143,6 +2145,13 @@ export async function POST(request) {
         // Stamps "AI Usage Reset At" so we know when the new accumulation period started.
         if (!campaignId) return NextResponse.json({ error: "campaignId required" }, { status: 400 });
         const result = await resetCampaignAIUsage(campaignId);
+        return NextResponse.json(result);
+      }
+      case "reset_rapidapi_usage": {
+        // Reset the campaign's accumulated RapidAPI (Lead Movement Scan) usage counters back to zero.
+        // Same purpose as reset_ai_usage but for the RapidAPI line item.
+        if (!campaignId) return NextResponse.json({ error: "campaignId required" }, { status: 400 });
+        const result = await resetCampaignRapidAPIUsage(campaignId);
         return NextResponse.json(result);
       }
       default:

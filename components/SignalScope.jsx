@@ -157,6 +157,9 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   // Hidden in clientMode (admin-only billing data).
   const [aiUsage, setAiUsage] = useState(null); // {inputTokens, outputTokens, totalCostUSD, callsCount, lastCallAt, resetAt}
   const [aiUsageLoading, setAiUsageLoading] = useState(false);
+  // Same pattern for RapidAPI (Lead Movement Scan) usage — separate cost line
+  const [rapidApiUsage, setRapidApiUsage] = useState(null); // {totalCostUSD, callsCount, lastCallAt, resetAt, perCallCostUSD}
+  const [rapidApiUsageLoading, setRapidApiUsageLoading] = useState(false);
   const [outreachItems, setOutreachItems] = useState([]);
   const [outreachLoading, setOutreachLoading] = useState(false);
   // HubSpot
@@ -605,11 +608,63 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     }
   };
 
+  // Load RapidAPI usage stats from the Campaign record. Same get_campaign
+  // endpoint as AI usage; parses different field set. Admin-only.
+  const loadRapidAPIUsage = async () => {
+    if (clientMode) return;
+    if (!camp?.airtableId) return;
+    try {
+      setRapidApiUsageLoading(true);
+      const res = await fetch("/api/airtable", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "get_campaign", campaignId: camp.airtableId }),
+      });
+      if (!res.ok) { setRapidApiUsage(null); return; }
+      const data = await res.json();
+      const f = data.fields || {};
+      setRapidApiUsage({
+        totalCostUSD: f["RapidAPI Total Cost USD"] || 0,
+        callsCount: f["RapidAPI Calls Count"] || 0,
+        lastCallAt: f["RapidAPI Last Call At"] || null,
+        resetAt: f["RapidAPI Usage Reset At"] || null,
+        perCallCostUSD: f["RapidAPI Per Call Cost USD"] || 0.01,
+      });
+    } catch (e) {
+      console.error("RapidAPI usage load error:", e);
+      setRapidApiUsage(null);
+    } finally {
+      setRapidApiUsageLoading(false);
+    }
+  };
+
+  // Reset RapidAPI counters — same billing-cycle pattern as AI reset.
+  const resetRapidAPIUsage = async () => {
+    if (clientMode) return;
+    if (!camp?.airtableId) return;
+    if (!confirm("Reset RapidAPI (Lead Movement) usage counters to zero?\n\nThis is for billing cycles — typically you'd run this AFTER invoicing the client for the previous period. The reset is permanent.")) return;
+    try {
+      const res = await fetch("/api/airtable", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "reset_rapidapi_usage", campaignId: camp.airtableId }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        setMsg("✅ RapidAPI usage counters reset");
+        await loadRapidAPIUsage();
+      } else {
+        setMsg("❌ Reset failed: " + (data.error || "unknown error"));
+      }
+    } catch (e) {
+      setMsg("❌ Reset failed: " + e.message);
+    }
+  };
+
   // Load AI usage when dashboard is shown — refresh on every tab visit so cost
   // updates show immediately after a scan/AI operation. Skipped in clientMode.
   useEffect(() => {
     if (tab === "dashboard" && !clientMode && camp?.airtableId) {
       loadAIUsage();
+      loadRapidAPIUsage();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab, camp?.airtableId, clientMode]);
@@ -2035,6 +2090,66 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
             )}
           </div>
         )}
+
+        {/* ─── RapidAPI Usage & Cost (Lead Movement Scan) ──────────────
+            Separate line item from AI because it bills against a different
+            RapidAPI subscription. Shown only when there's been activity OR
+            we have a perCallCost configured — keeps the dashboard clean for
+            campaigns that haven't used Lead Movement yet. */}
+        {!clientMode && (
+          <div style={{marginTop:24}}>
+            <SectionHeader title="🧭 RapidAPI Usage & Cost" sub="LinkedIn profile lookups (Lead Movement Scan) billed to this campaign" />
+            {rapidApiUsage === null && rapidApiUsageLoading ? (
+              <div style={{padding:24,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,textAlign:"center",color:"var(--t3)",fontSize:11}}>Loading usage…</div>
+            ) : rapidApiUsage === null || rapidApiUsage.callsCount === 0 ? (
+              <div style={{padding:24,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,textAlign:"center",color:"var(--t3)",fontSize:11}}>
+                No RapidAPI usage yet. Counters initialize on the first Lead Movement scan. Per-call cost defaults to ${(rapidApiUsage?.perCallCostUSD || 0.01).toFixed(4)}; configure on Campaign record field "RapidAPI Per Call Cost USD" to match your actual plan.
+              </div>
+            ) : (
+              <>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(160px,1fr))",gap:10,marginBottom:10}}>
+                  <StatTile
+                    label="Total cost"
+                    value={`$${(rapidApiUsage.totalCostUSD || 0).toFixed(4)}`}
+                    sub={rapidApiUsage.resetAt ? `Since ${new Date(rapidApiUsage.resetAt).toLocaleDateString()}` : "All-time"}
+                    emoji="💵"
+                    color={rapidApiUsage.totalCostUSD > 20 ? "var(--amb)" : "var(--grn)"}
+                  />
+                  <StatTile
+                    label="Profile lookups"
+                    value={(rapidApiUsage.callsCount || 0).toLocaleString()}
+                    sub={rapidApiUsage.lastCallAt ? `Last: ${new Date(rapidApiUsage.lastCallAt).toLocaleString()}` : "No calls yet"}
+                    emoji="🔍"
+                    color="var(--blu)"
+                  />
+                  <StatTile
+                    label="Per-call rate"
+                    value={`$${(rapidApiUsage.perCallCostUSD || 0.01).toFixed(4)}`}
+                    sub="Set on Campaign field"
+                    emoji="💲"
+                    color="var(--t2)"
+                  />
+                  <StatTile
+                    label="Avg/scan"
+                    value={rapidApiUsage.callsCount > 0 ? `$${((rapidApiUsage.totalCostUSD || 0) / Math.max(1, Math.ceil(rapidApiUsage.callsCount / 200))).toFixed(4)}` : "—"}
+                    sub={`Est. ~${Math.ceil(rapidApiUsage.callsCount / 200)} scans`}
+                    emoji="📊"
+                    color="var(--pur)"
+                  />
+                </div>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 14px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,fontSize:10,color:"var(--t3)"}}>
+                  <div>
+                    <span style={{color:"var(--t2)"}}>For billing:</span> bills separately from AI usage. Set actual per-call cost on Campaign field "RapidAPI Per Call Cost USD" to match your plan.
+                  </div>
+                  <div style={{display:"flex",gap:6}}>
+                    <button className="btn btn-s" onClick={loadRapidAPIUsage} disabled={rapidApiUsageLoading} title="Refresh from Airtable">{rapidApiUsageLoading ? "⏳" : "🔄"} Refresh</button>
+                    <button className="btn btn-s btn-d" onClick={resetRapidAPIUsage} disabled={!rapidApiUsage.callsCount} title={!rapidApiUsage.callsCount ? "Nothing to reset" : "Zero out the counters and stamp a new cycle"}>↺ Reset Counters</button>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        )}
       </>);
     })()}
 
@@ -3278,7 +3393,8 @@ Output format (strict JSON, no markdown):
     open={showLeadMovementModal}
     onClose={()=>{
       setShowLeadMovementModal(false);
-      // Refresh tasks + leads so new movement tasks and updated lead fields show in UI
+      // Refresh tasks + leads + RapidAPI usage so new movement tasks, updated
+      // lead fields, AND post-scan cost all show in UI without a page reload
       (async()=>{
         try{
           const [t,l] = await Promise.all([
@@ -3287,6 +3403,7 @@ Output format (strict JSON, no markdown):
           ]);
           setTasks((t.records||[]).sort((a,b)=>((b.fields?.Created||"")>(a.fields?.Created||"")?1:-1)));
           setLeads(l.records||[]);
+          loadRapidAPIUsage();
         }catch(e){console.error("Post-scan refresh failed",e);}
       })();
     }}
