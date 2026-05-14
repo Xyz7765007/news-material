@@ -519,10 +519,17 @@ async function scanNews(company, taskDefs, threshold = 50, campaignId = null) {
   // We decode IN-PLACE (replace item.url) so the rest of the scan is unchanged.
   // Concurrency is moderate (4) because the batchexecute RPC hits Google's
   // own infra and we want to be polite. Simple base64 decode is local-only.
+  //
+  // Cap decode at the first 50 URLs to match the body-fetch cap at line 559.
+  // Previously the decoder ran on all dedupedRecent URLs (up to ~100) but
+  // body fetch only uses the first 50 — decoding URLs 51-100 was wasted load
+  // on Google and contributed to 429 rate-limiting cascades.
   const DECODE_CONCURRENCY = 4;
+  const DECODE_LIMIT = 50;
+  const toDecode = dedupedRecent.slice(0, DECODE_LIMIT);
   let decodeStats = { attempted: 0, decoded: 0, failed: 0 };
-  for (let i = 0; i < dedupedRecent.length; i += DECODE_CONCURRENCY) {
-    const batch = dedupedRecent.slice(i, i + DECODE_CONCURRENCY);
+  for (let i = 0; i < toDecode.length; i += DECODE_CONCURRENCY) {
+    const batch = toDecode.slice(i, i + DECODE_CONCURRENCY);
     await Promise.all(batch.map(async item => {
       if (!item.url || !item.url.includes("news.google.com/rss/articles/")) return;
       decodeStats.attempted++;
