@@ -2337,7 +2337,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
           {leadTags.map(t => <option key={t} value={t}>{t} ({leads.filter(l=>(l.fields||{})["Campaign Tag"]===t).length})</option>)}
         </select>}
         {!clientMode&&<label className="btn btn-s" style={{cursor:"pointer"}}><I.Upload/> Upload CSV<input type="file" accept=".csv" hidden onChange={e=>{if(e.target.files[0])handleCSVFile(e.target.files[0],"Leads",setLeads)}}/></label>}
-        {!clientMode&&<button className="btn btn-s btn-p" onClick={()=>{console.log("[Movement Scan] button clicked, opening modal");setShowLeadMovementModal(true);}} title="Scan LinkedIn for newly hired / promoted / exited leads">🧭 Movement Scan</button>}
+        {!clientMode&&<button className="btn btn-s btn-p" onClick={()=>{alert("Movement Scan button clicked! Opening modal now…");console.log("[Movement Scan] button clicked, opening modal");setShowLeadMovementModal(true);}} title="Scan LinkedIn for newly hired / promoted / exited leads">🧭 Movement Scan</button>}
       </div></div>
 
     {filteredLeads.length===0?<div className="empty"><div className="em">👤</div><p>{leads.length>0?"No leads match this campaign filter.":"Upload a CSV."}</p></div>:

@@ -423,7 +423,7 @@ function Stat({ label, value, highlight, muted, color }) {
 const modalBackdrop = {
   position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
   background: "rgba(0,0,0,0.6)", display: "flex",
-  alignItems: "center", justifyContent: "center", zIndex: 1000,
+  alignItems: "center", justifyContent: "center", zIndex: 9999,
 };
 const modalBox = {
   background: "#1a1a1d", color: "#eee", borderRadius: 10,
