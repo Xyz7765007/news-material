@@ -62,6 +62,10 @@ export default function LeadMovementScanModal({ open, onClose, campaign, leads =
   // Reset state when modal opens
   useEffect(() => {
     if (open) {
+      console.log("[Movement Scan modal] open useEffect fired. baseId=", baseId, "campaignId=", campaignId, "leads.length=", leads.length);
+      if (!baseId) {
+        console.warn("[Movement Scan modal] ⚠️ baseId is empty — preview/scan will not work. Check that campaign={...} is passed.");
+      }
       setPhase("preview");
       setPreview(null);
       setErrorMsg("");
@@ -223,7 +227,13 @@ export default function LeadMovementScanModal({ open, onClose, campaign, leads =
           <div>
             <p style={dim}>Scans all leads via RapidAPI (Fresh LinkedIn Profile Data) to detect job movement in the last N days. Creates tasks for Hired / Promoted / Exited.</p>
 
-            {tagOptions.length > 0 && (
+            {!baseId && (
+              <div style={{ ...previewBox, background: "#3a2a1a", borderColor: "#642", color: "#fa6" }}>
+                ⚠️ <strong>No campaign selected.</strong> Open a campaign first, then click Movement Scan from the Leads tab.
+              </div>
+            )}
+
+            {baseId && tagOptions.length > 0 && (
               <div style={fieldRow}>
                 <label style={lbl}>Campaign Tag filter:</label>
                 <select
