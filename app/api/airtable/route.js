@@ -310,6 +310,15 @@ const SCHEMA = {
     { name: "GA Last Visit", type: "singleLineText" },
     { name: "GA Engagement Score", type: "number", options: { precision: 0 } },
     { name: "GA Last Synced At", type: "singleLineText" },
+    // ─── Lead Movement tracking fields (auto-created on first scan run) ───
+    { name: "Current Company", type: "singleLineText" },
+    { name: "Current Job Title", type: "singleLineText" },
+    { name: "Current Role Started At", type: "singleLineText" },
+    { name: "Days In Current Role", type: "number", options: { precision: 0 } },
+    { name: "Previous Company", type: "singleLineText" },
+    { name: "Previous Job Title", type: "singleLineText" },
+    { name: "Last LinkedIn Check", type: "singleLineText" },
+    { name: "Movement Detected", type: "singleLineText" },
   ],
   "Task Rules": [
     { name: "Name", type: "singleLineText" },
@@ -343,6 +352,8 @@ const SCHEMA = {
     { name: "Phone", type: "singleLineText" },
     { name: "HubSpot Task ID", type: "singleLineText" },
     { name: "HubSpot Last Synced", type: "singleLineText" },
+    // Lead Movement field — distinguishes Hired / Promoted / Exited tasks
+    { name: "Movement Type", type: "singleLineText" },
   ],
   "Outreach": [
     { name: "Lead Name", type: "singleLineText" },
@@ -386,6 +397,12 @@ const SCHEMA = {
     { name: "Email CTA Purpose", type: "multilineText" },
     { name: "Client Password", type: "singleLineText" },
     { name: "Client Access", type: "singleLineText" },
+    // RapidAPI cost tracking — auto-populated by /api/scan-leads
+    { name: "RapidAPI Calls Count", type: "number", options: { precision: 0 } },
+    { name: "RapidAPI Total Cost USD", type: "number", options: { precision: 4 } },
+    { name: "RapidAPI Last Call At", type: "singleLineText" },
+    { name: "RapidAPI Usage Reset At", type: "singleLineText" },
+    { name: "RapidAPI Per Call Cost USD", type: "number", options: { precision: 4 } },
   ],
   "Email Offers": [
     { name: "Name", type: "singleLineText" },
