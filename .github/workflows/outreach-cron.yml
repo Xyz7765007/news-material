@@ -32,7 +32,7 @@ jobs:
         run: |
           response=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" \
             -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
-            https://news-material-eta.vercel.app/api/cron/outreach)
+            https://news-material-two.vercel.app/api/cron/outreach)
           
           # Extract HTTP status from response
           http_status=$(echo "$response" | tail -n1 | sed 's/HTTP_STATUS://')
