@@ -4,7 +4,7 @@ import { NextResponse } from "next/server";
 // Vercel's cron logs view may not show invocations because cached responses
 // are not logged as fresh invocations.
 export const dynamic = "force-dynamic";
-export const maxDuration = 600;
+export const maxDuration = 300;
 
 // Vercel Cron — runs daily at 6am UTC (11:30am IST) to process outreach queues.
 // Hobby plan limit: 1 invocation per day. Pro plan can change schedule to
