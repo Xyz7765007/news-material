@@ -143,6 +143,14 @@ const CAMPAIGN_TABLES = {
     { name: "Account ID", type: "singleLineText" },
     { name: "URL", type: "url" },
     { name: "Created", type: "dateTime", options: TZ_ISO },
+    // ─── Side Kick chatbot integration ────────────────────────
+    // When a user clicks a CTA in the chatbot, the action endpoint
+    // stamps these fields. "Handled At" empty = pending (shows up
+    // in the chatbot feed). Filled = resolved (hidden from feed,
+    // kept in Airtable for audit/history).
+    { name: "Handled At", type: "dateTime", options: TZ_ISO },
+    { name: "Handled As", type: "singleSelect", options: { choices: [{ name: "done" }, { name: "skip" }] } },
+    { name: "Handled Notes", type: "multilineText" },
   ],
   "Sent Messages Review": [
     { name: "Lead Name", type: "singleLineText" },

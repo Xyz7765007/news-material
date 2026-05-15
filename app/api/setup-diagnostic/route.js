@@ -78,6 +78,8 @@ const SCHEMA_REQUIREMENTS = {
       "Signal": "any",
       "Event ID": "any",      // webhook dedup
       "Account ID": "any",    // per-account routing context
+      "Handled At": "any",    // Side Kick chatbot: empty = pending in feed, filled = resolved
+      "Handled As": "any",    // "done" or "skip" — set by /api/sidekick/action
     },
     "Sent Messages Review": {
       "Lead Name": "any",
