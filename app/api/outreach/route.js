@@ -10,6 +10,94 @@ const OPENAI_KEY = process.env.OPENAI_API_KEY;
 const AT_API = "https://api.airtable.com/v0";
 
 // ═══════════════════════════════════════════════════════════════
+// SCHEMA BOOTSTRAP
+// Used when this route needs to write to a table that may not exist
+// yet in a fresh campaign base (Outreach, Sent Messages Review).
+// Direct Meta API call — no flaky internal fetch round-trip.
+// Returns { ok: true } on success or { ok: false, error: "...", missingScope: bool }
+// so callers can surface a clear UI error.
+// ═══════════════════════════════════════════════════════════════
+async function bootstrapTable(baseId, tableName, fieldNames) {
+  if (!baseId || !AIRTABLE_KEY) {
+    return { ok: false, error: "Missing baseId or AIRTABLE_API_KEY" };
+  }
+  const metaHdr = { Authorization: `Bearer ${AIRTABLE_KEY}`, "Content-Type": "application/json" };
+
+  // Step 1: list existing tables. Requires schema.bases:read scope on the PAT.
+  let tables;
+  try {
+    const r = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables`, { headers: metaHdr });
+    if (!r.ok) {
+      const t = await r.text();
+      // Permission errors: 401 (invalid PAT) or 403 (PAT lacks schema scope on this base)
+      if (r.status === 401 || r.status === 403) {
+        return {
+          ok: false,
+          missingScope: true,
+          error: `Airtable PAT lacks schema.bases:read on base ${baseId}. Either grant the scope at https://airtable.com/create/tokens, or manually create the "${tableName}" table with these fields: ${fieldNames.join(", ")}`,
+        };
+      }
+      return { ok: false, error: `Failed to list tables (HTTP ${r.status}): ${t.slice(0, 200)}` };
+    }
+    const d = await r.json();
+    tables = d.tables || [];
+  } catch (e) {
+    return { ok: false, error: `Network error listing tables: ${e.message}` };
+  }
+
+  const existing = tables.find(t => t.name === tableName);
+
+  // Step 2: if table exists, ensure all required fields are present
+  if (existing) {
+    const existingFieldNames = new Set((existing.fields || []).map(f => f.name));
+    const missing = fieldNames.filter(n => !existingFieldNames.has(n));
+    if (missing.length === 0) return { ok: true, action: "exists", tableId: existing.id };
+
+    // Add missing fields one by one (Airtable API requires individual POSTs)
+    const errors = [];
+    for (const fieldName of missing) {
+      try {
+        const r = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables/${existing.id}/fields`, {
+          method: "POST", headers: metaHdr,
+          body: JSON.stringify({ name: fieldName, type: "singleLineText" }),
+        });
+        if (!r.ok) errors.push(`${fieldName}: ${(await r.text()).slice(0, 100)}`);
+      } catch (e) {
+        errors.push(`${fieldName}: ${e.message}`);
+      }
+    }
+    if (errors.length) {
+      return { ok: false, missingScope: errors.some(e => /403|forbidden|permission/i.test(e)),
+        error: `Table exists but couldn't add fields: ${errors.join("; ").slice(0, 400)}` };
+    }
+    return { ok: true, action: "fields_added", tableId: existing.id };
+  }
+
+  // Step 3: table doesn't exist — create it with all required fields
+  try {
+    const fields = fieldNames.map(name => ({ name, type: "singleLineText" }));
+    const r = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables`, {
+      method: "POST", headers: metaHdr,
+      body: JSON.stringify({ name: tableName, fields }),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      if (r.status === 401 || r.status === 403) {
+        return {
+          ok: false,
+          missingScope: true,
+          error: `Airtable PAT lacks schema.bases:write on base ${baseId}. Either grant the scope at https://airtable.com/create/tokens, or manually create the "${tableName}" table with these fields: ${fieldNames.join(", ")}`,
+        };
+      }
+      return { ok: false, error: `Failed to create table "${tableName}" (HTTP ${r.status}): ${t.slice(0, 300)}` };
+    }
+    return { ok: true, action: "created" };
+  } catch (e) {
+    return { ok: false, error: `Network error creating table: ${e.message}` };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // UNIPILE API HELPERS
 // ═══════════════════════════════════════════════════════════════
 
@@ -563,26 +651,21 @@ async function logAiMessageForReview(baseId, {
     });
     if (!r.ok) {
       const errTxt = await r.text();
-      // First write to a missing table → auto-create via ensure_fields, then retry
-      if (r.status === 404 || errTxt.includes("NOT_FOUND") || errTxt.includes("Could not find")) {
-        console.warn(`[review-log] Sent Messages Review table missing in base ${baseId}, auto-creating`);
-        try {
-          await fetch(`${process.env.VERCEL_URL ? "https://" + process.env.VERCEL_URL : "http://localhost:3000"}/api/airtable`, {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              action: "ensure_fields", table: "Sent Messages Review", baseId,
-              fieldNames: Object.keys(fields),
-            }),
-          });
-          const retry = await fetch(url, {
-            method: "POST",
-            headers: { "Authorization": `Bearer ${process.env.AIRTABLE_API_KEY}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ fields, typecast: true }),
-          });
-          if (!retry.ok) console.warn(`[review-log] Retry after auto-create failed: ${(await retry.text()).slice(0, 200)}`);
-        } catch (e) {
-          console.warn(`[review-log] Auto-create failed: ${e.message}`);
+      // First write to a missing table → auto-create via bootstrapTable, then retry
+      if (r.status === 404 || errTxt.includes("NOT_FOUND") || errTxt.includes("Could not find") || errTxt.includes("INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND")) {
+        console.warn(`[review-log] Sent Messages Review table missing in base ${baseId}, auto-creating via bootstrapTable`);
+        const bootstrap = await bootstrapTable(baseId, "Sent Messages Review", Object.keys(fields));
+        if (!bootstrap.ok) {
+          console.warn(`[review-log] Bootstrap failed: ${bootstrap.error}${bootstrap.missingScope ? " (PAT missing schema scope)" : ""}`);
+          return;
         }
+        // Retry the write
+        const retry = await fetch(url, {
+          method: "POST",
+          headers: { "Authorization": `Bearer ${process.env.AIRTABLE_API_KEY}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ fields, typecast: true }),
+        });
+        if (!retry.ok) console.warn(`[review-log] Retry after bootstrap failed: ${(await retry.text()).slice(0, 200)}`);
       } else {
         console.warn(`[review-log] Write failed (non-fatal): ${errTxt.slice(0, 200)}`);
       }
@@ -1074,21 +1157,24 @@ async function enqueueLeads(baseId, ruleConfig, options = {}, campaignId = null)
 
   if (!eligible.length) return { error: "No eligible leads after dedup", enqueued: 0, skippedDupes, skippedByTagFilter };
 
-  // Pre-flight: ensure Outreach table has all fields we'll write.
-  // Airtable will return 422 Unknown field otherwise and atCreate has a retry,
-  // but ensuring up-front gives a cleaner first attempt and persists the schema.
+  // Pre-flight: ensure Outreach table exists with all required fields.
+  // If the PAT lacks schema scope, bootstrapTable returns a clear error
+  // we can surface to the UI (instead of silent 403s on later create attempts).
   const REQUIRED_OUTREACH_FIELDS = [
     "Lead Name", "LinkedIn URL", "Campaign", "Mode", "Status", "Company", "Title",
     "Email", "Signal", "DM Step", "Next Action Date", "Created At",
     "Connection Sent At", "Last DM Sent At", "Unipile Chat ID", "Notes",
     "Replied At", "Connection Accepted At",
   ];
-  try {
-    await fetch(`${process.env.VERCEL_URL ? "https://" + process.env.VERCEL_URL : "http://localhost:3000"}/api/airtable`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "ensure_fields", table: "Outreach", fieldNames: REQUIRED_OUTREACH_FIELDS, baseId }),
-    }).catch(() => null);
-  } catch {} // best-effort, atCreate has a retry anyway
+  const bootstrap = await bootstrapTable(baseId, "Outreach", REQUIRED_OUTREACH_FIELDS);
+  if (!bootstrap.ok) {
+    return {
+      error: `Outreach table setup failed: ${bootstrap.error}`,
+      enqueued: 0, skippedDupes, skippedByTagFilter,
+      missingAirtableScope: bootstrap.missingScope || false,
+    };
+  }
+  console.log(`[outreach] Outreach table bootstrap: ${bootstrap.action || "ok"}`);
 
   // Create outreach queue records
   const records = eligible.map(l => {
