@@ -360,7 +360,18 @@ async function atList(baseId, table, params = {}) {
   do {
     const url = `${AT_API}/${baseId}/${encodeURIComponent(table)}?${qs}${offset ? "&offset=" + offset : ""}`;
     const res = await fetch(url, { headers: atHdr });
-    if (!res.ok) { console.error(`AT list ${table}:`, await res.text()); break; }
+    if (!res.ok) {
+      const errTxt = await res.text();
+      // 403 INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND usually means the table
+      // doesn't exist yet in this base (e.g. fresh campaign). Silently treat
+      // as empty list — the caller's bootstrap logic will create the table
+      // on first write. Only log truly unexpected failures (auth issues, 500s).
+      const isMissingTable = res.status === 403 && /INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND/i.test(errTxt);
+      if (!isMissingTable) {
+        console.error(`AT list ${table} (HTTP ${res.status}):`, errTxt.slice(0, 200));
+      }
+      break;
+    }
     const d = await res.json();
     all.push(...(d.records || []));
     offset = d.offset;
