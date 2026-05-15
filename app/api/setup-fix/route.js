@@ -182,6 +182,26 @@ export async function POST(request) {
 
   const report = { master: {}, campaigns: [], summary: { fixed: 0, failed: 0, warnings: [] } };
 
+  // ─── Optional baseId override ──────────────────────────────────
+  // If ?baseId=appXXX is passed, bootstrap that one base only (using
+  // CAMPAIGN_TABLES schema). Bypasses the Features filter so campaigns
+  // that aren't "linkedin_outreach" (e.g. Veloka with Features=top_x)
+  // can still get fields like Handled At / Handled As / Handled Notes
+  // added to their Tasks table for the Side Kick chatbot integration.
+  const overrideBaseId = url.searchParams.get("baseId");
+  if (overrideBaseId) {
+    const campReport = { name: `override (${overrideBaseId})`, baseId: overrideBaseId, tables: {} };
+    for (const [tableName, fields] of Object.entries(CAMPAIGN_TABLES)) {
+      const r = await bootstrapTable(overrideBaseId, tableName, fields);
+      campReport.tables[tableName] = r;
+      if (r.ok) report.summary.fixed++;
+      else report.summary.failed++;
+    }
+    report.campaigns.push(campReport);
+    // Skip master + campaign iteration; the override is the whole request.
+    return NextResponse.json({ ...report, mode: "single_base_override" });
+  }
+
   // ─── Fix master base tables ────────────────────────────────────
   for (const [tableName, fields] of Object.entries(MASTER_TABLES)) {
     const r = await bootstrapTable(MASTER_BASE_ID, tableName, fields);
