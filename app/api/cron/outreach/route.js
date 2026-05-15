@@ -142,7 +142,10 @@ export async function GET(request) {
     for (const camp of campaigns) {
       const cf = camp.fields || {};
       const baseId = cf["Base ID"];
-      const features = (cf.Features || "").split(",").map(s => s.trim());
+      const rawFeatures = cf.Features;
+      const features = Array.isArray(rawFeatures)
+        ? rawFeatures.map(s => String(s).trim())
+        : String(rawFeatures || "").split(",").map(s => s.trim());
 
       if (!baseId) {
         summary.skipReasons.push(`Campaign "${cf.Name || camp.id}" has no Base ID — skipped`);

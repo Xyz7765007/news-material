@@ -188,7 +188,10 @@ export async function POST(request) {
       const { records } = await campRes.json();
       for (const camp of (records || [])) {
         const cf = camp.fields || {};
-        const features = (cf.Features || "").split(",").map(s => s.trim());
+        const rawFeatures = cf.Features;
+        const features = Array.isArray(rawFeatures)
+          ? rawFeatures.map(s => String(s).trim())
+          : String(rawFeatures || "").split(",").map(s => s.trim());
         if (!features.includes("linkedin_outreach")) continue;
         const baseId = cf["Base ID"];
         if (!baseId) {
