@@ -547,6 +547,66 @@ async function handleWebhook(request, fallbackBaseId) {
     accountId, eventId,
   });
 
+  // ─── REAL-TIME OUTREACH STATUS SYNC ─────────────────────────
+  // When a high-signal event (reply or connection accepted) lands, also
+  // update the Outreach record IMMEDIATELY. Otherwise we wait up to 4
+  // hours for the next outreach cron run to notice — meaning another DM
+  // step could fire in the meantime. This closes that window.
+  //
+  // Strict guardrails:
+  //   - Only updates Outreach records that match the lead's LinkedIn URL
+  //   - For connection_accepted: only flips to "connected" if currently in
+  //     "queued"/"connection_sent" — won't overwrite "dm_2" or "completed"
+  //   - For message_reply: always flips to "replied" (this is the strongest
+  //     signal — even if we're mid-sequence, lead replied → stop everything)
+  //   - Failure is non-fatal (logged but doesn't fail the webhook response)
+  const leadUrl = (lead.fields?.["LinkedIn URL"] || "").trim();
+  if (leadUrl && (triggerType === "unipile_message_reply" || triggerType === "unipile_connection_accepted")) {
+    try {
+      const escUrl = leadUrl.toLowerCase().replace(/"/g, '\\"');
+      const outreach = await atFindOne(baseId, "Outreach", `LOWER({LinkedIn URL}) = "${escUrl}"`);
+      if (outreach) {
+        const currentStatus = outreach.fields?.Status || "queued";
+        const fields = {};
+        if (triggerType === "unipile_message_reply") {
+          // Reply is the strongest stop signal — override any in-flight state
+          if (currentStatus !== "replied" && currentStatus !== "completed") {
+            fields.Status = "replied";
+            fields.Notes = "Lead replied (webhook real-time) — DM sequence stopped";
+          }
+        } else if (triggerType === "unipile_connection_accepted") {
+          // Only advance forward; never regress from dm_N back to connected
+          if (currentStatus === "queued" || currentStatus === "connection_sent") {
+            fields.Status = "connected";
+            fields["Connection Accepted At"] = new Date().toISOString();
+            // Schedule first DM for tomorrow if rule has days_after_accept; the
+            // outreach cron will fire the first DM on its next run after that date
+            const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
+            fields["Next Action Date"] = tomorrow.toISOString().slice(0, 10);
+          }
+        }
+        if (Object.keys(fields).length > 0) {
+          const r = await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Outreach")}/${outreach.id}`, {
+            method: "PATCH", headers: atHdr,
+            body: JSON.stringify({ fields, typecast: true }),
+          });
+          if (r.ok) {
+            console.log(`[unipile-triggers] Outreach ${outreach.id} updated: ${currentStatus} → ${fields.Status || "(unchanged)"}`);
+          } else {
+            const errTxt = await r.text();
+            console.warn(`[unipile-triggers] Outreach sync PATCH failed (non-fatal): ${errTxt.slice(0, 200)}`);
+          }
+        } else {
+          console.log(`[unipile-triggers] Outreach ${outreach.id} found but no status change needed (current: ${currentStatus})`);
+        }
+      } else {
+        console.log(`[unipile-triggers] No Outreach record found for lead URL ${leadUrl} — lead matched in Leads table but not in an active outreach sequence`);
+      }
+    } catch (e) {
+      console.warn(`[unipile-triggers] Outreach sync failed (non-fatal): ${e.message}`);
+    }
+  }
+
   return NextResponse.json({
     ok: true,
     trigger_type: triggerType,

@@ -519,6 +519,79 @@ async function aiPersonalizeMessage(template, lead, signal, companyName, campaig
   }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// AI MESSAGE REVIEW LOG
+// Every AI-personalised message we send is logged to a "Sent Messages Review"
+// table so the operator can audit, flag issues, and feed corrections back
+// into the prompt. This is the in-app notification surface — the UI polls
+// this table for items where Status="needs_review" and surfaces them as a
+// notification badge.
+// ═══════════════════════════════════════════════════════════════
+async function logAiMessageForReview(baseId, {
+  leadName, leadLinkedInUrl, leadCompany, leadTitle,
+  messageType,         // "connection_note" | "dm_step_1" | "dm_step_2" | ...
+  template,            // rule's template text used as input
+  aiOutput,            // the actual message that was sent
+  aiInputContext,      // JSON-stringified snapshot of what fields fed the AI
+  campaign,            // rule/campaign name
+  unipileChatId,
+  accountId,
+}) {
+  if (!baseId) return;
+  try {
+    const fields = {
+      "Lead Name": leadName || "Unknown",
+      "LinkedIn URL": leadLinkedInUrl || "",
+      "Company": leadCompany || "",
+      "Title": leadTitle || "",
+      "Message Type": messageType || "unknown",
+      "Template Used": (template || "").slice(0, 1000),
+      "AI Output (Sent)": (aiOutput || "").slice(0, 2000),
+      "AI Input Context": (aiInputContext || "").slice(0, 4000),
+      "Campaign": campaign || "",
+      "Account ID": accountId || "",
+      "Unipile Chat ID": unipileChatId || "",
+      "Sent At": new Date().toISOString(),
+      "Status": "needs_review",   // user → "approved" | "flagged"
+      "Reviewer Notes": "",
+    };
+    const url = `https://api.airtable.com/v0/${baseId}/${encodeURIComponent("Sent Messages Review")}`;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${process.env.AIRTABLE_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ fields, typecast: true }),
+    });
+    if (!r.ok) {
+      const errTxt = await r.text();
+      // First write to a missing table → auto-create via ensure_fields, then retry
+      if (r.status === 404 || errTxt.includes("NOT_FOUND") || errTxt.includes("Could not find")) {
+        console.warn(`[review-log] Sent Messages Review table missing in base ${baseId}, auto-creating`);
+        try {
+          await fetch(`${process.env.VERCEL_URL ? "https://" + process.env.VERCEL_URL : "http://localhost:3000"}/api/airtable`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              action: "ensure_fields", table: "Sent Messages Review", baseId,
+              fieldNames: Object.keys(fields),
+            }),
+          });
+          const retry = await fetch(url, {
+            method: "POST",
+            headers: { "Authorization": `Bearer ${process.env.AIRTABLE_API_KEY}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ fields, typecast: true }),
+          });
+          if (!retry.ok) console.warn(`[review-log] Retry after auto-create failed: ${(await retry.text()).slice(0, 200)}`);
+        } catch (e) {
+          console.warn(`[review-log] Auto-create failed: ${e.message}`);
+        }
+      } else {
+        console.warn(`[review-log] Write failed (non-fatal): ${errTxt.slice(0, 200)}`);
+      }
+    }
+  } catch (e) {
+    console.warn(`[review-log] Exception (non-fatal): ${e.message}`);
+  }
+}
+
 // ─── REPLY INTENT CLASSIFICATION ────────────────────────────
 // Takes a reply message and returns:
 //   intent: interested | objection | referral | not_interested | out_of_office | auto_reply | unclear
@@ -791,6 +864,17 @@ async function processOutreachQueue(baseId, accountId, ruleConfig, campaignId = 
             "Next Action Date": nextDate,
           }}]);
           connSent++;
+          // Log the AI-personalised connection note for in-app review
+          if (connMsg && ruleConfig.connectionMessage) {
+            logAiMessageForReview(baseId, {
+              leadName: f.Name, leadLinkedInUrl: linkedinUrl, leadCompany: f.Company, leadTitle: f.Title,
+              messageType: "connection_note",
+              template: ruleConfig.connectionMessage,
+              aiOutput: connMsg,
+              aiInputContext: JSON.stringify({ name: f.Name, company: f.Company, title: f.Title, signal: f.Signal }),
+              campaign, accountId,
+            }).catch(()=>{});
+          }
         } else {
           console.error("Invitation failed:", res.data);
           await atUpdate(baseId, "Outreach", [{ id: item.id, fields: { Status: "error", Notes: JSON.stringify(res.data).slice(0, 500) }}]);
@@ -875,6 +959,19 @@ async function processOutreachQueue(baseId, accountId, ruleConfig, campaignId = 
             "Unipile Chat ID": existingChatId || chatRes.data?.chat_id || chatRes.data?.id || "",
           }}]);
           dmsSent++;
+          // Log the DM send for in-app review (only when the step had AI personalisation)
+          if (step.aiPersonalize) {
+            logAiMessageForReview(baseId, {
+              leadName: f.Name, leadLinkedInUrl: f["LinkedIn URL"] || "", leadCompany: f.Company, leadTitle: f.Title,
+              messageType: `dm_step_${dmStep + 1}`,
+              template: step.message,
+              aiOutput: msg,
+              aiInputContext: JSON.stringify({ name: f.Name, company: f.Company, title: f.Title, signal: f.Signal, dmStep }),
+              campaign,
+              unipileChatId: existingChatId || chatRes.data?.chat_id || chatRes.data?.id || "",
+              accountId,
+            }).catch(()=>{});
+          }
         } else if (chatRes.status === 422 || chatRes.status === 403) {
           // Not connected yet or can't message — keep waiting
           const nextDate = new Date(now.getTime() + 1 * 86400000).toISOString().slice(0, 10);
@@ -924,10 +1021,33 @@ async function enqueueLeads(baseId, ruleConfig, options = {}, campaignId = null)
 
   let eligible;
   let skippedDupes = 0;
+  let skippedByTagFilter = 0;
+
+  // ─── CAMPAIGN TAG FILTER (optional) ──────────────────────────
+  // If ruleConfig.campaignTags is set (array of tag values), narrow the
+  // candidate pool to leads whose `Campaign Tag` field matches ANY of those
+  // tags BEFORE running dedup or AI selection. Empty/missing → no filter.
+  // The lead's Campaign Tag field can be single-select or multi-select; we
+  // handle both by normalizing to an array.
+  const tagFilter = Array.isArray(ruleConfig.campaignTags) ? ruleConfig.campaignTags.filter(Boolean) : [];
+  let preFilteredLeads = leads;
+  if (tagFilter.length > 0) {
+    const lcTags = new Set(tagFilter.map(t => String(t).toLowerCase().trim()));
+    const before = leads.length;
+    preFilteredLeads = leads.filter(l => {
+      const raw = l.fields?.["Campaign Tag"];
+      if (!raw) return false;
+      const tags = Array.isArray(raw) ? raw : [raw];
+      return tags.some(t => lcTags.has(String(t).toLowerCase().trim()));
+    });
+    skippedByTagFilter = before - preFilteredLeads.length;
+    console.log(`[outreach] Campaign Tag filter (${tagFilter.join(", ")}) → ${preFilteredLeads.length}/${before} leads passed`);
+  }
 
   if (mode === "manual") {
-    // Manual mode: user picked specific lead IDs
-    eligible = leads.filter(l => selectedIds.includes(l.id));
+    // Manual mode: user picked specific lead IDs (tag filter still applies for safety)
+    const selectedIdSet = new Set(selectedIds);
+    eligible = preFilteredLeads.filter(l => selectedIdSet.has(l.id));
     // Still dedupe against existing outreach
     const beforeCount = eligible.length;
     eligible = eligible.filter(l => {
@@ -937,17 +1057,22 @@ async function enqueueLeads(baseId, ruleConfig, options = {}, campaignId = null)
     skippedDupes = beforeCount - eligible.length;
   } else {
     // Auto mode: AI selects from leads with LinkedIn URLs not yet in queue
-    const hasLinkedIn = leads.filter(l => (l.fields?.["LinkedIn URL"] || "").trim());
+    const hasLinkedIn = preFilteredLeads.filter(l => (l.fields?.["LinkedIn URL"] || "").trim());
     skippedDupes = hasLinkedIn.length - hasLinkedIn.filter(l => !existingLinkedIns.has((l.fields?.["LinkedIn URL"] || "").toLowerCase().trim())).length;
     eligible = hasLinkedIn.filter(l => !existingLinkedIns.has((l.fields?.["LinkedIn URL"] || "").toLowerCase().trim()));
 
-    if (!eligible.length) return { error: "No eligible leads (all already in outreach or missing LinkedIn URL)", enqueued: 0, skippedDupes };
+    if (!eligible.length) {
+      const reason = tagFilter.length > 0
+        ? `No eligible leads matching Campaign Tag(s) "${tagFilter.join(", ")}" after dedup`
+        : "No eligible leads (all already in outreach or missing LinkedIn URL)";
+      return { error: reason, enqueued: 0, skippedDupes, skippedByTagFilter };
+    }
 
-    // AI selects the best leads
+    // AI selects the best leads (from the tag-filtered, dedup'd pool)
     eligible = await aiSelectLeads(eligible, ruleConfig.leadPrompt || "", count, campaignId);
   }
 
-  if (!eligible.length) return { error: "No eligible leads after dedup", enqueued: 0, skippedDupes };
+  if (!eligible.length) return { error: "No eligible leads after dedup", enqueued: 0, skippedDupes, skippedByTagFilter };
 
   // Pre-flight: ensure Outreach table has all fields we'll write.
   // Airtable will return 422 Unknown field otherwise and atCreate has a retry,
@@ -1547,6 +1672,59 @@ export async function POST(request) {
         // Optional status filter
         const filtered = body.status ? items.filter(q => (q.fields?.Status || "queued") === body.status) : items;
         return NextResponse.json({ items: filtered });
+      }
+
+      case "list_campaign_tags": {
+        // Returns the distinct set of values found in the Leads table's
+        // "Campaign Tag" field, with a count of leads per tag. Used by the
+        // outreach rule editor to populate a multi-select dropdown.
+        if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
+        const leads = await atList(baseId, "Leads");
+        const counts = new Map();
+        for (const l of leads) {
+          const raw = l.fields?.["Campaign Tag"];
+          if (!raw) continue;
+          const tags = Array.isArray(raw) ? raw : [raw];
+          for (const t of tags) {
+            const k = String(t).trim();
+            if (!k) continue;
+            counts.set(k, (counts.get(k) || 0) + 1);
+          }
+        }
+        const tags = Array.from(counts.entries())
+          .map(([tag, count]) => ({ tag, count }))
+          .sort((a, b) => b.count - a.count);
+        return NextResponse.json({ ok: true, tags, totalLeads: leads.length, leadsWithTags: leads.filter(l => l.fields?.["Campaign Tag"]).length });
+      }
+
+      case "list_review": {
+        // Returns AI-generated messages awaiting review. UI surfaces these
+        // in the notification box. Default: only items with Status=needs_review.
+        if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
+        const all = await atList(baseId, "Sent Messages Review").catch(() => []);
+        const statusFilter = body.status || "needs_review";
+        const items = (statusFilter === "all" ? all : all.filter(r => (r.fields?.Status || "needs_review") === statusFilter))
+          .sort((a, b) => (b.fields?.["Sent At"] || "").localeCompare(a.fields?.["Sent At"] || ""))
+          .slice(0, 200);
+        const pendingCount = all.filter(r => (r.fields?.Status || "needs_review") === "needs_review").length;
+        return NextResponse.json({ ok: true, items, pendingCount, totalCount: all.length });
+      }
+
+      case "review_action": {
+        // body: { itemId, action: "approve" | "flag", notes }
+        if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
+        const { itemId, action: revAction, notes } = body;
+        if (!itemId || !revAction) return NextResponse.json({ error: "itemId and action required" }, { status: 400 });
+        const newStatus = revAction === "approve" ? "approved" : revAction === "flag" ? "flagged" : "needs_review";
+        const fields = { Status: newStatus, "Reviewed At": new Date().toISOString() };
+        if (notes !== undefined) fields["Reviewer Notes"] = String(notes).slice(0, 2000);
+        const r = await fetch(`https://api.airtable.com/v0/${baseId}/${encodeURIComponent("Sent Messages Review")}/${itemId}`, {
+          method: "PATCH",
+          headers: { "Authorization": `Bearer ${process.env.AIRTABLE_API_KEY}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ fields, typecast: true }),
+        });
+        if (!r.ok) return NextResponse.json({ error: (await r.text()).slice(0, 200) }, { status: 500 });
+        return NextResponse.json({ ok: true, status: newStatus });
       }
 
       case "send_manual_connections": {

@@ -3389,6 +3389,8 @@ Output format (strict JSON, no markdown):
 
   {/* Lead Movement Scan Modal — RapidAPI Fresh LinkedIn Profile Data */}
   {(()=>{ console.log("[Movement Scan] RENDER (SignalScope JSX): showLeadMovementModal =", showLeadMovementModal); return null; })()}
+  {/* Floating AI Reviews badge — always-visible notification box for AI-generated DMs */}
+  {!clientMode && <ReviewNotificationBox baseId={bid} />}
   <LeadMovementScanModal
     open={showLeadMovementModal}
     onClose={()=>{
@@ -7975,6 +7977,11 @@ function RuleEditor({rule,onSave,onClose,availableFields,baseId}){
     <div className="ig"><div className="il">AI Lead Prompt <span style={{fontSize:9,color:"var(--t3)",fontWeight:400}}>— which leads should be targeted?</span></div>
       <textarea className="inp ta" value={oc.leadPrompt} onChange={e=>setOc(p=>({...p,leadPrompt:e.target.value}))} placeholder="e.g. Select VP+ in marketing at 200-5000 employee SaaS companies." style={{minHeight:50,fontSize:11}}/>
     </div>
+    <CampaignTagPicker
+      baseId={baseId}
+      selected={oc.campaignTags || []}
+      onChange={tags=>setOc(p=>({...p,campaignTags:tags}))}
+    />
     <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
       <div className="ig"><div className="il">Leads per Batch</div><input type="number" className="inp" value={oc.leadsPerBatch} onChange={e=>setOc(p=>({...p,leadsPerBatch:parseInt(e.target.value)||10}))} min={1} max={100}/></div>
       <div className="ig"><div className="il">Connections / Day</div><input type="number" className="inp" value={oc.connectionsPerDay} onChange={e=>setOc(p=>({...p,connectionsPerDay:parseInt(e.target.value)||5}))} min={1} max={50}/></div>
@@ -8313,4 +8320,275 @@ function ExportModal({ tasks, accounts, leads, onClose }) {
       </button>
     </div>
   </div></div>);
+}
+// ═══════════════════════════════════════════════════════════════
+// CAMPAIGN TAG PICKER
+// Multi-select dropdown for filtering leads by Campaign Tag in outreach
+// rule editor. Loads tags via /api/outreach list_campaign_tags on mount.
+// ═══════════════════════════════════════════════════════════════
+function CampaignTagPicker({ baseId, selected, onChange }) {
+  const [tags, setTags] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState("");
+  const [meta, setMeta] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true); setErr("");
+      try {
+        const r = await fetch("/api/outreach", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "list_campaign_tags", baseId }),
+        });
+        const d = await r.json();
+        if (cancelled) return;
+        if (d.ok) {
+          setTags(d.tags || []);
+          setMeta({ totalLeads: d.totalLeads, leadsWithTags: d.leadsWithTags });
+        } else {
+          setErr(d.error || "Failed to load tags");
+        }
+      } catch (e) { if (!cancelled) setErr(e.message); }
+      if (!cancelled) setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [baseId]);
+
+  const toggle = (tag) => {
+    if (selected.includes(tag)) onChange(selected.filter(t => t !== tag));
+    else onChange([...selected, tag]);
+  };
+
+  if (loading) return <div style={{fontSize:10,color:"var(--t3)",padding:6}}>Loading Campaign Tags…</div>;
+  if (err) return <div style={{fontSize:10,color:"var(--red)",padding:6}}>Tag load error: {err}</div>;
+  if (tags.length === 0) {
+    return (
+      <div className="ig">
+        <div className="il">Campaign Tag Filter <span style={{fontSize:9,color:"var(--t3)",fontWeight:400}}>— optional</span></div>
+        <div style={{fontSize:10,color:"var(--t3)",padding:8,background:"var(--hover)",borderRadius:4}}>
+          No "Campaign Tag" values found in the Leads table. Add a Campaign Tag field on your leads (single or multi-select) and tag them, then this picker will populate.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="ig">
+      <div className="il">
+        Campaign Tag Filter <span style={{fontSize:9,color:"var(--t3)",fontWeight:400}}>— optional; restrict AI to leads with selected tags only ({meta?.leadsWithTags}/{meta?.totalLeads} leads tagged)</span>
+      </div>
+      <div style={{display:"flex",gap:6,flexWrap:"wrap",padding:8,background:"var(--hover)",borderRadius:4,maxHeight:140,overflowY:"auto"}}>
+        {tags.map(({tag, count}) => {
+          const isSel = selected.includes(tag);
+          return (
+            <button
+              key={tag}
+              type="button"
+              onClick={()=>toggle(tag)}
+              style={{
+                padding:"4px 8px",fontSize:10,borderRadius:4,cursor:"pointer",
+                background: isSel ? "var(--blu)" : "var(--card)",
+                color: isSel ? "var(--bg)" : "var(--t1)",
+                border: `1px solid ${isSel ? "var(--blu)" : "var(--bdr)"}`,
+              }}
+            >
+              {isSel ? "✓ " : ""}{tag} <span style={{opacity:0.6,marginLeft:3}}>({count})</span>
+            </button>
+          );
+        })}
+      </div>
+      {selected.length > 0 && (
+        <div style={{fontSize:10,color:"var(--blu)",marginTop:4}}>
+          Will limit AI selection to leads tagged with: <strong>{selected.join(", ")}</strong>. Leave empty to consider all leads.
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// REVIEW NOTIFICATION BOX
+// Floating badge + modal showing AI-generated messages awaiting review.
+// Polls every 60s for new items. Displays the lead, the template that
+// was used, the AI output that was sent, and an Approve/Flag action.
+// Mounted at the top level of SignalScope so the badge is always visible.
+// ═══════════════════════════════════════════════════════════════
+function ReviewNotificationBox({ baseId }) {
+  const [pendingCount, setPendingCount] = useState(0);
+  const [items, setItems] = useState([]);
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [filter, setFilter] = useState("needs_review"); // needs_review | approved | flagged | all
+
+  const load = async () => {
+    if (!baseId) return;
+    setLoading(true);
+    try {
+      const r = await fetch("/api/outreach", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "list_review", baseId, status: filter }),
+      });
+      const d = await r.json();
+      if (d.ok) { setItems(d.items || []); setPendingCount(d.pendingCount || 0); }
+    } catch {}
+    setLoading(false);
+  };
+
+  // Initial load + poll every 60s
+  useEffect(() => {
+    if (!baseId) return;
+    load();
+    const id = setInterval(load, 60000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [baseId, filter]);
+
+  const act = async (itemId, action) => {
+    try {
+      await fetch("/api/outreach", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "review_action", baseId, itemId, action }),
+      });
+      await load();
+    } catch {}
+  };
+
+  if (!baseId) return null;
+
+  return (<>
+    {/* Floating badge — sits in lower right */}
+    <button
+      onClick={()=>setOpen(o=>!o)}
+      style={{
+        position:"fixed", bottom:20, right:20, zIndex:99,
+        padding:"10px 14px", borderRadius:24, border:"1px solid var(--bdr)",
+        background: pendingCount > 0 ? "var(--amb)" : "var(--card)",
+        color: pendingCount > 0 ? "var(--bg)" : "var(--t1)",
+        cursor:"pointer", fontSize:12, fontWeight:600,
+        boxShadow:"0 4px 16px rgba(0,0,0,0.3)",
+        display:"flex", alignItems:"center", gap:8,
+      }}
+      title="AI message review queue"
+    >
+      📬 AI Reviews
+      {pendingCount > 0 && (
+        <span style={{
+          background:"var(--bg)", color:"var(--amb)",
+          padding:"2px 8px", borderRadius:12, fontSize:11, fontWeight:700,
+        }}>{pendingCount}</span>
+      )}
+    </button>
+
+    {open && (
+      <div
+        onClick={()=>setOpen(false)}
+        style={{
+          position:"fixed", top:0, left:0, right:0, bottom:0,
+          background:"rgba(0,0,0,0.5)", zIndex:100,
+          display:"flex", alignItems:"center", justifyContent:"center", padding:20,
+        }}
+      >
+        <div
+          onClick={e=>e.stopPropagation()}
+          style={{
+            background:"var(--bg)", border:"1px solid var(--bdr)", borderRadius:12,
+            width:"100%", maxWidth:920, maxHeight:"80vh", display:"flex", flexDirection:"column",
+            boxShadow:"0 8px 32px rgba(0,0,0,0.5)",
+          }}
+        >
+          <div style={{padding:"14px 18px",borderBottom:"1px solid var(--bdr)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div>
+              <div style={{fontSize:14,fontWeight:600,color:"var(--t1)"}}>📬 AI Message Reviews</div>
+              <div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>Audit AI-personalised DMs and connection notes. Approve good ones; flag bad ones with notes so they don't repeat.</div>
+            </div>
+            <button className="btn btn-s" onClick={()=>setOpen(false)}>✕</button>
+          </div>
+
+          {/* Filter pills */}
+          <div style={{padding:"10px 18px",borderBottom:"1px solid var(--bdr)",display:"flex",gap:6,alignItems:"center"}}>
+            {[
+              {id:"needs_review",label:"Needs Review",count:pendingCount},
+              {id:"approved",label:"Approved"},
+              {id:"flagged",label:"Flagged"},
+              {id:"all",label:"All"},
+            ].map(f=>(
+              <button key={f.id} className="btn btn-s" onClick={()=>setFilter(f.id)}
+                style={filter===f.id?{background:"var(--amb)",color:"var(--bg)",borderColor:"var(--amb)"}:{}}>
+                {f.label}{f.count!=null && f.count>0 ? ` (${f.count})` : ""}
+              </button>
+            ))}
+            <button className="btn btn-s" onClick={load} disabled={loading} style={{marginLeft:"auto"}}>{loading?"...":"↻"}</button>
+          </div>
+
+          <div style={{flex:1,overflowY:"auto",padding:18}}>
+            {items.length === 0 ? (
+              <div style={{padding:40,textAlign:"center",color:"var(--t3)"}}>
+                <div style={{fontSize:24,marginBottom:8}}>📭</div>
+                <div>No items in this view.</div>
+                <div style={{fontSize:10,marginTop:6}}>AI-personalised messages will appear here after they're sent.</div>
+              </div>
+            ) : (
+              <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                {items.map(it => {
+                  const f = it.fields || {};
+                  const status = f.Status || "needs_review";
+                  const statusColor = status === "approved" ? "var(--grn)" : status === "flagged" ? "var(--red)" : "var(--amb)";
+                  return (
+                    <div key={it.id} style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8}}>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,marginBottom:8}}>
+                        <div>
+                          <div style={{fontSize:12,fontWeight:600,color:"var(--t1)"}}>
+                            {f["Lead Name"]} <span style={{fontWeight:400,color:"var(--t3)"}}>· {f.Company} · {f.Title}</span>
+                          </div>
+                          <div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>
+                            <strong>{f["Message Type"]}</strong> · {f.Campaign} · {f["Sent At"] ? new Date(f["Sent At"]).toLocaleString() : ""}
+                          </div>
+                        </div>
+                        <span style={{padding:"3px 8px",fontSize:9,fontWeight:600,borderRadius:4,background:"var(--hover)",color:statusColor,border:`1px solid ${statusColor}`}}>{status.replace("_", " ")}</span>
+                      </div>
+                      <div style={{marginBottom:8,padding:10,background:"var(--hover)",borderRadius:4,fontSize:11,color:"var(--t1)",whiteSpace:"pre-wrap"}}>
+                        <div style={{fontSize:9,color:"var(--t3)",marginBottom:4}}>📤 SENT MESSAGE</div>
+                        {f["AI Output (Sent)"]}
+                      </div>
+                      <details style={{marginBottom:8}}>
+                        <summary style={{fontSize:10,color:"var(--t3)",cursor:"pointer"}}>Show template + AI input context</summary>
+                        <div style={{marginTop:6,padding:8,background:"var(--hover)",borderRadius:4,fontSize:10,color:"var(--t2)",whiteSpace:"pre-wrap"}}>
+                          <div style={{fontSize:9,color:"var(--t3)",marginBottom:4}}>📝 TEMPLATE USED</div>
+                          {f["Template Used"] || "(none)"}
+                          <div style={{fontSize:9,color:"var(--t3)",margin:"10px 0 4px"}}>🧠 AI INPUT CONTEXT</div>
+                          {f["AI Input Context"] || "(none)"}
+                        </div>
+                      </details>
+                      {status === "needs_review" && (
+                        <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                          <button className="btn btn-s" style={{borderColor:"var(--grn)",color:"var(--grn)"}} onClick={()=>act(it.id, "approve")}>✓ Approve</button>
+                          <button className="btn btn-s" style={{borderColor:"var(--red)",color:"var(--red)"}} onClick={async()=>{
+                            const notes = prompt("Why is this message problematic? (Optional — helps improve the AI prompt over time)");
+                            if (notes !== null) {
+                              await fetch("/api/outreach", {
+                                method:"POST", headers:{"Content-Type":"application/json"},
+                                body: JSON.stringify({ action:"review_action", baseId, itemId: it.id, action:"flag", notes }),
+                              });
+                              await load();
+                            }
+                          }}>⚠ Flag</button>
+                          {f["LinkedIn URL"] && <a href={f["LinkedIn URL"]} target="_blank" rel="noreferrer" style={{fontSize:10,color:"var(--blu)",marginLeft:"auto"}}>open LinkedIn ↗</a>}
+                        </div>
+                      )}
+                      {f["Reviewer Notes"] && (
+                        <div style={{marginTop:6,padding:8,background:"rgba(239,68,68,.06)",borderLeft:"3px solid var(--red)",fontSize:10,color:"var(--t2)"}}>
+                          <strong>Reviewer notes:</strong> {f["Reviewer Notes"]}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    )}
+  </>);
 }
