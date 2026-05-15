@@ -52,18 +52,36 @@ function formatCard(record) {
     lead_title: f["Lead Title"] || f.Title || "",
     lead_email: f.Email || "",
     lead_linkedin: f["LinkedIn URL"] || f["Linkedin URL"] || "",
+    lead_phone: f.Phone || "",
     score: typeof f.Score === "number" ? f.Score : 0,
     task_type: f["Task Type"] || "",
     task_rule: f["Task Rule"] || "",
     source: f.Source || "",
     signal: f.Signal || "",
     score_reason: f["Score Reason"] || "",
+    movement_type: f["Movement Type"] || "",
     url: f.URL || f["Post URL"] || f["Signal URL"] || "",
     account_id: f["Account ID"] || "",
     event_id: f["Event ID"] || "",
     created_at: f.Created || f.Date || "",
   };
 }
+
+// Filter formula:
+//   1. Handled At must be empty (pending)
+//   2. AND: either the task is NOT one of the time-sensitive types
+//      (engagement = GA, linkedin_engagement = LinkedIn Posts, lead_movement = RapidAPI movement),
+//      OR Created within last 7 days.
+//   Per Kunal: GA, LinkedIn engagement, and movement-detected signals all
+//   go stale after a week. Top X and Unipile triggers stay regardless.
+//
+//   FIND("engagement", {Task Type}) matches BOTH "engagement" (GA) and
+//   "linkedin_engagement" (LinkedIn Posts) in one check.
+//
+//   Assumes Created is a dateTime field — setup-fix ensures this. Older
+//   text-type Created columns will fail DATETIME comparisons silently and
+//   tasks fall through unfiltered (acceptable degraded behaviour).
+const PENDING_FILTER = `AND({Handled At} = BLANK(), OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
 
 export async function GET(request) {
   if (!authOk(request)) {
@@ -80,10 +98,10 @@ export async function GET(request) {
   }
   const limit = Math.min(parseInt(url.searchParams.get("limit") || "20", 10) || 20, 100);
 
-  // Filter: tasks where Handled At is empty (i.e. still pending).
+  // Filter (PENDING_FILTER above): pending tasks, excluding stale GA-engagement (>7d).
   // Sort: highest Score first, then most recent Created.
   const params = new URLSearchParams({
-    filterByFormula: `{Handled At} = BLANK()`,
+    filterByFormula: PENDING_FILTER,
     "sort[0][field]": "Score",
     "sort[0][direction]": "desc",
     "sort[1][field]": "Created",

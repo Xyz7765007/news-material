@@ -39,16 +39,17 @@ export async function GET(request) {
     return NextResponse.json({ ok: false, error: "baseId query param required" }, { status: 400 });
   }
 
-  // Fetch only the Name field (smallest possible payload) with the same
-  // filter as /feed. Walk pages to get a true total. Most campaigns
-  // won't have >100 pending tasks at any time, so this is fast.
+  // Same filter as /feed (see comments there) — keeps badge consistent.
+  // Time-sensitive types (engagement, linkedin_engagement, lead_movement) age
+  // out after 7 days; all other types remain regardless of age.
+  const PENDING_FILTER = `AND({Handled At} = BLANK(), OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
   let total = 0;
   let offset = "";
   let pages = 0;
   try {
     while (pages < 10) { // safety cap; 10 pages × 100 = 1000 tasks
       const params = new URLSearchParams({
-        filterByFormula: `{Handled At} = BLANK()`,
+        filterByFormula: PENDING_FILTER,
         "fields[]": "Name",
         pageSize: "100",
       });

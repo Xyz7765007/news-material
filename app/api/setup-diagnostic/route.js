@@ -81,6 +81,14 @@ const SCHEMA_REQUIREMENTS = {
       "Handled At": "any",    // Side Kick chatbot: empty = pending in feed, filled = resolved
       "Handled As": "any",    // "done" or "skip" — set by /api/sidekick/action
     },
+    "Sidekick Chat": {
+      "Role": "any",
+      "Text": "any",
+      "Created At": "any",
+      "Intent": "any",
+      "Action Type": "any",
+      "Action Result": "any",
+    },
     "Sent Messages Review": {
       "Lead Name": "any",
       "AI Output (Sent)": "any",

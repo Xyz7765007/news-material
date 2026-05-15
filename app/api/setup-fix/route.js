@@ -109,6 +109,34 @@ const MASTER_TABLES = {
     { name: "Errors Count", type: "number", options: { precision: 0 } },
     { name: "Details", type: "multilineText" },
   ],
+  // ─── Movement Scan Runs ────────────────────────────────────────
+  // State machine for chunked movement scans. One row = one user-initiated
+  // scan. The GitHub Actions cron polls /api/sidekick/movement-scan-tick
+  // every 5 min, finds rows where State=running, processes one batch each,
+  // and updates running totals here. When a batch returns done=true, State
+  // flips to done and the cron stops processing that row.
+  "Movement Scan Runs": [
+    { name: "Campaign ID", type: "singleLineText" },
+    { name: "Base ID", type: "singleLineText" },
+    { name: "State", type: "singleSelect", options: { choices: [
+      { name: "running" },
+      { name: "done" },
+      { name: "error" },
+      { name: "cancelled" },
+    ] } },
+    { name: "Started At", type: "dateTime", options: TZ_ISO },
+    { name: "Last Tick At", type: "dateTime", options: TZ_ISO },
+    { name: "Completed At", type: "dateTime", options: TZ_ISO },
+    { name: "Batches Run", type: "number", options: { precision: 0 } },
+    { name: "Total Processed", type: "number", options: { precision: 0 } },
+    { name: "Total Tasks Created", type: "number", options: { precision: 0 } },
+    { name: "Total Cost USD", type: "number", options: { precision: 4 } },
+    { name: "Hired Count", type: "number", options: { precision: 0 } },
+    { name: "Promoted Count", type: "number", options: { precision: 0 } },
+    { name: "Exited Count", type: "number", options: { precision: 0 } },
+    { name: "Latest Batch Summary", type: "multilineText" },
+    { name: "Error", type: "multilineText" },
+  ],
 };
 
 const CAMPAIGN_TABLES = {
@@ -151,6 +179,20 @@ const CAMPAIGN_TABLES = {
     { name: "Handled At", type: "dateTime", options: TZ_ISO },
     { name: "Handled As", type: "singleSelect", options: { choices: [{ name: "done" }, { name: "skip" }] } },
     { name: "Handled Notes", type: "multilineText" },
+  ],
+
+  // ─── Sidekick Chat — persistent chat history + dynamic memory ──
+  // The chatbot reads this table on mount to restore prior conversations
+  // and writes each user / bot exchange so Claude has multi-session context.
+  // Over time this becomes the "dynamic memory" that lets the system learn
+  // the operator's patterns (which rules they run, what they skip, etc).
+  "Sidekick Chat": [
+    { name: "Role", type: "singleSelect", options: { choices: [{ name: "user" }, { name: "bot" }] } },
+    { name: "Text", type: "multilineText" },
+    { name: "Created At", type: "dateTime", options: TZ_ISO },
+    { name: "Intent", type: "singleLineText" },          // what Claude classified the user msg as
+    { name: "Action Type", type: "singleLineText" },     // scan | refresh | status | null
+    { name: "Action Result", type: "multilineText" },    // JSON of execution outcome (for bot messages)
   ],
   "Sent Messages Review": [
     { name: "Lead Name", type: "singleLineText" },

@@ -445,7 +445,15 @@ async function handleScan({
 
   let apiCallsMade = 0;
   let fatalQuotaError = false; // flips true on monthly_quota_exhausted; aborts remaining work
+  let timedOut = false;         // flips true when we exceed time budget; lets us exit cleanly
+  let processedCount = 0;       // how many leads in this batch we actually completed (for log clarity)
   const perCallCost = await getRapidAPICost(campaignId);
+
+  // Time budget: Vercel kills serverless functions at maxDuration (300s).
+  // We exit cleanly at 270s so partial work persists and a continuation call
+  // can pick up via freshnessSkipDays (already-stamped leads are skipped).
+  const SCAN_BUDGET_MS = 270 * 1000;
+  const scanStartedAt = Date.now();
 
   // Process with concurrency control
   for (let i = 0; i < leadsToProcess.length; i += concurrency) {
@@ -453,6 +461,15 @@ async function handleScan({
     // that will all 429. Already-fired calls in this slice still complete.
     if (fatalQuotaError) {
       console.warn(`[lead-movement] aborting batch after ${apiCallsMade} calls — RapidAPI monthly quota exhausted`);
+      break;
+    }
+    // Time budget check — bail out cleanly before Vercel timeout (300s) hits.
+    // Leads already processed have Last LinkedIn Check stamped, so re-running
+    // the scan picks up where we left off via freshnessSkipDays.
+    const elapsed = Date.now() - scanStartedAt;
+    if (elapsed > SCAN_BUDGET_MS) {
+      console.warn(`[lead-movement] time budget exceeded (${Math.round(elapsed/1000)}s); bailing at ${processedCount}/${leadsToProcess.length} leads. Re-run to continue.`);
+      timedOut = true;
       break;
     }
     const slice = leadsToProcess.slice(i, i + concurrency);
@@ -534,6 +551,9 @@ async function handleScan({
         tasksToCreate.push(taskFields);
       }
     }));
+    // Successfully completed this slice — track progress so timeout bailout
+    // log shows accurate "X/Y leads processed before timing out"
+    processedCount += slice.length;
   }
 
   // Bulk update leads
@@ -565,12 +585,8 @@ async function handleScan({
     });
   }
 
-  console.log(
-    `[lead-movement] batch done: ${processed.total} leads → ` +
-    `${processed.hired}H / ${processed.promoted}P / ${processed.exited}E / ` +
-    `${processed.none}N / ${processed.stale}S / ${processed.unavailable}U; ` +
-    `tasks created: ${taskResult.created}; cost: $${batchCostUSD.toFixed(4)}`
-  );
+  const summary = `${processed.total} leads → ${processed.hired}H / ${processed.promoted}P / ${processed.exited}E / ${processed.none}N / ${processed.stale}S / ${processed.unavailable}U; tasks created: ${taskResult.created}; cost: $${batchCostUSD.toFixed(4)}${timedOut ? ` (TIMED OUT at ${processedCount}/${leadsToProcess.length} — re-run to continue)` : ""}`;
+  console.log(`[lead-movement] batch done: ${summary}`);
   if (Object.keys(errorTallies).length > 0) {
     const breakdown = Object.entries(errorTallies)
       .sort((a, b) => b[1] - a[1])
@@ -579,15 +595,66 @@ async function handleScan({
     console.log(`[lead-movement] error breakdown: ${breakdown}`);
   }
 
+  // ─── Persist run summary to Cron Run Log (master base) ─────────
+  // Gives the operator a permanent record in Airtable they can see without
+  // tailing Vercel logs. Failure here is non-fatal — we still return success
+  // to the caller. Uses the existing Cron Run Log schema (Cron Name, Run At,
+  // Trigger, Status, Duration ms, Errors Count, Details).
+  try {
+    const MASTER_BASE_ID = process.env.AIRTABLE_BASE_ID;
+    const AIRTABLE_KEY = process.env.AIRTABLE_API_KEY;
+    if (MASTER_BASE_ID && AIRTABLE_KEY) {
+      const totalErrors = Object.values(errorTallies).reduce((a, b) => a + b, 0);
+      const errorBreakdown = Object.keys(errorTallies).length
+        ? Object.entries(errorTallies).sort((a, b) => b[1] - a[1]).map(([c, n]) => `${c}=${n}`).join(", ")
+        : "";
+      const status = fatalQuotaError ? "quota_exhausted" : (timedOut ? "timeout" : "complete");
+      const details = [
+        `Campaign: ${campaignId || "(n/a)"}`,
+        `Processed: ${processedCount}/${leadsToProcess.length} leads`,
+        `Movements: ${processed.hired} hired, ${processed.promoted} promoted, ${processed.exited} exited`,
+        `Tasks created: ${taskResult.created}`,
+        `Cost: $${batchCostUSD.toFixed(4)}`,
+        errorBreakdown ? `Errors: ${errorBreakdown}` : null,
+        timedOut ? `⚠ Hit 270s budget — re-run to continue. Freshness-skip handles dedup.` : null,
+        fatalQuotaError ? `✗ RapidAPI quota exhausted` : null,
+      ].filter(Boolean).join("\n");
+
+      const logFields = {
+        "Cron Name": "Movement Scan",
+        "Run At": new Date(scanStartedAt).toISOString(),
+        "Trigger": "Manual",
+        "Status": status,
+        "Duration ms": Date.now() - scanStartedAt,
+        "Errors Count": totalErrors,
+        "Details": details,
+      };
+      await fetch(`https://api.airtable.com/v0/${MASTER_BASE_ID}/${encodeURIComponent("Cron Run Log")}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${AIRTABLE_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ fields: logFields, typecast: true }),
+      });
+    }
+  } catch (e) {
+    // Non-fatal — keep going
+    console.warn(`[lead-movement] failed to write Cron Run Log: ${e.message}`);
+  }
+
   return {
     ok: true,
     processed,
+    processedCount,             // how many leads this batch actually completed
+    batchSize: leadsToProcess.length, // how many were planned
     tasksCreated: taskResult.created,
     leadsUpdated: updateResult.updated,
     costUSD: Math.round(batchCostUSD * 10000) / 10000,
     errors: errors.slice(0, 20), // cap to avoid response bloat
     nextCursor: fatalQuotaError ? null : continuationCursor,
-    done: fatalQuotaError || !continuationCursor,
+    // done=false on timeout so the UI/cron knows to re-run. Re-runs naturally
+    // skip already-stamped leads via freshnessSkipDays — no manual cursor needed.
+    done: fatalQuotaError ? true : (timedOut ? false : !continuationCursor),
+    timedOut,
+    elapsedMs: Date.now() - scanStartedAt,
     // Surface fatal state so UI can show the right message
     fatalError: fatalQuotaError
       ? "RapidAPI monthly quota exhausted. Upgrade your plan at https://rapidapi.com/freshdata-freshdata-default/api/fresh-linkedin-profile-data or wait until your next billing cycle."
