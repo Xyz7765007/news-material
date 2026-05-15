@@ -117,6 +117,79 @@ export async function GET(request) {
   report.diagnosis.push(`Campaigns API returned ${report.rawCampaignsApiCall.recordCount} record(s).`);
   report.diagnosis.push(`Of those, ${outreachCampaigns.length} have "linkedin_outreach" in Features.`);
 
+  // ─── Call 3: For each outreach campaign, dump its Task Rules ─
+  // This is what the cron does next. We mirror it to see the same data.
+  report.outreachCampaignTaskRules = [];
+  for (const c of outreachCampaigns) {
+    const trUrl = `https://api.airtable.com/v0/${c.baseId}/${encodeURIComponent("Task Rules")}`;
+    const entry = {
+      campaignName: c.name,
+      campaignBaseId: c.baseId,
+      taskRulesUrl: trUrl,
+      status: null,
+      rules: [],
+    };
+    try {
+      const r = await fetch(trUrl, { headers: { Authorization: `Bearer ${AIRTABLE_KEY}` } });
+      entry.status = r.status;
+      if (!r.ok) {
+        entry.errorBody = (await r.text()).slice(0, 300);
+        report.diagnosis.push(`⚠ "${c.name}" Task Rules API returned HTTP ${r.status}. Cron will also see this error.`);
+      } else {
+        const d = await r.json();
+        for (const rec of (d.records || [])) {
+          const f = rec.fields || {};
+          const taskType = f["Task Type"];
+          let outreachConfig;
+          try { outreachConfig = JSON.parse(f["Outreach Config"] || "{}"); }
+          catch (e) { outreachConfig = { _parseError: e.message }; }
+          entry.rules.push({
+            recordId: rec.id,
+            name: f.Name || "(no Name)",
+            TaskType_raw_value: taskType,
+            TaskType_raw_type: typeof taskType,
+            TaskType_length: typeof taskType === "string" ? taskType.length : null,
+            TaskType_charCodes: typeof taskType === "string" ? Array.from(taskType).map(c => c.charCodeAt(0)) : null,
+            TaskType_equals_linkedin_outreach: taskType === "linkedin_outreach",
+            outreachConfig_active: outreachConfig.active,
+            outreachConfig_hasAccountId: !!outreachConfig.accountId,
+            outreachConfig_accountIdValue: outreachConfig.accountId || "(missing)",
+            outreachConfig_keys: Object.keys(outreachConfig),
+            all_field_names: Object.keys(f),
+          });
+        }
+
+        // Inline diagnosis per campaign
+        const matchingRules = entry.rules.filter(r => r.TaskType_equals_linkedin_outreach);
+        const activeRules = matchingRules.filter(r => r.outreachConfig_active === true);
+        report.diagnosis.push(`"${c.name}" has ${entry.rules.length} Task Rule(s); ${matchingRules.length} with Task Type=linkedin_outreach; ${activeRules.length} with outreachConfig.active=true.`);
+
+        // Common mistakes
+        for (const ru of entry.rules) {
+          if (!ru.TaskType_equals_linkedin_outreach) {
+            if (typeof ru.TaskType_raw_value === "string" && ru.TaskType_raw_value.trim() === "linkedin_outreach") {
+              report.diagnosis.push(`⚠ Rule "${ru.name}" has Task Type with whitespace: "${ru.TaskType_raw_value}" — invisible spaces around the value. Trim it in Airtable.`);
+            } else if (typeof ru.TaskType_raw_value === "string" && /linkedin/i.test(ru.TaskType_raw_value)) {
+              report.diagnosis.push(`⚠ Rule "${ru.name}" has Task Type="${ru.TaskType_raw_value}" — close but not exact match for "linkedin_outreach"`);
+            } else if (ru.TaskType_raw_value == null) {
+              report.diagnosis.push(`⚠ Rule "${ru.name}" has NO Task Type set (field empty or column missing).`);
+            } else {
+              report.diagnosis.push(`⚠ Rule "${ru.name}" Task Type is ${ru.TaskType_raw_type}: ${JSON.stringify(ru.TaskType_raw_value)} — not "linkedin_outreach".`);
+            }
+          } else if (ru.outreachConfig_active !== true) {
+            report.diagnosis.push(`⚠ Rule "${ru.name}" has Task Type=linkedin_outreach but outreachConfig.active is "${ru.outreachConfig_active}" (need exactly true). Edit the rule in UI and toggle Active ON.`);
+          } else if (!ru.outreachConfig_hasAccountId) {
+            report.diagnosis.push(`⚠ Rule "${ru.name}" is active but has no LinkedIn accountId set. Edit the rule and pick the LinkedIn account it should send from.`);
+          }
+        }
+      }
+    } catch (e) {
+      entry.error = e.message;
+      report.diagnosis.push(`⚠ Task Rules fetch for "${c.name}" threw: ${e.message}`);
+    }
+    report.outreachCampaignTaskRules.push(entry);
+  }
+
   if (outreachCampaigns.length === 0) {
     report.diagnosis.push("⚠ ZERO campaigns matched linkedin_outreach. Common causes:");
     report.diagnosis.push("  1. The base in Vercel env (AIRTABLE_BASE_ID) is different from the base you're editing in Airtable UI");
