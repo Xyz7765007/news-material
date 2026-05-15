@@ -2555,6 +2555,38 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       }}>Edit</button><button className="btn btn-s" onClick={()=>duplicateRule(r)} title="Duplicate"><I.Copy/></button><button className="btn btn-d btn-s" onClick={()=>del("Task Rules",[r.id],setRules)}><I.Trash/></button></div>
     </div>)})}</div>
   </div>)}
+
+  {/* Outreach Rules summary on Task Rules tab (the actual editor lives on LinkedIn Automation tab) */}
+  {(() => {
+    const outRules = rules.filter(r => (r.fields || {})["Task Type"] === "linkedin_outreach");
+    if (outRules.length === 0) return null;
+    return (
+      <div style={{marginTop:20}}>
+        <div style={{fontSize:11,fontWeight:600,color:"var(--t2)",marginBottom:8}}>🔗 LinkedIn Outreach Rules</div>
+        <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          {outRules.map(r => {
+            const f = r.fields || {};
+            let config; try { config = JSON.parse(f["Outreach Config"] || "{}"); } catch { config = {}; }
+            const seq = config.dmSequence || [];
+            return (
+              <div key={r.id} style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <div>
+                  <div style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>{f.Name}</div>
+                  <div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>
+                    {config.leadsPerBatch || 10} leads/batch · {seq.length} DM steps · {config.connectionsPerDay || 5}/day · {config.active ? <span style={{color:"var(--grn)"}}>● active</span> : <span style={{color:"var(--amb)"}}>○ inactive</span>}
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                  <span style={{fontSize:10,color:"var(--t3)"}}>Edit on the</span>
+                  <button className="btn btn-s btn-p" onClick={()=>setTab("outreach")}>💬 LinkedIn Automation tab →</button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  })()}
   </>}</div>)}
 
   {/* PROMPTS */}
