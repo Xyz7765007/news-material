@@ -5546,6 +5546,7 @@ function TriggersTab({ baseId, campaign }) {
   const [status, setStatus] = useState(null);
   const [triggers, setTriggers] = useState([]);
   const [sourceFilter, setSourceFilter] = useState("all"); // all | Unipile | GA | LinkedIn Posts (RapidAPI)
+  const [accountFilter, setAccountFilter] = useState("all"); // all | <account_id> — narrows feed to a single account
   const [windowDays, setWindowDays] = useState(7);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshResult, setRefreshResult] = useState(null);
@@ -5592,7 +5593,10 @@ function TriggersTab({ baseId, campaign }) {
   useEffect(() => {
     loadStatus();
     loadTriggers();
-  }, [baseId, windowDays]);
+    // Also load routing data (silently) so we have account_id → name lookup
+    // for the breakdown widget. Doesn't depend on user expanding the routing panel.
+    loadRouting().catch(() => {});
+  }, [baseId, windowDays]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Manual refresh — pulls fresh data from Unipile (profile views, reactions),
   // creates tasks for any new events, then reloads the triggers list.
@@ -5667,9 +5671,14 @@ function TriggersTab({ baseId, campaign }) {
   }, [unroutedExpanded]);
 
   // Group triggers by source for the dashboard cards
-  const filteredTriggers = sourceFilter === "all"
+  // Step 1: apply source filter
+  const sourceFiltered = sourceFilter === "all"
     ? triggers
     : triggers.filter(t => t.task_type?.startsWith(sourceFilter.toLowerCase()));
+  // Step 2: apply account filter
+  const filteredTriggers = accountFilter === "all"
+    ? sourceFiltered
+    : sourceFiltered.filter(t => (t.account_id || "(none)") === accountFilter);
 
   const counts = {
     all: triggers.length,
@@ -5678,9 +5687,41 @@ function TriggersTab({ baseId, campaign }) {
     posts: triggers.filter(t => t.task_type === "linkedin_engagement").length,
   };
 
+  // ─── Per-account breakdown ────────────────────────────────────
+  // Build a lookup: account_id → human-readable name (from routing data we
+  // silently loaded). Falls back to a truncated account_id if not mapped yet.
+  const accountNameById = {};
+  if (routingData?.accounts) {
+    for (const a of routingData.accounts) {
+      if (a.account_id) accountNameById[a.account_id] = a.name || a.account_id;
+    }
+  }
+  const labelForAccountId = (id) => {
+    if (!id) return "(no account_id)";
+    if (accountNameById[id]) return accountNameById[id];
+    // Unmapped — show truncated ID so user can still distinguish accounts
+    return `Unmapped · ${id.slice(0, 8)}…`;
+  };
+
+  // Group sourceFiltered (NOT filteredTriggers — we want full per-account view,
+  // not narrowed-by-current-account) by account_id, then by event type.
+  // Result: [{ accountId, name, total, byType: {dm:N, conn:N, react:N, ...} }, ...]
+  const accountBreakdown = (() => {
+    const m = {};
+    for (const t of sourceFiltered) {
+      const id = t.account_id || "(none)";
+      if (!m[id]) m[id] = { accountId: id, name: labelForAccountId(id), total: 0, byType: {} };
+      m[id].total++;
+      const tt = t.task_type || "unknown";
+      m[id].byType[tt] = (m[id].byType[tt] || 0) + 1;
+    }
+    return Object.values(m).sort((a, b) => b.total - a.total);
+  })();
+
   const triggerTypeLabels = {
     unipile_message_reply: "📬 DM Reply",
     unipile_connection_accepted: "🤝 Connection Accepted",
+    unipile_message_reaction: "😊 DM Reaction",
     unipile_post_comment_on_yours: "💬 Comment on your Post",
     unipile_post_reaction_on_yours: "👍 Reaction on your Post",
     unipile_profile_view: "👀 Profile View",
@@ -5901,6 +5942,67 @@ function TriggersTab({ baseId, campaign }) {
       </div>
     </div>
 
+    {/* ─── PER-ACCOUNT BREAKDOWN ───────────────────────────────
+        Shows event volume by LinkedIn account so you can see at a glance
+        which account is generating engagement. Click an account to filter
+        the feed below to just that account's events. */}
+    {accountBreakdown.length > 0 && (
+      <div style={{marginBottom:14,padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+          <div style={{fontSize:12,fontWeight:600,color:"var(--t1)"}}>👥 Activity by Account <span style={{color:"var(--t3)",fontWeight:400,marginLeft:6,fontSize:10}}>— click to filter feed</span></div>
+          {accountFilter !== "all" && (
+            <button className="btn btn-s" onClick={()=>setAccountFilter("all")} style={{fontSize:10}}>✕ Clear filter</button>
+          )}
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))",gap:8}}>
+          {accountBreakdown.map(a => {
+            const isSelected = accountFilter === a.accountId;
+            const unmapped = a.name.startsWith("Unmapped ·");
+            return (
+              <button
+                key={a.accountId}
+                onClick={()=>setAccountFilter(isSelected ? "all" : a.accountId)}
+                style={{
+                  textAlign:"left",
+                  padding:"10px 12px",
+                  background: isSelected ? "var(--amb)" : "var(--hover)",
+                  color: isSelected ? "var(--bg)" : "var(--t1)",
+                  border: `1px solid ${isSelected ? "var(--amb)" : "var(--bdr)"}`,
+                  borderRadius:6,
+                  cursor:"pointer",
+                  display:"flex",
+                  flexDirection:"column",
+                  gap:4,
+                }}
+                title={`account_id: ${a.accountId}`}
+              >
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",gap:8}}>
+                  <strong style={{fontSize:12,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                    {unmapped ? "⚠ " : ""}{a.name}
+                  </strong>
+                  <span style={{fontSize:16,fontWeight:700}}>{a.total}</span>
+                </div>
+                <div style={{fontSize:10,color:isSelected?"var(--bg)":"var(--t3)",display:"flex",flexWrap:"wrap",gap:6}}>
+                  {Object.entries(a.byType)
+                    .sort((x,y)=>y[1]-x[1])
+                    .slice(0,4)
+                    .map(([type, count]) => {
+                      const lbl = triggerTypeLabels[type] || type.replace(/^unipile_/, "").replace(/_/g, " ");
+                      return <span key={type} style={{opacity:0.85}}>{lbl}: <strong>{count}</strong></span>;
+                    })}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+        {accountBreakdown.some(a => a.name.startsWith("Unmapped ·")) && (
+          <div style={{marginTop:10,fontSize:10,color:"var(--amb)"}}>
+            ⚠ Some accounts aren't mapped to campaigns yet — open the 🔀 Account Routing panel above to assign them.
+          </div>
+        )}
+      </div>
+    )}
+
     {/* Triggers feed */}
     {loading ? (
       <div style={{padding:40,textAlign:"center",color:"var(--t3)"}}>Loading triggers...</div>
@@ -5917,7 +6019,10 @@ function TriggersTab({ baseId, campaign }) {
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,marginBottom:8}}>
               <div>
                 <div style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>{t.name || "Unknown lead"}</div>
-                <div style={{fontSize:11,color:"var(--t3)"}}>{t.company || ""}{t.created ? ` · ${new Date(t.created).toLocaleString()}` : ""}</div>
+                <div style={{fontSize:11,color:"var(--t3)"}}>
+                  {t.company || ""}{t.created ? ` · ${new Date(t.created).toLocaleString()}` : ""}
+                  {t.account_id && <> · via <strong style={{color:"var(--t2)"}}>{labelForAccountId(t.account_id)}</strong></>}
+                </div>
               </div>
               <div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}>
                 <span style={{padding:"3px 8px",background:"var(--hover)",borderRadius:4,fontSize:10,color:"var(--t2)"}}>{triggerTypeLabels[t.task_type] || t.task_type}</span>

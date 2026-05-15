@@ -167,6 +167,13 @@ const TRIGGER_DEFINITIONS = {
     source: "Unipile",
     surface: "poll",
   },
+  unipile_message_reaction: {
+    label: "😊 Lead reacted to your DM",
+    description: "Lead reacted with emoji to your message — engagement signal",
+    default_score: 60,
+    source: "Unipile",
+    surface: "webhook",
+  },
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -403,7 +410,12 @@ async function handleWebhook(request, fallbackBaseId) {
   const accountId = body.account_id || body.account?.id || null;
   const eventId = body.event_id || body.message_id || body.id || `${eventType}-${Date.now()}`;
 
+  // Verbose payload logging — invaluable for debugging field extraction issues.
+  // Logs first 1500 chars of raw payload so we can see what Unipile actually sent.
   console.log(`[unipile-triggers] Webhook received: type=${eventType} account=${accountId} event=${eventId}`);
+  try {
+    console.log(`[unipile-triggers] Raw payload: ${JSON.stringify(body).slice(0, 1500)}`);
+  } catch {}
 
   // Map Unipile event → our trigger type
   let triggerType = null;
@@ -416,9 +428,17 @@ async function handleWebhook(request, fallbackBaseId) {
     case "new_message":
     case "message_received":
       triggerType = "unipile_message_reply";
-      signalText = (body.message?.text || body.text || "").slice(0, 500);
+      signalText = (body.message?.text || body.text || body.message || "").toString().slice(0, 500);
       evidenceUrl = body.chat_url || body.message?.url || "";
-      leadLinkedInData = body.sender || body.from || body.attendee || {};
+      // Unipile message payload has `sender` object with attendee_provider_id.
+      // Normalize: surface the provider_id under canonical name so findLead matches.
+      // Real shape: { sender: { attendee_id, attendee_provider_id, ... } }
+      leadLinkedInData = {
+        provider_id: body.sender?.attendee_provider_id || body.sender?.provider_id || body.from?.provider_id || null,
+        public_identifier: body.sender?.attendee_public_identifier || body.sender?.public_identifier || null,
+        profile_url: body.sender?.attendee_profile_url || body.sender?.profile_url || null,
+        full_name: body.sender?.attendee_name || body.sender?.name || null,
+      };
       break;
 
     case "users.relations.created":
@@ -426,9 +446,29 @@ async function handleWebhook(request, fallbackBaseId) {
     case "connection_accepted":
     case "invitation_accepted":
       triggerType = "unipile_connection_accepted";
-      signalText = `Connection accepted on ${new Date().toLocaleDateString()}`;
-      leadLinkedInData = body.user || body.relation || {};
+      // Unipile new_relation payload is FLAT — fields are at top level with `user_` prefix.
+      // Real shape per docs: { user_provider_id, user_public_identifier, user_profile_url, user_full_name }
+      // (NOT nested under body.user or body.relation as I previously assumed)
+      leadLinkedInData = {
+        provider_id: body.user_provider_id || body.user?.provider_id || null,
+        public_identifier: body.user_public_identifier || body.user?.public_identifier || null,
+        profile_url: body.user_profile_url || body.user?.profile_url || null,
+        full_name: body.user_full_name || body.user?.full_name || null,
+      };
+      signalText = `Connection accepted${leadLinkedInData.full_name ? ` (${leadLinkedInData.full_name})` : ""} on ${new Date().toLocaleDateString()}`;
       evidenceUrl = leadLinkedInData.profile_url || "";
+      break;
+
+    case "message_reaction":
+      // Reaction on a DM — score 60. The reactor data is in body.sender like message_received.
+      triggerType = "unipile_message_reaction";
+      signalText = `Reacted to your DM with ${body.reaction || body.message?.reaction || ""}`;
+      leadLinkedInData = {
+        provider_id: body.sender?.attendee_provider_id || body.sender?.provider_id || null,
+        public_identifier: body.sender?.attendee_public_identifier || null,
+        profile_url: body.sender?.attendee_profile_url || null,
+        full_name: body.sender?.attendee_name || null,
+      };
       break;
 
     case "post.commented":
@@ -440,10 +480,22 @@ async function handleWebhook(request, fallbackBaseId) {
       leadLinkedInData = body.author || body.commenter || body.user || {};
       break;
 
+    case "account_status":
+    case "credentials_expired":
+    case "account_disconnected":
+    case "creation_success":
+    case "creation_fail":
+      // Ops event — log it but don't try to create a lead task. Will route to
+      // Slack notification in a future build. For now, just acknowledge.
+      console.log(`[unipile-triggers] Account status event: ${eventType} for account ${accountId}. Body: ${JSON.stringify(body).slice(0, 300)}`);
+      return NextResponse.json({ ok: true, ignored: true, reason: "account_status events not yet wired to Slack notifications", type: eventType, accountId });
+
     default:
-      console.log(`[unipile-triggers] Unhandled event type: ${eventType}`);
+      console.log(`[unipile-triggers] Unhandled event type: ${eventType}. Payload sample: ${JSON.stringify(body).slice(0, 300)}`);
       return NextResponse.json({ ok: true, ignored: true, reason: "unhandled event type", type: eventType });
   }
+
+  console.log(`[unipile-triggers] Extracted lead data: ${JSON.stringify(leadLinkedInData)}`);
 
   // ─── Account-based routing ───
   // Look up which campaign base this account_id belongs to. If not mapped,
@@ -642,6 +694,8 @@ export async function GET(request) {
           signal: r.fields?.Signal,
           url: r.fields?.URL,
           created: r.fields?.Created,
+          account_id: r.fields?.["Account ID"] || null,
+          event_id: r.fields?.["Event ID"] || null,
         })),
       });
     }
