@@ -1013,14 +1013,17 @@ async function processOutreachQueue(baseId, accountId, ruleConfig, campaignId = 
             "Next Action Date": nextDate,
           }}]);
           connSent++;
-          // Log the AI-personalised connection note for in-app review
+          // Log the AI-personalised connection note for in-app review.
+          // f comes from the Outreach record where the name is stored in
+          // "Lead Name" (not "Name"). Fall back across variants for safety.
           if (connMsg && ruleConfig.connectionMessage) {
+            const resolvedName = f["Lead Name"] || f.Name || f["Full Name"] || "Unknown";
             logAiMessageForReview(baseId, {
-              leadName: f.Name, leadLinkedInUrl: linkedinUrl, leadCompany: f.Company, leadTitle: f.Title,
+              leadName: resolvedName, leadLinkedInUrl: linkedinUrl, leadCompany: f.Company, leadTitle: f.Title,
               messageType: "connection_note",
               template: ruleConfig.connectionMessage,
               aiOutput: connMsg,
-              aiInputContext: JSON.stringify({ name: f.Name, company: f.Company, title: f.Title, signal: f.Signal }),
+              aiInputContext: JSON.stringify({ name: resolvedName, company: f.Company, title: f.Title, signal: f.Signal }),
               campaign, accountId,
             }).catch(()=>{});
           }
@@ -1110,12 +1113,13 @@ async function processOutreachQueue(baseId, accountId, ruleConfig, campaignId = 
           dmsSent++;
           // Log the DM send for in-app review (only when the step had AI personalisation)
           if (step.aiPersonalize) {
+            const resolvedName = f["Lead Name"] || f.Name || f["Full Name"] || "Unknown";
             logAiMessageForReview(baseId, {
-              leadName: f.Name, leadLinkedInUrl: f["LinkedIn URL"] || "", leadCompany: f.Company, leadTitle: f.Title,
+              leadName: resolvedName, leadLinkedInUrl: f["LinkedIn URL"] || "", leadCompany: f.Company, leadTitle: f.Title,
               messageType: `dm_step_${dmStep + 1}`,
               template: step.message,
               aiOutput: msg,
-              aiInputContext: JSON.stringify({ name: f.Name, company: f.Company, title: f.Title, signal: f.Signal, dmStep }),
+              aiInputContext: JSON.stringify({ name: resolvedName, company: f.Company, title: f.Title, signal: f.Signal, dmStep }),
               campaign,
               unipileChatId: existingChatId || chatRes.data?.chat_id || chatRes.data?.id || "",
               accountId,
