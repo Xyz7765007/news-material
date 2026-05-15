@@ -32,15 +32,26 @@ function authOk(request) {
 
 // Format an Airtable Tasks row into a chatbot-ready card payload.
 // Stable shape — the chatbot can rely on these field names.
+//
+// SignalScope's Tasks schema (from app/api/airtable/route.js line 998):
+//   - `Name` (primary) = the lead's name for lead-level tasks,
+//      or the account's name for account-level tasks.
+//   - `Company` = the lead's employer (lead tasks) or = Name (account tasks).
+//   - `Lead Title`, `Email`, `LinkedIn URL` = lead contact details, may be empty.
+//   - `Task Type` = "top_x" | "linkedin_engagement" | etc.
+//   - `Task Rule` = the rule name (e.g. "Top 50 leads", "VP marketing earnings").
+//
+// The chatbot can decide how to render — typically display `lead_name` as the
+// big subject + `company` as smaller context underneath.
 function formatCard(record) {
   const f = record.fields || {};
   return {
     id: record.id,
+    lead_name: f.Name || "",
     company: f.Company || "",
-    lead_name: f["Scan Target"] === "leads" ? (f["Lead Name"] || f.Name || "") : "",
-    lead_title: f["Lead Title"] || "",
+    lead_title: f["Lead Title"] || f.Title || "",
     lead_email: f.Email || "",
-    lead_linkedin: f["LinkedIn URL"] || "",
+    lead_linkedin: f["LinkedIn URL"] || f["Linkedin URL"] || "",
     score: typeof f.Score === "number" ? f.Score : 0,
     task_type: f["Task Type"] || "",
     task_rule: f["Task Rule"] || "",
@@ -48,7 +59,6 @@ function formatCard(record) {
     signal: f.Signal || "",
     score_reason: f["Score Reason"] || "",
     url: f.URL || f["Post URL"] || f["Signal URL"] || "",
-    scan_target: f["Scan Target"] || "accounts",
     account_id: f["Account ID"] || "",
     event_id: f["Event ID"] || "",
     created_at: f.Created || f.Date || "",
