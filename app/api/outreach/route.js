@@ -986,8 +986,12 @@ async function processOutreachQueue(baseId, accountId, ruleConfig, campaignId = 
     const status = f.Status || "queued";
     const nextAction = f["Next Action Date"] || "";
 
-    // Skip if next action is in the future
-    if (nextAction && nextAction > today) continue;
+    // Next Action Date filter — skip future-dated items EXCEPT for
+    // `connection_sent` which must always be checked for acceptance regardless.
+    // Otherwise the cron would never detect a connection acceptance until the
+    // hardcoded "check tomorrow" date arrives, missing acceptances that happen
+    // within the same day they were sent.
+    if (nextAction && nextAction > today && status !== "connection_sent") continue;
 
     // Respect caps per action type
     if (status === "queued" && connSent >= MAX_CONNECTIONS_PER_RUN) continue;
