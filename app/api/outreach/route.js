@@ -512,7 +512,89 @@ async function aiSelectLeads(leads, prompt, count, campaignId = null) {
   }
 }
 
-async function aiPersonalizeMessageWithMeta(template, lead, signal, companyName, campaignId = null) {
+// ═══════════════════════════════════════════════════════════════
+// AI OUTPUT SANITIZER
+// Defensive cleanup for anything coming out of the LLM. Catches the
+// common failure modes: leaked quotes, markdown formatting, code blocks,
+// refusal patterns ("I can't help with that"), and any merge fields the
+// AI failed to resolve. Run this on every AI message before sending.
+//
+// Returns { ok: true, text } on success, or { ok: false, reason } if the
+// output looks unsafe to send. Callers should fall back to deterministic
+// fillMergeFields when ok=false.
+// ═══════════════════════════════════════════════════════════════
+function sanitizeAiOutput(rawText, { lead, signal, companyName, maxLength = 8000 } = {}) {
+  if (!rawText || typeof rawText !== "string") {
+    return { ok: false, reason: "empty_or_non_string" };
+  }
+
+  let t = rawText.trim();
+
+  // Strip code-block fences (` ```...``` `) — AI sometimes wraps output
+  // in markdown code blocks despite instructions otherwise
+  t = t.replace(/^```[\w]*\s*\n?/m, "").replace(/\n?```\s*$/m, "").trim();
+
+  // Strip leading/trailing quotes (single, double, backtick, smart-quotes)
+  t = t.replace(/^["'`""'']+|["'`""'']+$/g, "").trim();
+
+  // Strip markdown formatting that would render as literal text in LinkedIn:
+  // **bold**, *italic*, __underline__, _italic_, `code`
+  t = t
+    .replace(/\*\*([^*]+)\*\*/g, "$1")  // **bold** → bold
+    .replace(/__([^_]+)__/g, "$1")       // __underline__ → underline
+    .replace(/(?<![*])\*([^*\n]+)\*(?![*])/g, "$1")  // *italic* → italic (not part of **)
+    .replace(/(?<![_])_([^_\n]+)_(?![_])/g, "$1")     // _italic_ → italic
+    .replace(/`([^`\n]+)`/g, "$1");      // `code` → code
+
+  // Detect AI refusals — these are deal breakers, fall back to deterministic
+  const refusalPatterns = [
+    /^(I'?m sorry|I apologize|I can'?t|I cannot|I'?m unable|Sorry,?|Unfortunately,?)\b/i,
+    /^As an AI/i,
+    /\bI don'?t have (the |enough )?(context|information|details)\b/i,
+    /\bI need more information\b/i,
+    /\b(unable|not able) to (help|provide|generate|create)\b/i,
+  ];
+  for (const p of refusalPatterns) {
+    if (p.test(t)) {
+      return { ok: false, reason: "ai_refusal", refusalSnippet: t.slice(0, 100) };
+    }
+  }
+
+  // CRITICAL: any unresolved merge field is a deal breaker
+  const unresolvedMerge = t.match(/\{[a-zA-Z_][a-zA-Z0-9_\s]*\}/);
+  if (unresolvedMerge) {
+    // Try to resolve it ourselves before giving up
+    if (lead) {
+      t = fillMergeFields(t, lead, signal || "", companyName || "");
+      // Re-check
+      if (/\{[a-zA-Z_][a-zA-Z0-9_\s]*\}/.test(t)) {
+        return { ok: false, reason: "unresolved_merge_field", field: unresolvedMerge[0] };
+      }
+    } else {
+      return { ok: false, reason: "unresolved_merge_field", field: unresolvedMerge[0] };
+    }
+  }
+
+  // Bracket placeholders like [NAME] or [YOUR COMPANY]
+  if (/\[[A-Z_ ]{3,}\]/.test(t)) {
+    return { ok: false, reason: "bracket_placeholder" };
+  }
+
+  if (!t.trim()) {
+    return { ok: false, reason: "empty_after_sanitize" };
+  }
+
+  // Length limit — caller specifies based on message type:
+  //   - LinkedIn connection note: 300 char limit, use 295 for safety
+  //   - LinkedIn DM: ~8000 char limit, use 7900 for safety
+  if (t.length > maxLength) {
+    return { ok: false, reason: "too_long", actualLength: t.length, maxLength };
+  }
+
+  return { ok: true, text: t };
+}
+
+async function aiPersonalizeMessageWithMeta(template, lead, signal, companyName, campaignId = null, options = {}) {
   // Always do deterministic merge first — this is our safety net
   const deterministic = fillMergeFields(template, lead, signal, companyName);
 
@@ -625,34 +707,35 @@ RULES:
       return { text: deterministic, method: "deterministic_empty_ai" };
     }
 
-    // Strip any leaked quotes around the whole message
-    const cleaned = aiMsg.replace(/^["'`]+|["'`]+$/g, "").trim();
+    // Run comprehensive sanitizer — handles quotes, markdown, code blocks,
+    // refusals, unresolved merge fields, length limits.
+    // maxLength comes from options.messageType:
+    //   - "connection_note" → 295 (LinkedIn limit 300)
+    //   - "dm" → 7900 (LinkedIn DM limit ~8000)
+    //   - default 8000 for safety
+    const maxLength = options.messageType === "connection_note" ? 295
+                    : options.messageType === "dm" ? 7900
+                    : 295; // default to connection-note-safe since most callers don't pass messageType
+    const sanitized = sanitizeAiOutput(aiMsg, { lead, signal, companyName, maxLength });
 
-    // CRITICAL SAFETY CHECK: if AI left any merge fields unresolved, don't trust it
-    const v = validateMessage(cleaned, "ai_output");
-    if (!v.ok) {
-      console.warn("[MERGE] AI returned message with unresolved fields, falling back:", v.error, "AI output:", cleaned.slice(0, 100));
-      return { text: deterministic, method: "deterministic_validation_failed" };
+    if (!sanitized.ok) {
+      console.warn(`[MERGE] AI output rejected (${sanitized.reason}). Falling back to deterministic. AI output: ${aiMsg.slice(0, 150)}`);
+      return { text: deterministic, method: `deterministic_${sanitized.reason}`, aiAttempt: aiMsg.slice(0, 150) };
     }
 
-    // Length safety
-    if (cleaned.length > 295) {
-      console.warn(`[MERGE] AI message too long (${cleaned.length} chars). Falling back to deterministic.`);
-      return { text: deterministic, method: "deterministic_too_long", aiAttempt: cleaned.slice(0, 100) };
-    }
-
-    console.log(`[MERGE] ✅ AI message generated for ${names.first || "lead"} (${cleaned.length} chars, ${hasGAContext ? "with GA" : "no GA"})`);
-    return { text: cleaned, method: hasGAContext ? "ai_with_ga" : "ai_no_ga" };
+    console.log(`[MERGE] ✅ AI message generated for ${names.first || "lead"} (${sanitized.text.length} chars, ${hasGAContext ? "with GA" : "no GA"})`);
+    return { text: sanitized.text, method: hasGAContext ? "ai_with_ga" : "ai_no_ga" };
   } catch (e) {
     console.error("[MERGE] AI personalization threw:", e.message, e.stack?.slice(0, 200));
     return { text: deterministic, method: "deterministic_error", error: e.message };
   }
 }
 
-// Backward-compat wrapper: returns just the string (most callers use this)
-async function aiPersonalizeMessage(template, lead, signal, companyName, campaignId = null) {
+// Backward-compat wrapper: returns just the string (most callers use this).
+// Options: { messageType: "connection_note" | "dm" } controls length limit.
+async function aiPersonalizeMessage(template, lead, signal, companyName, campaignId = null, options = {}) {
   try {
-    const result = await aiPersonalizeMessageWithMeta(template, lead, signal, companyName, campaignId);
+    const result = await aiPersonalizeMessageWithMeta(template, lead, signal, companyName, campaignId, options);
     return result?.text || fillMergeFields(template, lead, signal, companyName);
   } catch (e) {
     console.error("[MERGE] aiPersonalizeMessage wrapper threw:", e.message);
@@ -1004,10 +1087,13 @@ async function processOutreachQueue(baseId, accountId, ruleConfig, campaignId = 
         if (!linkedinUrl) continue;
 
         const connMsg = ruleConfig.connectionMessage
-          ? await aiPersonalizeMessage(ruleConfig.connectionMessage, f, f.Signal || "", f.Company || "", campaignId)
+          ? await aiPersonalizeMessage(ruleConfig.connectionMessage, f, f.Signal || "", f.Company || "", campaignId, { messageType: "connection_note" })
           : undefined;
+        // Final safety: enforce LinkedIn's 300-char connection note limit.
+        // If deterministic fallback exceeds it (long template), truncate.
+        const safeConnMsg = connMsg && connMsg.length > 295 ? connMsg.slice(0, 295).replace(/\s+\S*$/, "") : connMsg;
 
-        const res = await sendInvitation(accountId, linkedinUrl, connMsg);
+        const res = await sendInvitation(accountId, linkedinUrl, safeConnMsg);
         if (res.ok) {
           const daysGap = ruleConfig.daysAfterConnect || 2;
           const nextDate = new Date(now.getTime() + daysGap * 86400000).toISOString().slice(0, 10);
@@ -1020,13 +1106,13 @@ async function processOutreachQueue(baseId, accountId, ruleConfig, campaignId = 
           // Log the AI-personalised connection note for in-app review.
           // f comes from the Outreach record where the name is stored in
           // "Lead Name" (not "Name"). Fall back across variants for safety.
-          if (connMsg && ruleConfig.connectionMessage) {
+          if (safeConnMsg && ruleConfig.connectionMessage) {
             const resolvedName = f["Lead Name"] || f.Name || f["Full Name"] || "Unknown";
             logAiMessageForReview(baseId, {
               leadName: resolvedName, leadLinkedInUrl: linkedinUrl, leadCompany: f.Company, leadTitle: f.Title,
               messageType: "connection_note",
               template: ruleConfig.connectionMessage,
-              aiOutput: connMsg,
+              aiOutput: safeConnMsg,
               aiInputContext: JSON.stringify({ name: resolvedName, company: f.Company, title: f.Title, signal: f.Signal }),
               campaign, accountId,
             }).catch(()=>{});
@@ -1090,17 +1176,39 @@ async function processOutreachQueue(baseId, accountId, ruleConfig, campaignId = 
         }
 
         const step = sequence[dmStep];
+
+        // Empty-message guard — never send blank DMs
+        if (!step.message || !String(step.message).trim()) {
+          console.warn(`[OUTREACH] DM step ${dmStep + 1} has empty message — skipping ${f["Lead Name"] || "lead"}`);
+          // Bump next action so we don't loop on this every run
+          const skipDate = new Date(now.getTime() + 1 * 86400000).toISOString().slice(0, 10);
+          await atUpdate(baseId, "Outreach", [{ id: item.id, fields: { "Next Action Date": skipDate, Notes: `DM step ${dmStep + 1} skipped: empty message` }}]);
+          continue;
+        }
+
         const msg = step.aiGenerate
-          ? await aiPersonalizeMessage(step.message, f, f.Signal || "", f.Company || "", campaignId)
+          ? await aiPersonalizeMessage(step.message, f, f.Signal || "", f.Company || "", campaignId, { messageType: "dm" })
           : fillMergeFields(step.message, f, f.Signal || "", f.Company || "");
+
+        // Final empty/length safety on the rendered message
+        if (!msg || !msg.trim()) {
+          console.warn(`[OUTREACH] Rendered DM is empty for ${f["Lead Name"] || "lead"} step ${dmStep + 1} — skipping`);
+          const skipDate = new Date(now.getTime() + 1 * 86400000).toISOString().slice(0, 10);
+          await atUpdate(baseId, "Outreach", [{ id: item.id, fields: { "Next Action Date": skipDate, Notes: `DM ${dmStep + 1} rendered empty` }}]);
+          continue;
+        }
+        if (msg.length > 7900) {
+          console.warn(`[OUTREACH] DM exceeds LinkedIn limit (${msg.length} chars), truncating`);
+        }
+        const safeMsg = msg.length > 7900 ? msg.slice(0, 7900).replace(/\s+\S*$/, "") : msg;
 
         // If we have an existing chat, send a follow-up message there instead of starting new
         let chatRes;
         if (existingChatId) {
-          chatRes = await sendMessage(existingChatId, msg);
+          chatRes = await sendMessage(existingChatId, safeMsg);
         } else {
           const linkedinUrl = f["LinkedIn URL"] || "";
-          chatRes = await startNewChat(accountId, linkedinUrl, msg);
+          chatRes = await startNewChat(accountId, linkedinUrl, safeMsg);
         }
 
         if (chatRes.ok) {
@@ -1115,14 +1223,16 @@ async function processOutreachQueue(baseId, accountId, ruleConfig, campaignId = 
             "Unipile Chat ID": existingChatId || chatRes.data?.chat_id || chatRes.data?.id || "",
           }}]);
           dmsSent++;
-          // Log the DM send for in-app review (only when the step had AI personalisation)
-          if (step.aiPersonalize) {
+          // Log the DM send for in-app review (only when AI personalisation was used).
+          // NOTE: rule editor sets `aiGenerate` on each step (not `aiPersonalize`).
+          // Earlier code checked the wrong field and DM logs never appeared.
+          if (step.aiGenerate) {
             const resolvedName = f["Lead Name"] || f.Name || f["Full Name"] || "Unknown";
             logAiMessageForReview(baseId, {
               leadName: resolvedName, leadLinkedInUrl: f["LinkedIn URL"] || "", leadCompany: f.Company, leadTitle: f.Title,
               messageType: `dm_step_${dmStep + 1}`,
               template: step.message,
-              aiOutput: msg,
+              aiOutput: safeMsg,
               aiInputContext: JSON.stringify({ name: resolvedName, company: f.Company, title: f.Title, signal: f.Signal, dmStep }),
               campaign,
               unipileChatId: existingChatId || chatRes.data?.chat_id || chatRes.data?.id || "",
