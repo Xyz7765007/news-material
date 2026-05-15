@@ -69,7 +69,14 @@ async function atListAll(baseId, table, params = {}) {
     const qs = new URLSearchParams({ pageSize: "100", ...(offset ? { offset } : {}), ...params }).toString();
     const r = await fetch(`${AT_API}/${baseId}/${encodeURIComponent(table)}?${qs}`, { headers: atHdr });
     if (!r.ok) {
-      console.error(`[unipile-triggers] atListAll ${table} failed: ${r.status}`);
+      // 403 INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND usually means the table
+      // doesn't exist yet — treat as empty silently. Only log truly unexpected
+      // errors (auth issues, 500s).
+      const errTxt = await r.text().catch(() => "");
+      const isMissingTable = r.status === 403 && /INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND/i.test(errTxt);
+      if (!isMissingTable) {
+        console.error(`[unipile-triggers] atListAll ${table} failed: ${r.status} — ${errTxt.slice(0, 200)}`);
+      }
       break;
     }
     const d = await r.json();

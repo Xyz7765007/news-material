@@ -385,16 +385,21 @@ async function atCreate(baseId, table, records) {
   for (let i = 0; i < records.length; i += 10) {
     const batch = records.slice(i, i + 10).map(r => ({ fields: r }));
     let res = await fetch(`${AT_API}/${baseId}/${encodeURIComponent(table)}`, {
-      method: "POST", headers: atHdr, body: JSON.stringify({ records: batch }),
+      method: "POST", headers: atHdr,
+      // typecast=true tells Airtable to coerce values to match field types
+      // (e.g. text "0" → number 0). Helps with mixed-type fields but won't
+      // fix incompatible field types like Autonumber/Formula.
+      body: JSON.stringify({ records: batch, typecast: true }),
     });
+
+    let cachedErrText = null; // cache so we don't double-read the body
 
     // If 422 "Unknown field name", remove unknown fields and retry
     if (res.status === 422) {
-      const errText = await res.text();
-      console.warn(`[AT CREATE] 422 on ${table}, error: ${errText.slice(0,300)}`);
+      cachedErrText = await res.text();
+      console.warn(`[AT CREATE] 422 on ${table}, error: ${cachedErrText.slice(0, 300)}`);
       const unknownFields = [];
-      // Extract field names from Airtable error messages like "Unknown field name: \"Mode\""
-      const matches = errText.matchAll(/[Uu]nknown field name:?\s*["']([^"']+)["']/g);
+      const matches = cachedErrText.matchAll(/[Uu]nknown field name:?\s*["']([^"']+)["']/g);
       for (const m of matches) unknownFields.push(m[1]);
 
       if (unknownFields.length > 0) {
@@ -405,15 +410,24 @@ async function atCreate(baseId, table, records) {
           return { fields: clean };
         });
         res = await fetch(`${AT_API}/${baseId}/${encodeURIComponent(table)}`, {
-          method: "POST", headers: atHdr, body: JSON.stringify({ records: cleanBatch }),
+          method: "POST", headers: atHdr,
+          body: JSON.stringify({ records: cleanBatch, typecast: true }),
         });
+        cachedErrText = null; // new response, old cache invalid
       }
     }
 
     if (!res.ok) {
-      const err = await res.text();
+      // Reuse cached body if we already consumed it, otherwise read fresh
+      const err = cachedErrText !== null ? cachedErrText : await res.text();
       console.error(`[AT CREATE] ${table} failed ${res.status}:`, err.slice(0, 300));
-      errors.push({ status: res.status, body: err.slice(0, 300) });
+      // Detect specific column-type errors so the UI can surface a clean message
+      const isFieldTypeError = /INVALID_VALUE_FOR_COLUMN|cannot accept/i.test(err);
+      errors.push({
+        status: res.status,
+        body: err.slice(0, 400),
+        kind: isFieldTypeError ? "field_type_mismatch" : "unknown",
+      });
       continue;
     }
     const d = await res.json();
