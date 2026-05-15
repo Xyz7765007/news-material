@@ -27,7 +27,7 @@ on:
 jobs:
   tick:
     runs-on: ubuntu-latest
-    timeout-minutes: 6       # safety; ticks should finish in <300s
+    timeout-minutes: 7       # safety; Vercel function caps at 300s + network/setup headroom
     steps:
       - name: Tick movement scan
         env:
@@ -39,12 +39,14 @@ jobs:
             exit 1
           fi
 
-          # POST to the tick endpoint, capturing both body and HTTP status
+          # POST to the tick endpoint, capturing both body and HTTP status.
+          # --max-time 350 gives the Vercel function its full 300s budget
+          # PLUS 50s for response transit + GitHub network latency.
           response=$(curl -sS -w "\n__HTTP_STATUS__:%{http_code}" -X POST \
             -H "Authorization: Bearer $SIDEKICK_API_KEY" \
             -H "Content-Type: application/json" \
             "$SIGNALSCOPE_URL/api/sidekick/movement-scan-tick" \
-            --max-time 290)
+            --max-time 350)
 
           body=$(echo "$response" | sed 's/__HTTP_STATUS__:[0-9]*$//')
           status=$(echo "$response" | grep -o '__HTTP_STATUS__:[0-9]*' | cut -d: -f2)
