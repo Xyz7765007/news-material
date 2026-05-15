@@ -450,9 +450,12 @@ async function handleScan({
   const perCallCost = await getRapidAPICost(campaignId);
 
   // Time budget: Vercel kills serverless functions at maxDuration (300s).
-  // We exit cleanly at 270s so partial work persists and a continuation call
-  // can pick up via freshnessSkipDays (already-stamped leads are skipped).
-  const SCAN_BUDGET_MS = 270 * 1000;
+  // We exit at 240s so partial work persists, the tick handler has time to
+  // PATCH the run row + write Cron Run Log, and the response can transit
+  // back to GitHub Actions before its curl --max-time fires.
+  // Leads already processed have Last LinkedIn Check stamped, so re-running
+  // the scan picks up where we left off via freshnessSkipDays.
+  const SCAN_BUDGET_MS = 240 * 1000;
   const scanStartedAt = Date.now();
 
   // Process with concurrency control

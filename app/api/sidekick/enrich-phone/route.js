@@ -91,8 +91,27 @@ export async function POST(request) {
       return NextResponse.json({ ok: true, found: false, phone: "", note: "No match found in Apollo" });
     }
 
-    // Pick best phone — mobile > direct dial > phone
-    const bestPhone = enrichData.mobile || enrichData.directDial || enrichData.phone || "";
+    // Apollo's response shape has three potential phone sources, each with
+    // very different value to the operator. Pick the best AND tell the caller
+    // exactly what kind it is so they know whether they'll reach the person
+    // or a switchboard.
+    //
+    //   - mobile (person.mobile_phone) → personal cell. Highest value.
+    //   - company_main (person.organization.primary_phone) → org switchboard,
+    //     not direct dial. Often hits a receptionist. Despite Apollo naming
+    //     the field "directDial" in our enrich helper, this is actually the
+    //     organization's primary_phone — NOT a personal direct line.
+    //   - other_listed (person.phone_numbers[0]) → first phone in the
+    //     person's phone_numbers array. Could be work, home, anything.
+    //     Quality varies wildly.
+    const phoneOptions = [
+      { value: enrichData.mobile,     type: "mobile",       description: "personal mobile" },
+      { value: enrichData.directDial, type: "company_main", description: "company main line (Apollo: organization.primary_phone)" },
+      { value: enrichData.phone,      type: "other_listed", description: "other listed phone" },
+    ];
+    const selected = phoneOptions.find(opt => opt.value);
+    const bestPhone = selected?.value || "";
+
     if (!bestPhone) {
       return NextResponse.json({ ok: true, found: true, phone: "", note: "Apollo found the person but no phone number on record" });
     }
@@ -106,17 +125,24 @@ export async function POST(request) {
     });
     if (!patchRes.ok) {
       // Phone was found but couldn't be saved — still return it so UI can use
-      return NextResponse.json({ ok: true, found: true, phone: bestPhone, note: "Phone found but not saved to Airtable" });
+      return NextResponse.json({
+        ok: true, found: true, phone: bestPhone,
+        phoneType: selected.type,
+        phoneTypeDescription: selected.description,
+        note: "Phone found but not saved to Airtable",
+      });
     }
 
     return NextResponse.json({
       ok: true,
       found: true,
       phone: bestPhone,
+      phoneType: selected.type,                  // mobile | company_main | other_listed
+      phoneTypeDescription: selected.description, // human-readable why
       details: {
         mobile: enrichData.mobile || "",
-        directDial: enrichData.directDial || "",
-        landline: enrichData.phone || "",
+        companyMain: enrichData.directDial || "",  // honest name; Apollo's field is misnamed
+        otherListed: enrichData.phone || "",
       },
     });
   } catch (e) {
