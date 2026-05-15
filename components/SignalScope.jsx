@@ -1321,7 +1321,20 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const saveRule = async (rule) => {
     let fields;
     if (rule.taskType === "linkedin_outreach") {
-      fields = { Name: rule.name, Description: rule.description || "", "Task Type": "linkedin_outreach", "Outreach Config": JSON.stringify(rule.outreachConfig || {}) };
+      // Auto-attach the campaign's currently-assigned LinkedIn account so the
+      // cron can find it. Otherwise the rule has active:true but no accountId
+      // and the cron silently skips it. User can re-pick the campaign's
+      // assigned account via the LinkedIn Account section at the top of the
+      // LinkedIn Automation tab.
+      const oc = rule.outreachConfig || {};
+      if (!oc.accountId && linkedinAccount?.id) {
+        oc.accountId = linkedinAccount.id;
+        console.log(`[saveRule] Auto-attached campaign LinkedIn account ${linkedinAccount.id} to rule "${rule.name}"`);
+      }
+      if (!oc.accountId) {
+        alert("⚠ This outreach rule has no LinkedIn account assigned. The cron will skip it.\n\nFix: go to the LinkedIn Automation tab and connect/assign a LinkedIn account for this campaign first, then save this rule again.");
+      }
+      fields = { Name: rule.name, Description: rule.description || "", "Task Type": "linkedin_outreach", "Outreach Config": JSON.stringify(oc) };
     } else if (rule.taskType === "top_x") {
       fields = { Name: rule.name, Description: rule.description || "", "Task Type": "top_x", "Scan Target": rule.scanTarget || "leads", "Top N": rule.topN || 10, "Scoring Fields": JSON.stringify(rule.scoringFields || []), "Scoring Prompt": rule.scoringPrompt || "", Ease: rule.ease || "Medium", Strength: rule.strength || "Strong",
         "Smart Compile": rule.smartCompile ? "true" : "false",

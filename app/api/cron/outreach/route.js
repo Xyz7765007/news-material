@@ -106,7 +106,10 @@ export async function GET(request) {
 
   const summary = {
     trigger,
+    deploymentId: process.env.VERCEL_DEPLOYMENT_ID || process.env.VERCEL_GIT_COMMIT_SHA?.slice(0,8) || "(unknown)",
+    masterBaseId: MASTER_BASE_ID,
     campaignsChecked: 0,
+    rawCampaignRecords: [], // names + features of ALL records returned by Airtable
     outreachRulesFound: 0,
     activeRules: 0,
     connectionsSent: 0,
@@ -129,6 +132,15 @@ export async function GET(request) {
     }
     const { records: campaigns } = await campRes.json();
     summary.campaignsChecked = (campaigns || []).length;
+
+    // Dump raw record summary so we can see what Airtable actually returned
+    summary.rawCampaignRecords = (campaigns || []).map(c => ({
+      id: c.id,
+      name: c.fields?.Name || "(no name)",
+      baseId: c.fields?.["Base ID"] || "(no base id)",
+      Features: c.fields?.Features,
+      Features_type: Array.isArray(c.fields?.Features) ? "array" : typeof c.fields?.Features,
+    }));
 
     if (summary.campaignsChecked === 0) {
       summary.status = "no_campaigns";
@@ -187,8 +199,17 @@ export async function GET(request) {
           continue;
         }
         if (!config.accountId) {
-          campRecord.errors.push(`Rule "${rf.Name}": missing accountId (LinkedIn account not selected)`);
-          continue;
+          // Fallback: campaign-level "LinkedIn Account ID" field. This handles
+          // rules saved before per-rule accountId was auto-attached, or rules
+          // where the operator wants all rules to inherit the campaign's account.
+          const campaignAccountId = (cf["LinkedIn Account ID"] || "").trim();
+          if (campaignAccountId) {
+            config.accountId = campaignAccountId;
+            console.log(`[CRON] Rule "${rf.Name}": using campaign-level LinkedIn Account ID ${campaignAccountId} (rule had none)`);
+          } else {
+            campRecord.errors.push(`Rule "${rf.Name}": missing accountId — neither in Outreach Config nor on the Campaigns row's "LinkedIn Account ID" field`);
+            continue;
+          }
         }
         if (!config.active) continue;
 
