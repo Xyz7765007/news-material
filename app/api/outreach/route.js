@@ -11,30 +11,37 @@ const AT_API = "https://api.airtable.com/v0";
 
 // ═══════════════════════════════════════════════════════════════
 // SCHEMA BOOTSTRAP
-// Used when this route needs to write to a table that may not exist
-// yet in a fresh campaign base (Outreach, Sent Messages Review).
-// Direct Meta API call — no flaky internal fetch round-trip.
-// Returns { ok: true } on success or { ok: false, error: "...", missingScope: bool }
-// so callers can surface a clear UI error.
+// Creates a table with proper field types when missing in a campaign base.
+//
+// fieldDefs can be:
+//   - Array of strings (legacy): all created as singleLineText
+//   - Array of {name, type, options?} objects: each created with the
+//     specified Airtable field type (singleLineText, number, dateTime, etc.)
+//
+// Returns { ok: true } on success or { ok: false, error, missingScope } so
+// callers can surface clear UI errors.
 // ═══════════════════════════════════════════════════════════════
-async function bootstrapTable(baseId, tableName, fieldNames) {
+async function bootstrapTable(baseId, tableName, fieldDefs) {
   if (!baseId || !AIRTABLE_KEY) {
     return { ok: false, error: "Missing baseId or AIRTABLE_API_KEY" };
   }
   const metaHdr = { Authorization: `Bearer ${AIRTABLE_KEY}`, "Content-Type": "application/json" };
 
-  // Step 1: list existing tables. Requires schema.bases:read scope on the PAT.
+  // Normalize: strings → {name, type: singleLineText}; objects passed through
+  const normalized = fieldDefs.map(fd => typeof fd === "string"
+    ? { name: fd, type: "singleLineText" }
+    : { name: fd.name, type: fd.type || "singleLineText", options: fd.options }
+  );
+
   let tables;
   try {
     const r = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables`, { headers: metaHdr });
     if (!r.ok) {
       const t = await r.text();
-      // Permission errors: 401 (invalid PAT) or 403 (PAT lacks schema scope on this base)
       if (r.status === 401 || r.status === 403) {
         return {
-          ok: false,
-          missingScope: true,
-          error: `Airtable PAT lacks schema.bases:read on base ${baseId}. Either grant the scope at https://airtable.com/create/tokens, or manually create the "${tableName}" table with these fields: ${fieldNames.join(", ")}`,
+          ok: false, missingScope: true,
+          error: `Airtable PAT lacks schema.bases:read on base ${baseId}. Grant the scope at https://airtable.com/create/tokens, or manually create the "${tableName}" table.`,
         };
       }
       return { ok: false, error: `Failed to list tables (HTTP ${r.status}): ${t.slice(0, 200)}` };
@@ -47,46 +54,64 @@ async function bootstrapTable(baseId, tableName, fieldNames) {
 
   const existing = tables.find(t => t.name === tableName);
 
-  // Step 2: if table exists, ensure all required fields are present
+  // Existing table — diagnose mismatched types AND add missing fields
   if (existing) {
-    const existingFieldNames = new Set((existing.fields || []).map(f => f.name));
-    const missing = fieldNames.filter(n => !existingFieldNames.has(n));
-    if (missing.length === 0) return { ok: true, action: "exists", tableId: existing.id };
-
-    // Add missing fields one by one (Airtable API requires individual POSTs)
-    const errors = [];
-    for (const fieldName of missing) {
-      try {
-        const r = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables/${existing.id}/fields`, {
-          method: "POST", headers: metaHdr,
-          body: JSON.stringify({ name: fieldName, type: "singleLineText" }),
-        });
-        if (!r.ok) errors.push(`${fieldName}: ${(await r.text()).slice(0, 100)}`);
-      } catch (e) {
-        errors.push(`${fieldName}: ${e.message}`);
+    const existingByName = new Map((existing.fields || []).map(f => [f.name, f]));
+    const missing = normalized.filter(fd => !existingByName.has(fd.name));
+    const typeMismatches = [];
+    for (const fd of normalized) {
+      const ex = existingByName.get(fd.name);
+      if (!ex) continue;
+      // Detect mismatch: code wants number but field is text/lookup/formula/etc.
+      // Read-only types: autoNumber, formula, rollup, lookup, count, button, createdTime, lastModifiedTime
+      const readOnly = ["autoNumber", "formula", "rollup", "lookup", "count", "button", "createdTime", "lastModifiedTime"];
+      if (readOnly.includes(ex.type)) {
+        typeMismatches.push(`"${fd.name}" is ${ex.type} (read-only); code writes to this field. Change it to ${fd.type} in Airtable.`);
       }
     }
-    if (errors.length) {
-      return { ok: false, missingScope: errors.some(e => /403|forbidden|permission/i.test(e)),
-        error: `Table exists but couldn't add fields: ${errors.join("; ").slice(0, 400)}` };
+
+    // Add missing fields with their proper types
+    const errors = [];
+    for (const fd of missing) {
+      try {
+        const body = { name: fd.name, type: fd.type };
+        if (fd.options) body.options = fd.options;
+        const r = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables/${existing.id}/fields`, {
+          method: "POST", headers: metaHdr,
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) errors.push(`${fd.name}: ${(await r.text()).slice(0, 100)}`);
+      } catch (e) {
+        errors.push(`${fd.name}: ${e.message}`);
+      }
     }
-    return { ok: true, action: "fields_added", tableId: existing.id };
+
+    if (typeMismatches.length || errors.length) {
+      return {
+        ok: false,
+        missingScope: errors.some(e => /403|forbidden|permission/i.test(e)),
+        error: [
+          typeMismatches.length ? `Field type mismatches: ${typeMismatches.join("; ")}` : null,
+          errors.length ? `Failed to add fields: ${errors.join("; ").slice(0, 300)}` : null,
+        ].filter(Boolean).join(" | "),
+        typeMismatches, fieldAddErrors: errors,
+      };
+    }
+    return { ok: true, action: missing.length ? "fields_added" : "exists", tableId: existing.id };
   }
 
-  // Step 3: table doesn't exist — create it with all required fields
+  // Table doesn't exist — create with proper field types
   try {
-    const fields = fieldNames.map(name => ({ name, type: "singleLineText" }));
     const r = await fetch(`https://api.airtable.com/v0/meta/bases/${baseId}/tables`, {
       method: "POST", headers: metaHdr,
-      body: JSON.stringify({ name: tableName, fields }),
+      body: JSON.stringify({ name: tableName, fields: normalized }),
     });
     if (!r.ok) {
       const t = await r.text();
       if (r.status === 401 || r.status === 403) {
         return {
-          ok: false,
-          missingScope: true,
-          error: `Airtable PAT lacks schema.bases:write on base ${baseId}. Either grant the scope at https://airtable.com/create/tokens, or manually create the "${tableName}" table with these fields: ${fieldNames.join(", ")}`,
+          ok: false, missingScope: true,
+          error: `Airtable PAT lacks schema.bases:write on base ${baseId}. Grant the scope at https://airtable.com/create/tokens, or manually create the "${tableName}" table.`,
         };
       }
       return { ok: false, error: `Failed to create table "${tableName}" (HTTP ${r.status}): ${t.slice(0, 300)}` };
@@ -1182,14 +1207,29 @@ async function enqueueLeads(baseId, ruleConfig, options = {}, campaignId = null)
 
   if (!eligible.length) return { error: "No eligible leads after dedup", enqueued: 0, skippedDupes, skippedByTagFilter };
 
-  // Pre-flight: ensure Outreach table exists with all required fields.
-  // If the PAT lacks schema scope, bootstrapTable returns a clear error
-  // we can surface to the UI (instead of silent 403s on later create attempts).
+  // Pre-flight: ensure Outreach table exists with all required fields AND proper types.
+  // DM Step needs to be number (we send integer 0); date fields need dateTime;
+  // everything else is text. If the PAT lacks schema scope OR an existing field
+  // has wrong type, this surfaces a clear error.
   const REQUIRED_OUTREACH_FIELDS = [
-    "Lead Name", "LinkedIn URL", "Campaign", "Mode", "Status", "Company", "Title",
-    "Email", "Signal", "DM Step", "Next Action Date", "Created At",
-    "Connection Sent At", "Last DM Sent At", "Unipile Chat ID", "Notes",
-    "Replied At", "Connection Accepted At",
+    { name: "Lead Name", type: "singleLineText" },
+    { name: "LinkedIn URL", type: "singleLineText" },
+    { name: "Campaign", type: "singleLineText" },
+    { name: "Mode", type: "singleLineText" },
+    { name: "Status", type: "singleLineText" },
+    { name: "Company", type: "singleLineText" },
+    { name: "Title", type: "singleLineText" },
+    { name: "Email", type: "singleLineText" },
+    { name: "Signal", type: "multilineText" },
+    { name: "DM Step", type: "number", options: { precision: 0 } },
+    { name: "Next Action Date", type: "date", options: { dateFormat: { name: "iso" } } },
+    { name: "Created At", type: "dateTime", options: { timeZone: "utc", dateFormat: { name: "iso" }, timeFormat: { name: "24hour" } } },
+    { name: "Connection Sent At", type: "dateTime", options: { timeZone: "utc", dateFormat: { name: "iso" }, timeFormat: { name: "24hour" } } },
+    { name: "Last DM Sent At", type: "dateTime", options: { timeZone: "utc", dateFormat: { name: "iso" }, timeFormat: { name: "24hour" } } },
+    { name: "Unipile Chat ID", type: "singleLineText" },
+    { name: "Notes", type: "multilineText" },
+    { name: "Replied At", type: "dateTime", options: { timeZone: "utc", dateFormat: { name: "iso" }, timeFormat: { name: "24hour" } } },
+    { name: "Connection Accepted At", type: "dateTime", options: { timeZone: "utc", dateFormat: { name: "iso" }, timeFormat: { name: "24hour" } } },
   ];
   const bootstrap = await bootstrapTable(baseId, "Outreach", REQUIRED_OUTREACH_FIELDS);
   if (!bootstrap.ok) {
@@ -1197,6 +1237,7 @@ async function enqueueLeads(baseId, ruleConfig, options = {}, campaignId = null)
       error: `Outreach table setup failed: ${bootstrap.error}`,
       enqueued: 0, skippedDupes, skippedByTagFilter,
       missingAirtableScope: bootstrap.missingScope || false,
+      typeMismatches: bootstrap.typeMismatches || [],
     };
   }
   console.log(`[outreach] Outreach table bootstrap: ${bootstrap.action || "ok"}`);
