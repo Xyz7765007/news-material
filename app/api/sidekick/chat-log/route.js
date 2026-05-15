@@ -52,7 +52,11 @@ export async function POST(request) {
   if (!text || typeof text !== "string") return NextResponse.json({ ok: false, error: "text required" }, { status: 400 });
 
   const nowISO = new Date().toISOString();
+  // Name is the primary field — populate with a readable snippet so the
+  // Airtable UI shows useful row identifiers instead of empty strings.
+  const nameSnippet = text.slice(0, 60).replace(/\s+/g, " ").trim();
   const fields = {
+    Name: `${role}: ${nameSnippet}`.slice(0, 100),
     Role: role,
     Text: text.slice(0, 100000),
     "Created At": nowISO,

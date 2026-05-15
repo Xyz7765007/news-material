@@ -115,7 +115,9 @@ const MASTER_TABLES = {
   // every 5 min, finds rows where State=running, processes one batch each,
   // and updates running totals here. When a batch returns done=true, State
   // flips to done and the cron stops processing that row.
+  // Name field must be first (primary; can't be singleSelect).
   "Movement Scan Runs": [
+    { name: "Name", type: "singleLineText" },  // primary — readable run label
     { name: "Campaign ID", type: "singleLineText" },
     { name: "Base ID", type: "singleLineText" },
     { name: "State", type: "singleSelect", options: { choices: [
@@ -186,7 +188,10 @@ const CAMPAIGN_TABLES = {
   // and writes each user / bot exchange so Claude has multi-session context.
   // Over time this becomes the "dynamic memory" that lets the system learn
   // the operator's patterns (which rules they run, what they skip, etc).
+  // IMPORTANT: Name MUST be first (singleLineText). Airtable's createTable API
+  // uses the first field as the primary, and primary can't be singleSelect.
   "Sidekick Chat": [
+    { name: "Name", type: "singleLineText" },  // primary — populated as "role: text snippet"
     { name: "Role", type: "singleSelect", options: { choices: [{ name: "user" }, { name: "bot" }] } },
     { name: "Text", type: "multilineText" },
     { name: "Created At", type: "dateTime", options: TZ_ISO },

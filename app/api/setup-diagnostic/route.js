@@ -82,6 +82,7 @@ const SCHEMA_REQUIREMENTS = {
       "Handled As": "any",    // "done" or "skip" — set by /api/sidekick/action
     },
     "Sidekick Chat": {
+      "Name": "any",
       "Role": "any",
       "Text": "any",
       "Created At": "any",
