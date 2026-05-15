@@ -3,6 +3,9 @@ import OpenAI from "openai";
 import { trackOpenAIUsage, resetCampaignAIUsage } from "@/lib/ai-usage";
 import { resetCampaignRapidAPIUsage } from "@/lib/rapidapi-usage";
 
+export const dynamic = "force-dynamic";
+export const fetchCache = "force-no-store";
+
 // 5-minute timeout: required for Top X scans on large lead lists (5K-10K records).
 // At 10K leads:
 //   - listRecords pagination: ~15-20s

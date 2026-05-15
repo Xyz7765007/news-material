@@ -2,6 +2,9 @@ import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import { trackOpenAIUsage } from "@/lib/ai-usage";
 
+export const dynamic = "force-dynamic";
+export const fetchCache = "force-no-store";
+
 const UNIPILE_DSN = process.env.UNIPILE_DSN; // e.g. https://api1.unipile.com:13371
 const UNIPILE_KEY = process.env.UNIPILE_API_KEY;
 const AIRTABLE_KEY = process.env.AIRTABLE_API_KEY;

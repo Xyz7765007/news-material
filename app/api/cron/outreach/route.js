@@ -4,6 +4,7 @@ import { NextResponse } from "next/server";
 // Vercel's cron logs view may not show invocations because cached responses
 // are not logged as fresh invocations.
 export const dynamic = "force-dynamic";
+export const fetchCache = "force-no-store"; // Critical: disable Next.js fetch cache so Airtable data is always fresh
 export const maxDuration = 300; // Vercel Hobby plan max is 300s; upgrade to Pro for higher
 
 // Vercel Cron — runs daily at 6am UTC (11:30am IST) to process outreach queues.
@@ -121,7 +122,11 @@ export async function GET(request) {
 
   try {
     // ─── Load campaigns from master base ─────────────────────────
-    const campRes = await fetch(`${AT_API}/${MASTER_BASE_ID}/${encodeURIComponent("Campaigns")}`, { headers: atHdr });
+    // cache: "no-store" is CRITICAL — Next.js App Router caches fetch() by
+    // default. Without this, the cron sees a stale snapshot of the Campaigns
+    // table from whenever this code path was first hit, missing any campaigns
+    // added since then.
+    const campRes = await fetch(`${AT_API}/${MASTER_BASE_ID}/${encodeURIComponent("Campaigns")}`, { headers: atHdr, cache: "no-store" });
     if (!campRes.ok) {
       const t = await campRes.text();
       summary.status = "campaigns_load_failed";
@@ -171,7 +176,7 @@ export async function GET(request) {
 
       let rulesData;
       try {
-        const rulesRes = await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Task Rules")}`, { headers: atHdr });
+        const rulesRes = await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Task Rules")}`, { headers: atHdr, cache: "no-store" });
         if (!rulesRes.ok) {
           const t = await rulesRes.text();
           campRecord.errors.push(`Task Rules table load failed: HTTP ${rulesRes.status} — ${t.slice(0, 150)}`);

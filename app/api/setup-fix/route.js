@@ -13,6 +13,7 @@
 import { NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
+export const fetchCache = "force-no-store"; // Critical: disable Next.js fetch cache so Airtable data is always fresh
 export const maxDuration = 120;
 
 const AIRTABLE_KEY = process.env.AIRTABLE_API_KEY;
