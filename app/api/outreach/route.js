@@ -849,11 +849,15 @@ function safeField(value) {
 
 // Derive first/last name from Name field if dedicated fields missing
 function deriveNames(f) {
-  const fullName = safeField(f.Name || f["Full Name"] || "");
+  // Try every reasonable variant: from leads table (Name, Full Name) AND from
+  // outreach records (Lead Name). Also handles snake_case and camelCase.
+  const fullName = safeField(
+    f.Name || f["Full Name"] || f["Lead Name"] || f.full_name || f.fullName || f.lead_name || ""
+  );
   const parts = fullName.split(/\s+/).filter(Boolean);
   return {
-    first: safeField(f["First Name"] || f.first_name || parts[0] || ""),
-    last: safeField(f["Last Name"] || f.last_name || parts.slice(1).join(" ") || ""),
+    first: safeField(f["First Name"] || f.first_name || f.firstName || parts[0] || ""),
+    last: safeField(f["Last Name"] || f.last_name || f.lastName || parts.slice(1).join(" ") || ""),
     full: fullName,
   };
 }
@@ -896,6 +900,15 @@ function fillMergeFields(template, lead, signal, companyName) {
     .replace(/ {2,}/g, " ")          // collapse multiple spaces
     .replace(/\n{3,}/g, "\n\n")      // collapse extra newlines
     .trim();
+
+  // FINAL SAFETY NET: any {placeholder} we couldn't resolve gets logged and
+  // replaced with a generic fallback. This guarantees no literal merge field
+  // text ever reaches LinkedIn — even if the template uses an unsupported tag.
+  const remaining = out.match(/\{[a-zA-Z_][a-zA-Z0-9_\s]*\}/g);
+  if (remaining) {
+    console.warn(`[MERGE] Unresolved placeholders after replacement: ${remaining.join(", ")} — replacing with "there". Template was: ${String(template).slice(0, 200)}`);
+    out = out.replace(/\{[a-zA-Z_][a-zA-Z0-9_\s]*\}/g, "there");
+  }
 
   return out;
 }
