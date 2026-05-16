@@ -204,11 +204,41 @@ async function getOrCreateAutoBatchRule(baseId, campaignAccountId, requestOrigin
   return { rule: created[0], ruleId: created[0].id, config: defaultConfig };
 }
 
+// ─── detectInternalLeak ──────────────────────────────────────────
+// Returns true if the generated message contains internal scoring data
+// or qualification language that should never reach the prospect. Used
+// as a final guard after AI generation — if leak detected, message is
+// thrown out and replaced with deterministic fallback.
+function detectInternalLeak(text) {
+  if (!text || typeof text !== "string") return false;
+  const t = text.toLowerCase();
+  const leaks = [
+    /\b\d{1,3}\/100\b/,                          // "67/100"
+    /\bicp fit\b/,
+    /\bicp score\b/,
+    /\bqualification score\b/,
+    /\bscore:\s*\d/,                              // "score: 67"
+    /\bdeterministic[:\s]/,
+    /\blead-side rules\b/,
+    /\bacv score\b/,
+    /\btam (small|large|big)\b/,
+    /\btop \d+ leads?\b/,
+    /\bcombo stood out\b/,
+    /\blooks like a strong fit\b/,
+    /\b\d{1,3}-\d{1,3}\s+(sales|marketing) team\b/,  // "11-30 sales team"
+    /\brules matched\b/,
+    /\bicp profile\b/,
+  ];
+  return leaks.some(re => re.test(t));
+}
+
 // ─── AI generation with deep personalization ─────────────────────
 // Builds a structured Lead Intelligence Brief from all relevant tasks,
 // passes it to AI with forced-citation rules + anti-generic examples.
 // Every output runs through sanitizeAndValidate (merge-field safety pass,
-// char limits, refusal detection). On failure → deterministic fallback.
+// char limits, refusal detection) AND detectInternalLeak (catches AI
+// citing internal scoring data back to the prospect). On failure →
+// deterministic fallback.
 async function generateLeadDrafts(lead, scoring, campaignContext) {
   const f = lead?.fields || {};
   const names = deriveNames(f);
@@ -259,47 +289,96 @@ ABSOLUTE OUTPUT RULES (violations = rejected output):
 ═════════════════════════════════════════════════════════════
 PERSONALIZATION RULES (THE CORE OF THIS JOB):
 ═════════════════════════════════════════════════════════════
-Each of the 4 messages MUST cite ≥1 SPECIFIC fact from RECENT LEAD ACTIVITY:
+Each of the 4 messages MUST cite ≥1 SPECIFIC fact from PUBLIC FACTS:
   - A number (e.g. "112% growth", "$50M raise")
   - A direct quote from their post (kept in quotes)
   - A named observation they made (e.g. "your D2C / Qcom split")
   - A specific topic they wrote about
 
-GENERIC PHRASES BANNED — instant fail:
-  ✗ "noticed your work at [company]"
-  ✗ "saw your recent activity"
-  ✗ "your latest post"
-  ✗ "great post about [topic]"
-  ✗ "curious how you're thinking about [generic thing] this year"
-  ✗ "happy to share a teardown"
-  ✗ "if [generic thing] is on the roadmap"
-  ✗ Any compliment without a specific data point attached
+═════════════════════════════════════════════════════════════
+WHAT YOU NEVER DO (instant fail — output rejected):
+═════════════════════════════════════════════════════════════
+
+A. INTERNAL-LEAK PHRASES — these expose our internal tooling to the lead.
+   NEVER use these or anything resembling them:
+   ✗ "your 67/100 fit"   ✗ "67/100"   ✗ "X/100" of any kind
+   ✗ "ICP fit"   ✗ "ICP score"   ✗ "qualification score"
+   ✗ "score:" anything   ✗ "the score"   ✗ "deterministic"
+   ✗ "Lead-side rules matched"   ✗ "rules matched"
+   ✗ "ACV Score 7-10" (translate to "high revenue tier" or omit entirely)
+   ✗ "TAM Small" / "TAM Large" (translate or omit)
+   ✗ "top 10 leads" / "top X leads"
+   ✗ "combo stood out"   ✗ "looks like a strong fit"
+   ✗ Any numeric team-size in "X-Y range" format (e.g. "11-30 sales team")
+
+B. GENERIC PHRASES — instant fail:
+   ✗ "noticed your work at [company]"
+   ✗ "saw your recent activity"
+   ✗ "your latest post"
+   ✗ "great post about [topic]"
+   ✗ "curious how you're thinking about [generic thing] this year"
+   ✗ "happy to share a teardown"
+   ✗ "if [generic thing] is on the roadmap"
+   ✗ Any compliment without a specific data point attached
 
 ═════════════════════════════════════════════════════════════
-WORKED EXAMPLE — what BAD vs GOOD looks like:
+WHEN NO PUBLIC FACTS EXIST:
 ═════════════════════════════════════════════════════════════
-Bad (generic, instant reject):
+If PUBLIC FACTS says "(none)", do NOT invent activity. Instead:
+  - Use general knowledge of the lead's company + role to write
+    something credible. Reference the COMPANY's actual business
+    (what they do, the market they're in), not internal scoring.
+  - Example for a founder at an Indian travel-tech company:
+    "Amar — building outbound for B2B travel platforms in India is
+    a specific motion. Curious how TraviYo is thinking about that
+    layer right now." (industry-aware, NOT internal-scoring-aware)
+  - Keep it short and honest. Don't fake specificity you don't have.
+
+═════════════════════════════════════════════════════════════
+WORKED EXAMPLES — bad vs good:
+═════════════════════════════════════════════════════════════
+Bad (cites internal scoring — instant reject):
+"Amar, your 67/100 ICP fit and the 11-30 sales team / 9-20 marketing
+team combo stood out. TraviYo looks like a strong fit for structured
+outbound."
+
+Bad (generic, no specifics):
 "Hi Devi — noticed your work at 1digitalstack.ai. Would like to connect."
 
-Good (specific, uses real data from the brief):
-"Hi Devi — your 112% Qcom number in healthy snacks caught my eye, especially the Bangalore-led adoption. We help D2C brands set up outbound around exactly this kind of category shift. Worth a chat?"
+Good (cites a real quote the lead actually wrote):
+"Hi Devi — your 112% Qcom number in healthy snacks caught my eye,
+especially the Bangalore-led adoption. We help D2C brands set up outbound
+around exactly this kind of category shift. Worth a chat?"
+
+Good (no public facts, leans on company + role):
+"Amar — building outbound for B2B travel platforms is a specific
+challenge. Curious how TraviYo is approaching that motion right now.
+Open to connecting?"
 
 ═════════════════════════════════════════════════════════════
 PER-MESSAGE REQUIREMENTS:
 ═════════════════════════════════════════════════════════════
-- connectionNote (max 260 chars): open with a specific reference to their activity. Soft connect ask. NO demo ask.
-- dm1 (max 600 chars, sent 2d post-connect): thank briefly, then go deeper on the signal they posted/showed. Add YOUR observation. End with one specific low-pressure question.
-- dm2 (max 550 chars, sent 3d post-dm1): bring a NEW angle, parallel, or data point you didn't mention before. Soft ask.
-- dm3 (max 500 chars, sent 4d post-dm2): soft close. No guilt-trip. Offer a SPECIFIC takeaway/resource (e.g. "if useful, here's how [Similar Company] handled their [X]") even if they don't reply.
+- connectionNote (max 260 chars): open with a specific reference to their
+  PUBLIC activity if available; else lean on company/role. Soft connect ask.
+- dm1 (max 600 chars, sent 2d post-connect): thank briefly, go deeper on the
+  PUBLIC signal or company context. Add YOUR observation. One specific question.
+- dm2 (max 550 chars, sent 3d post-dm1): bring a NEW angle, parallel, or data
+  point you didn't mention before. Soft ask.
+- dm3 (max 500 chars, sent 4d post-dm2): soft close. No guilt-trip. Offer a
+  SPECIFIC takeaway/resource (e.g. "if useful, here's how [Similar Company]
+  handled their [X]") even if they don't reply.
 
 ═════════════════════════════════════════════════════════════
 SELF-CHECK BEFORE OUTPUT:
 ═════════════════════════════════════════════════════════════
 For each of the 4 messages, verify:
-  (a) Does it contain at least ONE specific noun/number/quote from RECENT LEAD ACTIVITY?
-  (b) Is it free of banned phrases?
-  (c) Does it sound like a human who actually read the lead's post — not a template?
-If any check fails for any message, rewrite it before outputting.
+  (a) Does it contain at least ONE specific noun/quote from PUBLIC FACTS,
+      OR (if no public facts) a credible company/role-based observation?
+  (b) Is it free of internal-leak phrases (no scores, no ratings, no rule names)?
+  (c) Is it free of generic phrases (no "noticed your work")?
+  (d) Would the lead read it and think "this is from someone who actually
+      knows my work" — not "this is from a database that scored me"?
+If any check fails, rewrite before outputting.
 
 Output JSON shape:
 { "connectionNote": "...", "dm1": "...", "dm2": "...", "dm3": "..." }`;
@@ -309,13 +388,12 @@ Output JSON shape:
   Role: ${title} at ${company}
   LinkedIn: ${brief.identity.linkedinUrl || "(unknown)"}
 
-RECENT LEAD ACTIVITY (cite from this — do not invent facts):
 ${contextBlock}
 
 CAMPAIGN CONTEXT:
 ${campaignContext || "B2B outbound infrastructure — Side Kick builds AI-driven SDR systems for B2B companies that have outgrown traditional SDR agencies. Customers include companies running cold outbound at scale who want personalization without manual SDR overhead."}
 
-Generate the 4 messages following ALL rules. Each must cite specifics from RECENT LEAD ACTIVITY above.`;
+Generate the 4 messages following ALL rules above. Cite ONLY from PUBLIC FACTS. NEVER cite anything from INTERNAL CONTEXT. If PUBLIC FACTS is empty, lean on company/role inference — do not invent activity.`;
 
   let resp;
   try {
@@ -354,12 +432,22 @@ Generate the 4 messages following ALL rules. Each must cite specifics from RECEN
   }
 
   // Validate each message — merge field safety pass, char limits, refusal check
-  const validateOne = (raw, kind) => sanitizeAndValidate(raw, {
-    lead,
-    signal: f.Signal || contextBlock,
-    company,
-    kind,
-  });
+  const validateOne = (raw, kind) => {
+    const res = sanitizeAndValidate(raw, {
+      lead,
+      signal: f.Signal || contextBlock,
+      company,
+      kind,
+    });
+    // Extra guard: detect internal scoring/qualification language leaking
+    // into the message body. If AI cites our internal scoring data, throw
+    // it out — better a generic deterministic fallback than a message that
+    // mentions "67/100 ICP fit" to the prospect.
+    if (res.ok && detectInternalLeak(res.text)) {
+      return { ok: false, reason: "internal_leak_detected", snippet: res.text.slice(0, 120) };
+    }
+    return res;
+  };
 
   const connRes = validateOne(parsed.connectionNote, "connection_note");
   const dm1Res = validateOne(parsed.dm1, "dm");
