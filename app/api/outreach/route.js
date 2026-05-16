@@ -1069,6 +1069,14 @@ async function processOutreachQueue(baseId, accountId, ruleConfig, campaignId = 
     const status = f.Status || "queued";
     const nextAction = f["Next Action Date"] || "";
 
+    // ──── Auto-Batch: skip pending_approval ──────────────
+    // Records awaiting human approval in the Side Kick chatbot. Cron must NOT
+    // send these until user clicks Send → Status flips to "queued".
+    if (status === "pending_approval") continue;
+
+    // Skip terminal states early
+    if (status === "skipped" || status === "completed" || status === "replied") continue;
+
     // Next Action Date filter — skip future-dated items EXCEPT for
     // `connection_sent` which must always be checked for acceptance regardless.
     // Otherwise the cron would never detect a connection acceptance until the
@@ -1086,9 +1094,20 @@ async function processOutreachQueue(baseId, accountId, ruleConfig, campaignId = 
         const linkedinUrl = f["LinkedIn URL"] || "";
         if (!linkedinUrl) continue;
 
-        const connMsg = ruleConfig.connectionMessage
-          ? await aiPersonalizeMessage(ruleConfig.connectionMessage, f, f.Signal || "", f.Company || "", campaignId, { messageType: "connection_note" })
-          : undefined;
+        // AUTO-BATCH: if a pre-generated connection note exists on the record
+        // (set by /api/sidekick/auto-batch/generate), use it AS-IS. The user
+        // already approved this exact text in the chatbot. Skip AI re-generation
+        // to ensure the sent message matches what user saw.
+        const preGenerated = (f["Generated Connection Note"] || "").trim();
+        let connMsg;
+        if (preGenerated) {
+          connMsg = preGenerated;
+          console.log(`[OUTREACH] Using pre-generated connection note for ${f["Lead Name"] || "lead"}`);
+        } else {
+          connMsg = ruleConfig.connectionMessage
+            ? await aiPersonalizeMessage(ruleConfig.connectionMessage, f, f.Signal || "", f.Company || "", campaignId, { messageType: "connection_note" })
+            : undefined;
+        }
         // Final safety: enforce LinkedIn's 300-char connection note limit.
         // If deterministic fallback exceeds it (long template), truncate.
         const safeConnMsg = connMsg && connMsg.length > 295 ? connMsg.slice(0, 295).replace(/\s+\S*$/, "") : connMsg;
@@ -1177,8 +1196,13 @@ async function processOutreachQueue(baseId, accountId, ruleConfig, campaignId = 
 
         const step = sequence[dmStep];
 
-        // Empty-message guard — never send blank DMs
-        if (!step.message || !String(step.message).trim()) {
+        // AUTO-BATCH: check for pre-generated DM at this step.
+        // Generated DM 1 → step 0, Generated DM 2 → step 1, Generated DM 3 → step 2
+        const preGenDmField = `Generated DM ${dmStep + 1}`;
+        const preGenDm = (f[preGenDmField] || "").trim();
+
+        // Empty-message guard — never send blank DMs (unless we have pre-gen)
+        if (!preGenDm && (!step.message || !String(step.message).trim())) {
           console.warn(`[OUTREACH] DM step ${dmStep + 1} has empty message — skipping ${f["Lead Name"] || "lead"}`);
           // Bump next action so we don't loop on this every run
           const skipDate = new Date(now.getTime() + 1 * 86400000).toISOString().slice(0, 10);
@@ -1186,9 +1210,16 @@ async function processOutreachQueue(baseId, accountId, ruleConfig, campaignId = 
           continue;
         }
 
-        const msg = step.aiGenerate
-          ? await aiPersonalizeMessage(step.message, f, f.Signal || "", f.Company || "", campaignId, { messageType: "dm" })
-          : fillMergeFields(step.message, f, f.Signal || "", f.Company || "");
+        let msg;
+        if (preGenDm) {
+          // Use the pre-approved text from auto-batch
+          msg = preGenDm;
+          console.log(`[OUTREACH] Using pre-generated DM ${dmStep + 1} for ${f["Lead Name"] || "lead"}`);
+        } else {
+          msg = step.aiGenerate
+            ? await aiPersonalizeMessage(step.message, f, f.Signal || "", f.Company || "", campaignId, { messageType: "dm" })
+            : fillMergeFields(step.message, f, f.Signal || "", f.Company || "");
+        }
 
         // Final empty/length safety on the rendered message
         if (!msg || !msg.trim()) {
@@ -1364,6 +1395,15 @@ async function enqueueLeads(baseId, ruleConfig, options = {}, campaignId = null)
     { name: "Notes", type: "multilineText" },
     { name: "Replied At", type: "dateTime", options: { timeZone: "utc", dateFormat: { name: "iso" }, timeFormat: { name: "24hour" } } },
     { name: "Connection Accepted At", type: "dateTime", options: { timeZone: "utc", dateFormat: { name: "iso" }, timeFormat: { name: "24hour" } } },
+    // Auto-Batch fields — populated by /api/sidekick/auto-batch/generate
+    { name: "Generated Connection Note", type: "multilineText" },
+    { name: "Generated DM 1", type: "multilineText" },
+    { name: "Generated DM 2", type: "multilineText" },
+    { name: "Generated DM 3", type: "multilineText" },
+    { name: "Batch ID", type: "singleLineText" },
+    { name: "Why Reasons", type: "multilineText" },
+    { name: "Composite Score", type: "number", options: { precision: 0 } },
+    { name: "Edit History", type: "multilineText" },
   ];
   const bootstrap = await bootstrapTable(baseId, "Outreach", REQUIRED_OUTREACH_FIELDS);
   if (!bootstrap.ok) {

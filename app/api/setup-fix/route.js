@@ -161,6 +161,17 @@ const CAMPAIGN_TABLES = {
     { name: "Notes", type: "multilineText" },
     { name: "Replied At", type: "dateTime", options: TZ_ISO },
     { name: "Connection Accepted At", type: "dateTime", options: TZ_ISO },
+    // Auto-Batch fields (set by /api/sidekick/auto-batch/generate). Status
+    // values for these records start at "pending_approval" and the user
+    // approves them in the Side Kick chatbot to flip to "queued".
+    { name: "Generated Connection Note", type: "multilineText" },
+    { name: "Generated DM 1", type: "multilineText" },
+    { name: "Generated DM 2", type: "multilineText" },
+    { name: "Generated DM 3", type: "multilineText" },
+    { name: "Batch ID", type: "singleLineText" },
+    { name: "Why Reasons", type: "multilineText" },
+    { name: "Composite Score", type: "number", options: { precision: 0 } },
+    { name: "Edit History", type: "multilineText" },
   ],
   "Tasks": [
     // Don't redefine "Name" — Airtable uses the existing primary
