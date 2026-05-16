@@ -146,6 +146,7 @@ async function getOrCreateAutoBatchRule(baseId, campaignAccountId, requestOrigin
           table: "Outreach",
           fieldNames: [
             { name: "Post URL", type: "url" },
+            { name: "AI Debug", type: "multilineText" },
           ],
         }),
       });
@@ -326,18 +327,30 @@ Generate the 4 messages following ALL rules. Each must cite specifics from RECEN
       ],
       response_format: { type: "json_object" },
       temperature: 0.7,
-      max_tokens: 1400,  // bumped to allow richer personalization
+      // CRITICAL: gpt-5.4-mini requires max_completion_tokens, not max_tokens.
+      // Using max_tokens silently caps the response → AI returns empty fields
+      // → every message falls back to deterministic template (the bug Kunal
+      // hit on 2026-05-16). All other working OpenAI calls in this codebase
+      // use max_completion_tokens.
+      max_completion_tokens: 1400,
     });
   } catch (e) {
     console.error(`[AUTO-BATCH] AI failed for ${leadName}:`, e.message);
-    return { ...buildFallback(), aiFailed: true };
+    return { ...buildFallback(), aiFailed: true, aiError: e.message };
   }
 
+  const rawContent = resp.choices?.[0]?.message?.content || "";
   let parsed;
   try {
-    parsed = JSON.parse(resp.choices[0]?.message?.content || "{}");
-  } catch {
+    parsed = JSON.parse(rawContent || "{}");
+  } catch (e) {
+    console.warn(`[AUTO-BATCH] JSON parse failed for ${leadName}. Raw:`, rawContent.slice(0, 400));
     parsed = {};
+  }
+
+  // Log when the AI response is effectively empty so we can debug
+  if (!parsed.connectionNote && !parsed.dm1) {
+    console.warn(`[AUTO-BATCH] AI returned empty fields for ${leadName}. Raw response:`, rawContent.slice(0, 500), "Usage:", JSON.stringify(resp.usage));
   }
 
   // Validate each message — merge field safety pass, char limits, refusal check
@@ -373,7 +386,9 @@ Generate the 4 messages following ALL rules. Each must cite specifics from RECEN
     dm2: dm2Res.ok ? dm2Res.text : deterministicFallback(lead, "dm_2"),
     dm3: dm3Res.ok ? dm3Res.text : deterministicFallback(lead, "dm_3"),
     costUsd,
-    uiBullets,  // structured 1-3 bullets for chatbot UI (replaces raw Signal blob)
+    uiBullets,
+    rawAiResponse: rawContent.slice(0, 8000),  // for debugging — saved on Outreach record
+    aiUsage: resp.usage || null,
     validation: { connection: connRes, dm1: dm1Res, dm2: dm2Res, dm3: dm3Res },
   };
 }
@@ -491,6 +506,13 @@ export async function POST(request) {
         const m = sig.match(/https:\/\/(www\.)?linkedin\.com\/feed\/update\/[^\s)\]]+/);
         if (m) { postUrl = m[0]; break; }
       }
+      // Per-message validation status — visible in Airtable for debugging
+      const valSummary = [
+        `conn: ${d.validation?.connection?.ok ? "ok" : d.validation?.connection?.reason || "fallback"}`,
+        `dm1: ${d.validation?.dm1?.ok ? "ok" : d.validation?.dm1?.reason || "fallback"}`,
+        `dm2: ${d.validation?.dm2?.ok ? "ok" : d.validation?.dm2?.reason || "fallback"}`,
+        `dm3: ${d.validation?.dm3?.ok ? "ok" : d.validation?.dm3?.reason || "fallback"}`,
+      ].join(" | ");
       return {
         "Lead Name": f.Name || f["Full Name"] || "Unknown",
         "LinkedIn URL": linkedinUrl,
@@ -508,9 +530,16 @@ export async function POST(request) {
         "Generated DM 2": d.dm2,
         "Generated DM 3": d.dm3,
         "Batch ID": todayKey,
-        "Why Reasons": cleanReasons,             // clean bullets for chatbot card
-        "Post URL": postUrl,                     // clickable in chatbot UI
+        "Why Reasons": cleanReasons,
+        "Post URL": postUrl,
         "Composite Score": scoring.score,
+        // Debug fields — visible in Airtable for inspecting AI failures
+        "AI Debug": [
+          `Validation: ${valSummary}`,
+          `Cost: $${(d.costUsd || 0).toFixed(5)}`,
+          d.aiError ? `Error: ${d.aiError}` : "",
+          `Raw AI response (truncated):\n${(d.rawAiResponse || "").slice(0, 3000)}`,
+        ].filter(Boolean).join("\n\n"),
       };
     });
 

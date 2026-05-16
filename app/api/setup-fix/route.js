@@ -173,6 +173,9 @@ const CAMPAIGN_TABLES = {
     { name: "Post URL", type: "url" },
     { name: "Composite Score", type: "number", options: { precision: 0 } },
     { name: "Edit History", type: "multilineText" },
+    // AI Debug surfaces raw AI response + per-message validation reasons
+    // directly in Airtable so failures can be inspected without Vercel logs.
+    { name: "AI Debug", type: "multilineText" },
   ],
   "Tasks": [
     // Don't redefine "Name" — Airtable uses the existing primary
