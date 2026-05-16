@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { pickLeadField } from "@/lib/lead-fields";
 
 export const dynamic = "force-dynamic";
 export const fetchCache = "force-no-store";
@@ -289,10 +290,10 @@ async function createTriggerTask(baseId, { triggerType, lead, signalText, eviden
       "Task Rule": def.label,
       Score: score,
       "Scan Target": leadName,
-      "Lead Title": f.Title || "",
-      Email: f.Email || "",
-      "LinkedIn URL": f["LinkedIn URL"] || f["Linkedin URL"] || "",
-      Phone: f.Phone || "",
+      "Lead Title": pickLeadField(f, "title"),
+      Email: pickLeadField(f, "email"),
+      "LinkedIn URL": pickLeadField(f, "linkedinUrl"),
+      Phone: pickLeadField(f, "phone"),
       Signal: signalParts.join("\n"),
       URL: evidenceUrl || "",
       "Post URL": evidenceUrl || "",

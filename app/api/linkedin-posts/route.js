@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import { trackOpenAIUsage } from "@/lib/ai-usage";
+import { pickLeadField } from "@/lib/lead-fields";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LINKEDIN POSTS — FETCH + SCORE + CREATE TASKS
@@ -65,6 +66,14 @@ async function atCreateBatch(baseId, table, records) {
   const results = [];
   const errors = [];
 
+  // Fields that MUST NEVER be stripped — task is broken without them. If
+  // Airtable's error response somehow names one of these as the bad field
+  // (e.g. malformed parse, regex over-match), we abort that record instead
+  // of silently creating it with a critical field missing. Score is here
+  // because a 0-score task is functionally a broken task — it sorts to the
+  // bottom and the operator can't tell what the AI thought of the post.
+  const CRITICAL_FIELDS = new Set(["Name", "Score", "Signal", "Task Type", "Source"]);
+
   // Iteratively strip unknown fields and retry. Airtable only tells us ONE bad field per error,
   // so if your schema is missing 3 fields, we need 3 retries. Max 10 to avoid infinite loops.
   async function tryBatchWithStripping(batch, strippedFields = []) {
@@ -86,7 +95,13 @@ async function atCreateBatch(baseId, table, records) {
         || errText.match(/"([^"]+)"\s+(?:does not exist|is not a valid column)/);
       const badField = m ? m[1] : null;
       if (badField) {
-        console.warn(`[linkedin-posts] Stripping bad field "${badField}" from Tasks batch (attempt ${strippedFields.length + 1})`);
+        // SAFEGUARD: never strip critical fields. If Airtable says one of
+        // them is bad, surface the error — don't silently create broken tasks.
+        if (CRITICAL_FIELDS.has(badField)) {
+          console.error(`[linkedin-posts] REFUSING to strip critical field "${badField}". Airtable error: ${errText.slice(0, 300)}`);
+          return { ok: false, error: `Critical field "${badField}" rejected by Airtable. Fix the schema or value type. Error: ${errText.slice(0, 200)}`, strippedFields };
+        }
+        console.warn(`[linkedin-posts] Stripping bad field "${badField}" from Tasks batch (attempt ${strippedFields.length + 1}). Error: ${errText.slice(0, 200)}`);
         const stripped = batch.map(rec => {
           const f = { ...rec.fields };
           delete f[badField];
@@ -1280,10 +1295,10 @@ async function runLinkedInPostScan({
             "Task Rule": taskRuleName,
             Score: sp.adjusted_score,
             "Scan Target": leadName,
-            "Lead Title": f.Title || "",
-            Email: f.Email || "",
-            "LinkedIn URL": f["LinkedIn URL"] || f["Linkedin URL"] || "",
-            Phone: f.Phone || "",
+            "Lead Title": pickLeadField(f, "title"),
+            Email: pickLeadField(f, "email"),
+            "LinkedIn URL": pickLeadField(f, "linkedinUrl"),
+            Phone: pickLeadField(f, "phone"),
             Signal: signalParts.join("\n"),
             URL: postUrl,              // canonical post URL field
             "Post URL": postUrl,       // alt name — some schemas use this

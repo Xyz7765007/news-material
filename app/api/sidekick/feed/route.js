@@ -69,7 +69,11 @@ function formatCard(record) {
 
 // Filter formula:
 //   1. Handled At must be empty (pending)
-//   2. AND: either the task is NOT one of the time-sensitive types
+//   2. LinkedIn URL must NOT be empty — per Kunal, the chatbot only shows
+//      tasks where the lead has a LinkedIn URL, so the operator always has
+//      a path to action. Tasks for leads missing this field stay in Airtable
+//      (for re-enrichment / manual fix) but don't appear in the chatbot.
+//   3. AND: either the task is NOT one of the time-sensitive types
 //      (engagement = GA, linkedin_engagement = LinkedIn Posts, lead_movement = RapidAPI movement),
 //      OR Created within last 7 days.
 //   Per Kunal: GA, LinkedIn engagement, and movement-detected signals all
@@ -81,7 +85,7 @@ function formatCard(record) {
 //   Assumes Created is a dateTime field — setup-fix ensures this. Older
 //   text-type Created columns will fail DATETIME comparisons silently and
 //   tasks fall through unfiltered (acceptable degraded behaviour).
-const PENDING_FILTER = `AND({Handled At} = BLANK(), OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
+const PENDING_FILTER = `AND({Handled At} = BLANK(), {LinkedIn URL} != BLANK(), OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
 
 export async function GET(request) {
   if (!authOk(request)) {

@@ -167,11 +167,24 @@ const CAMPAIGN_TABLES = {
     { name: "Company", type: "singleLineText" },
     { name: "Source", type: "singleLineText" },
     { name: "Task Type", type: "singleLineText" },
+    { name: "Task Rule", type: "singleLineText" },
     { name: "Score", type: "number", options: { precision: 0 } },
+    { name: "Score Reason", type: "multilineText" },
     { name: "Signal", type: "multilineText" },
     { name: "Event ID", type: "singleLineText" },
     { name: "Account ID", type: "singleLineText" },
     { name: "URL", type: "url" },
+    // Lead contact fields — propagated from the Lead record at task-creation time
+    // so the chatbot can render CTAs (in LinkedIn / Call / etc). The chatbot
+    // feed filter requires {LinkedIn URL} to exist — without it, the filter
+    // formula throws and the feed returns 422.
+    { name: "Lead Title", type: "singleLineText" },
+    { name: "Email", type: "singleLineText" },
+    { name: "LinkedIn URL", type: "singleLineText" },
+    { name: "Phone", type: "singleLineText" },
+    { name: "Movement Type", type: "singleLineText" },  // hired/promoted/exited (movement scan)
+    { name: "Scan Target", type: "singleLineText" },
+    { name: "Date", type: "date", options: { dateFormat: { name: "iso" } } },
     { name: "Created", type: "dateTime", options: TZ_ISO },
     // ─── Side Kick chatbot integration ────────────────────────
     // When a user clicks a CTA in the chatbot, the action endpoint

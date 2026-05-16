@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { JWT } from "google-auth-library";
+import { pickLeadField } from "@/lib/lead-fields";
 
 const AIRTABLE_KEY = process.env.AIRTABLE_API_KEY;
 const MASTER_BASE_ID = process.env.AIRTABLE_BASE_ID;
@@ -1018,7 +1019,13 @@ export async function POST(request) {
         for (const lead of targetLeads) {
           const f = lead.fields || {};
           const name = f.Name || "Unknown";
-          const title = f.Title || "";
+          // Use pickLeadField for fields that vary in naming across data sources.
+          // Apollo uses "Title", Sales Nav uses "Job Title", manual sheets vary.
+          // Same for LinkedIn URL ("Linkedin URL" vs "LinkedIn URL" vs etc).
+          const title = pickLeadField(f, "title");
+          const leadLinkedIn = pickLeadField(f, "linkedinUrl");
+          const leadEmail = pickLeadField(f, "email");
+          const leadPhone = pickLeadField(f, "phone");
           const company = f.Company || "";
           const engagementScore = f["GA Engagement Score"] || 0;
           const sessions = f["GA Sessions"] || 0;
@@ -1052,9 +1059,10 @@ export async function POST(request) {
               "Task Type": "engagement",
               Date: todayStr,
               Created: nowISO,
-              Phone: f.Phone || "",
-              Email: f.Email || "",
-              "LinkedIn URL": f["LinkedIn URL"] || "",
+              Phone: leadPhone,
+              Email: leadEmail,
+              "LinkedIn URL": leadLinkedIn,
+              URL: leadLinkedIn,
             },
           });
         }

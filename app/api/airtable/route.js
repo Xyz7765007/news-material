@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import { trackOpenAIUsage, resetCampaignAIUsage } from "@/lib/ai-usage";
 import { resetCampaignRapidAPIUsage } from "@/lib/rapidapi-usage";
+import { pickLeadField } from "@/lib/lead-fields";
 
 export const dynamic = "force-dynamic";
 export const fetchCache = "force-no-store";
@@ -965,11 +966,17 @@ Return ONLY JSON: [{"idx":0,"score":85,"reason":"max 15 words explaining which d
   const todayStr = new Date().toISOString().slice(0, 10);
   const nowISO = new Date().toISOString();
 
+  // ─── Diagnostic: log the field names available on the first Lead ─────
+  // If Top X tasks ever come out empty for LinkedIn URL / Phone / Title, this
+  // log line tells us what field names the source table is actually using.
+  // pickLeadField already handles the common variants — add new ones to
+  // /lib/lead-fields.js if you find a convention not yet covered.
+  if (scored.length > 0) {
+    const sampleFields = Object.keys(scored[0].record.fields || {}).sort();
+    console.log(`[TOP-X] Sample lead field names (n=${sampleFields.length}): ${sampleFields.join(", ")}`);
+  }
+
   const tasks = scored.slice(0, topN).map(item => {
-    const score = parseInt(item.compositeScore) || 0;
-    const aiScore = parseInt(item.aiScore) || 0;
-    const numScore = parseInt(item.numericScore) || 0;
-    const f = item.record.fields || {};
 
     // Build a transparent Signal showing how this score was derived
     const signalLines = [];
@@ -992,22 +999,29 @@ Return ONLY JSON: [{"idx":0,"score":85,"reason":"max 15 words explaining which d
       signalLines.push(``, `📋 Field values:`, ...breakdown);
     }
 
-    // Task fields. The Tasks table in the user's master base uses "Name" as the primary
-    // field (see chat from 2026-04-23 19:00 — confirmed schema). Putting lead name here
-    // and company in "Company" — DON'T accidentally write the lead's name to Company.
+    // Task fields. Use pickLeadField to handle the wide range of field names
+    // different campaigns use for the same data (Apollo "Title" vs Sales Nav
+    // "Job Title" vs manual sheets "Position", etc). Silent empty values were
+    // the bug — Top X tasks looked sparse because the field name didn't match
+    // even though the Lead record had the data.
+    const leadTitle = pickLeadField(f, "title");
+    const leadLinkedIn = pickLeadField(f, "linkedinUrl");
+    const leadEmail = pickLeadField(f, "email");
+    const leadPhone = pickLeadField(f, "phone");
+
     return {
       Name: item.name,                              // primary — the lead OR the account name
       Company: scanTarget === "accounts" ? item.name : item.company,
       "Task Rule": rule.name || "Top X",
       Score: Math.max(0, Math.min(100, score)),
       "Scan Target": item.name,                     // for backwards compat with existing Tasks records
-      "Lead Title": f.Title || f["Lead Title"] || "",
-      Email: f.Email || "",
-      "LinkedIn URL": f["LinkedIn URL"] || f["Linkedin URL"] || "",
-      Phone: f.Phone || "",
+      "Lead Title": leadTitle,
+      Email: leadEmail,
+      "LinkedIn URL": leadLinkedIn,
+      Phone: leadPhone,
       Signal: signalLines.join("\n"),
       Source: useAI ? "Top X + AI Scoring" : "Top X Scoring",
-      URL: f["LinkedIn URL"] || f["Linkedin URL"] || "",
+      URL: leadLinkedIn,
       "Task Type": "top_x",
       Date: todayStr,
       Created: nowISO,
@@ -1733,19 +1747,24 @@ async function runTopXSmartCompile(baseId, rule, compiled, campaignId = null) {
 
     if (item.fuzzyReason) signalLines.push(``, `🤖 Fuzzy check: ${item.fuzzyReason}`);
 
+    const leadTitle = pickLeadField(f, "title");
+    const leadLinkedIn = pickLeadField(f, "linkedinUrl");
+    const leadEmail = pickLeadField(f, "email");
+    const leadPhone = pickLeadField(f, "phone");
+
     return {
       Name: item.name,
       Company: scanTarget === "accounts" ? item.name : item.company,
       "Task Rule": rule.name || "Top X (Smart)",
       Score: item.finalScore,
       "Scan Target": item.name,
-      "Lead Title": f.Title || f["Lead Title"] || "",
-      Email: f.Email || "",
-      "LinkedIn URL": f["LinkedIn URL"] || f["Linkedin URL"] || "",
-      Phone: f.Phone || "",
+      "Lead Title": leadTitle,
+      Email: leadEmail,
+      "LinkedIn URL": leadLinkedIn,
+      Phone: leadPhone,
       Signal: signalLines.join("\n"),
       Source: fuzzyApiCalls > 0 ? "Top X Smart (Rules + AI)" : "Top X Smart (Rules)",
-      URL: f["LinkedIn URL"] || f["Linkedin URL"] || "",
+      URL: leadLinkedIn,
       "Task Type": "top_x",
       Date: todayStr,
       Created: nowISO,

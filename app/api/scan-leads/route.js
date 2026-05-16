@@ -47,6 +47,7 @@ import { NextResponse } from "next/server";
 import { fetchLinkedInProfile } from "@/lib/linkedin-fetch";
 import { classifyMovement, buildTaskFromMovement, buildLeadUpdateFields } from "@/lib/movement-detection";
 import { trackRapidAPIUsageBatch, getRapidAPICost, ensureRapidAPIUsageFields } from "@/lib/rapidapi-usage";
+import { pickLeadField } from "@/lib/lead-fields";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300; // give chunked scans enough budget
@@ -482,8 +483,13 @@ async function handleScan({
         id: leadRec.id,
         name: f.Name || "Unknown",
         storedCompany: f.Company || "",
-        storedTitle: f.Title || "",
-        linkedinUrl: f["LinkedIn URL"] || "",
+        storedTitle: pickLeadField(f, "title"),
+        linkedinUrl: pickLeadField(f, "linkedinUrl"),
+        // Carry these so buildTaskFromMovement can stamp the resulting Task
+        // with the lead's contact details — otherwise the chatbot card has
+        // no phone/email and the "in LinkedIn" button never appears.
+        email: pickLeadField(f, "email"),
+        phone: pickLeadField(f, "phone"),
       };
       // The lead's storedAccount is whatever's in their Company field.
       // The lead's "in our system, attributed to this account" is also Company.

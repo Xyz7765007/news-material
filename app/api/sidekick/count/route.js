@@ -42,7 +42,7 @@ export async function GET(request) {
   // Same filter as /feed (see comments there) — keeps badge consistent.
   // Time-sensitive types (engagement, linkedin_engagement, lead_movement) age
   // out after 7 days; all other types remain regardless of age.
-  const PENDING_FILTER = `AND({Handled At} = BLANK(), OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
+  const PENDING_FILTER = `AND({Handled At} = BLANK(), {LinkedIn URL} != BLANK(), OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
   let total = 0;
   let offset = "";
   let pages = 0;
