@@ -170,6 +170,7 @@ const CAMPAIGN_TABLES = {
     { name: "Generated DM 3", type: "multilineText" },
     { name: "Batch ID", type: "singleLineText" },
     { name: "Why Reasons", type: "multilineText" },
+    { name: "Post URL", type: "url" },
     { name: "Composite Score", type: "number", options: { precision: 0 } },
     { name: "Edit History", type: "multilineText" },
   ],

@@ -7,6 +7,7 @@ import {
   deterministicFallback,
   deriveNames,
 } from "@/lib/message-merge.js";
+import { buildLeadBrief, briefToPromptBlock, briefToUiBullets } from "@/lib/lead-brief.js";
 
 // ═══════════════════════════════════════════════════════════════════
 // SIDEKICK AUTO-BATCH GENERATE
@@ -118,7 +119,8 @@ async function getOrCreateAutoBatchRule(baseId, campaignAccountId, requestOrigin
   // ─── Self-heal Task Rules schema first ───────────────────────
   // Veloka's Task Rules table may not have "Outreach Config" if the campaign
   // was created without linkedin_outreach setup. Call ensure_fields to add
-  // missing fields before we try to create the rule.
+  // missing fields before we try to create the rule. Also ensures Outreach
+  // has Post URL for the chatbot to render a clickable LinkedIn link.
   if (requestOrigin) {
     try {
       await fetch(new URL("/api/airtable", requestOrigin).toString(), {
@@ -132,6 +134,18 @@ async function getOrCreateAutoBatchRule(baseId, campaignAccountId, requestOrigin
             { name: "Name", type: "singleLineText" },
             { name: "Task Type", type: "singleLineText" },
             { name: "Outreach Config", type: "multilineText" },
+          ],
+        }),
+      });
+      await fetch(new URL("/api/airtable", requestOrigin).toString(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "ensure_fields",
+          baseId,
+          table: "Outreach",
+          fieldNames: [
+            { name: "Post URL", type: "url" },
           ],
         }),
       });
@@ -189,16 +203,21 @@ async function getOrCreateAutoBatchRule(baseId, campaignAccountId, requestOrigin
   return { rule: created[0], ruleId: created[0].id, config: defaultConfig };
 }
 
-// ─── AI generation with strict validation ────────────────────────
-// Every message: AI generates → sanitizeAndValidate runs (strip formatting,
-// merge-field safety pass, refusal detection, char-limit enforcement) → on
-// any failure → deterministic fallback. NO unsafe text ever reaches the DB.
+// ─── AI generation with deep personalization ─────────────────────
+// Builds a structured Lead Intelligence Brief from all relevant tasks,
+// passes it to AI with forced-citation rules + anti-generic examples.
+// Every output runs through sanitizeAndValidate (merge-field safety pass,
+// char limits, refusal detection). On failure → deterministic fallback.
 async function generateLeadDrafts(lead, scoring, campaignContext) {
   const f = lead?.fields || {};
   const names = deriveNames(f);
   const firstName = names.first || "there";
   const company = (f.Company || "your team");
-  const reasons = scoring?.reasons?.length ? scoring.reasons.join("; ") : "high lead score";
+
+  // Build structured brief from the lead's relevant tasks
+  const brief = buildLeadBrief(lead, scoring.relevantTasks || []);
+  const contextBlock = briefToPromptBlock(brief);
+  const uiBullets = briefToUiBullets(brief);
 
   const buildFallback = () => ({
     connectionNote: deterministicFallback(lead, "connection_note"),
@@ -206,6 +225,7 @@ async function generateLeadDrafts(lead, scoring, campaignContext) {
     dm2: deterministicFallback(lead, "dm_2"),
     dm3: deterministicFallback(lead, "dm_3"),
     costUsd: 0,
+    uiBullets,
     validation: {
       connection: { fallback: true, reason: "no_ai_or_failed" },
       dm1: { fallback: true }, dm2: { fallback: true }, dm3: { fallback: true },
@@ -215,41 +235,86 @@ async function generateLeadDrafts(lead, scoring, campaignContext) {
   if (!OPENAI_KEY) return buildFallback();
 
   const openai = new OpenAI({ apiKey: OPENAI_KEY });
-  const leadName = f.Name || f["Full Name"] || firstName;
-  const title = pickLeadField(f, "title") || "your role";
+  const leadName = brief.identity.fullName;
+  const title = brief.identity.title || "your role";
 
-  // STRICT system prompt:
-  // - Inline first name as plain text, NOT {first_name}
-  // - Hard char limits per message type
-  // - JSON-only output
-  const system = `You write LinkedIn outreach for Side Kick (B2B outbound infrastructure).
+  // ═══════════════════════════════════════════════════════════════
+  // DEEP-PERSONALIZATION PROMPT
+  // The core change: every message MUST cite specific data from
+  // RECENT LEAD ACTIVITY. Generic templates banned by explicit rule
+  // + worked examples. The brief block surfaces named facts AI can
+  // quote directly (direct quotes, suggested angles, AI rationale).
+  // ═══════════════════════════════════════════════════════════════
+  const system = `You write hyper-personalized LinkedIn outreach for Side Kick (B2B outbound infrastructure).
 
-ABSOLUTE RULES:
-- Output ONLY valid JSON. No preamble, no markdown, no code fences, no quotes around messages.
-- Inline "${firstName}" as plain text. NEVER write {first_name}, {name}, or any {placeholder}.
-- Inline "${company}" as plain text. NEVER write {company}.
-- No emojis. No markdown (**, _, \`).
+═════════════════════════════════════════════════════════════
+ABSOLUTE OUTPUT RULES (violations = rejected output):
+═════════════════════════════════════════════════════════════
+1. Output ONLY valid JSON. No preamble, no markdown, no code fences.
+2. Inline "${firstName}" as plain text. NEVER write {first_name}, {name}, or any {placeholder}.
+3. Inline "${company}" as plain text. NEVER write {company}.
+4. No emojis. No markdown (**, _, \`). No quotes around messages.
 
-CHARACTER LIMITS (hard caps, count them):
-- connectionNote: 260 chars MAX (LinkedIn cap is 300, leave headroom)
-- dm1: 600 chars MAX
-- dm2: 550 chars MAX
-- dm3: 500 chars MAX
+═════════════════════════════════════════════════════════════
+PERSONALIZATION RULES (THE CORE OF THIS JOB):
+═════════════════════════════════════════════════════════════
+Each of the 4 messages MUST cite ≥1 SPECIFIC fact from RECENT LEAD ACTIVITY:
+  - A number (e.g. "112% growth", "$50M raise")
+  - A direct quote from their post (kept in quotes)
+  - A named observation they made (e.g. "your D2C / Qcom split")
+  - A specific topic they wrote about
 
-MESSAGE PURPOSE:
-- connectionNote: warm intro that names the why-now signal. Soft connect ask. No demo ask.
-- dm1: sent 2 days post-accept. Thank briefly, reference signal with new insight, one low-pressure question.
-- dm2: sent 3 days post-dm1. One specific observation or insight. Soft ask.
-- dm3: sent 4 days post-dm2. Soft close. No guilt-trip. Optional take-away resource.
+GENERIC PHRASES BANNED — instant fail:
+  ✗ "noticed your work at [company]"
+  ✗ "saw your recent activity"
+  ✗ "your latest post"
+  ✗ "great post about [topic]"
+  ✗ "curious how you're thinking about [generic thing] this year"
+  ✗ "happy to share a teardown"
+  ✗ "if [generic thing] is on the roadmap"
+  ✗ Any compliment without a specific data point attached
+
+═════════════════════════════════════════════════════════════
+WORKED EXAMPLE — what BAD vs GOOD looks like:
+═════════════════════════════════════════════════════════════
+Bad (generic, instant reject):
+"Hi Devi — noticed your work at 1digitalstack.ai. Would like to connect."
+
+Good (specific, uses real data from the brief):
+"Hi Devi — your 112% Qcom number in healthy snacks caught my eye, especially the Bangalore-led adoption. We help D2C brands set up outbound around exactly this kind of category shift. Worth a chat?"
+
+═════════════════════════════════════════════════════════════
+PER-MESSAGE REQUIREMENTS:
+═════════════════════════════════════════════════════════════
+- connectionNote (max 260 chars): open with a specific reference to their activity. Soft connect ask. NO demo ask.
+- dm1 (max 600 chars, sent 2d post-connect): thank briefly, then go deeper on the signal they posted/showed. Add YOUR observation. End with one specific low-pressure question.
+- dm2 (max 550 chars, sent 3d post-dm1): bring a NEW angle, parallel, or data point you didn't mention before. Soft ask.
+- dm3 (max 500 chars, sent 4d post-dm2): soft close. No guilt-trip. Offer a SPECIFIC takeaway/resource (e.g. "if useful, here's how [Similar Company] handled their [X]") even if they don't reply.
+
+═════════════════════════════════════════════════════════════
+SELF-CHECK BEFORE OUTPUT:
+═════════════════════════════════════════════════════════════
+For each of the 4 messages, verify:
+  (a) Does it contain at least ONE specific noun/number/quote from RECENT LEAD ACTIVITY?
+  (b) Is it free of banned phrases?
+  (c) Does it sound like a human who actually read the lead's post — not a template?
+If any check fails for any message, rewrite it before outputting.
 
 Output JSON shape:
 { "connectionNote": "...", "dm1": "...", "dm2": "...", "dm3": "..." }`;
 
-  const user = `Lead: ${leadName}, ${title} at ${company}
-Why now: ${reasons}
-Campaign: ${campaignContext || "B2B outbound, AI-driven SDR"}
+  const user = `LEAD:
+  Name: ${leadName}
+  Role: ${title} at ${company}
+  LinkedIn: ${brief.identity.linkedinUrl || "(unknown)"}
 
-Generate the 4 messages following all rules.`;
+RECENT LEAD ACTIVITY (cite from this — do not invent facts):
+${contextBlock}
+
+CAMPAIGN CONTEXT:
+${campaignContext || "B2B outbound infrastructure — Side Kick builds AI-driven SDR systems for B2B companies that have outgrown traditional SDR agencies. Customers include companies running cold outbound at scale who want personalization without manual SDR overhead."}
+
+Generate the 4 messages following ALL rules. Each must cite specifics from RECENT LEAD ACTIVITY above.`;
 
   let resp;
   try {
@@ -261,7 +326,7 @@ Generate the 4 messages following all rules.`;
       ],
       response_format: { type: "json_object" },
       temperature: 0.7,
-      max_tokens: 1000,
+      max_tokens: 1400,  // bumped to allow richer personalization
     });
   } catch (e) {
     console.error(`[AUTO-BATCH] AI failed for ${leadName}:`, e.message);
@@ -275,14 +340,10 @@ Generate the 4 messages following all rules.`;
     parsed = {};
   }
 
-  // ─── Sanitize + validate each ──────────────────────────────────
-  // sanitizeAndValidate runs fillMergeFields as a safety pass, so even if
-  // AI ignored instructions and output "Hi {first_name}", it gets resolved
-  // to the real name. If validation fails (refusal, can't merge, etc.) →
-  // deterministicFallback ensures we never store garbage.
+  // Validate each message — merge field safety pass, char limits, refusal check
   const validateOne = (raw, kind) => sanitizeAndValidate(raw, {
     lead,
-    signal: f.Signal || reasons,
+    signal: f.Signal || contextBlock,
     company,
     kind,
   });
@@ -292,7 +353,7 @@ Generate the 4 messages following all rules.`;
   const dm2Res = validateOne(parsed.dm2, "dm");
   const dm3Res = validateOne(parsed.dm3, "dm");
 
-  // Log any validation failures so we can debug
+  // Log validation failures for debugging
   for (const [kind, res] of [["connection", connRes], ["dm1", dm1Res], ["dm2", dm2Res], ["dm3", dm3Res]]) {
     if (!res.ok) {
       console.warn(`[AUTO-BATCH] ${leadName} ${kind} validation failed: ${res.reason}`,
@@ -312,10 +373,8 @@ Generate the 4 messages following all rules.`;
     dm2: dm2Res.ok ? dm2Res.text : deterministicFallback(lead, "dm_2"),
     dm3: dm3Res.ok ? dm3Res.text : deterministicFallback(lead, "dm_3"),
     costUsd,
-    validation: {
-      connection: connRes,
-      dm1: dm1Res, dm2: dm2Res, dm3: dm3Res,
-    },
+    uiBullets,  // structured 1-3 bullets for chatbot UI (replaces raw Signal blob)
+    validation: { connection: connRes, dm1: dm1Res, dm2: dm2Res, dm3: dm3Res },
   };
 }
 
@@ -352,6 +411,30 @@ export async function POST(request) {
       });
     }
 
+    // ─── On force=true, clear out existing pending_approval rows ─
+    // Without this, regenerating would leave the old batch's records
+    // alongside the new ones (both with Status=pending_approval) — user
+    // sees doubled-up cards. Mark them as skipped so they don't reappear.
+    if (force) {
+      try {
+        const existingPending = await atList(baseId, "Outreach",
+          `{Status} = 'pending_approval'`);
+        if (existingPending.length) {
+          const updates = existingPending.map(r => ({
+            id: r.id,
+            fields: {
+              Status: "skipped",
+              Notes: `${r.fields?.Notes || ""}\n[${new Date().toISOString()}] Replaced by force-regenerated batch`.trim(),
+            },
+          }));
+          await atUpdate(baseId, "Outreach", updates);
+          console.log(`[AUTO-BATCH] force=true: cleared ${updates.length} stale pending_approval records`);
+        }
+      } catch (e) {
+        console.warn("[AUTO-BATCH] Failed to clear stale pending records:", e.message);
+      }
+    }
+
     // Load data
     const [leads, tasks, existingOutreach] = await Promise.all([
       atList(baseId, "Leads"),
@@ -359,8 +442,10 @@ export async function POST(request) {
       atList(baseId, "Outreach"),
     ]);
 
-    // Exclude leads already in active outreach
-    const STALE_STATUSES = new Set(["skipped", "completed", "replied"]);
+    // Exclude leads already in active outreach. NOTE: pending_approval just
+    // got cleared above on force=true, so this only catches truly-active
+    // outreach (queued / connection_sent / connected / dm_N).
+    const STALE_STATUSES = new Set(["skipped", "completed", "replied", "pending_approval"]);
     const excludeLinkedIns = new Set(
       existingOutreach
         .filter(r => !STALE_STATUSES.has((r.fields?.Status || "").toLowerCase()))
@@ -395,6 +480,17 @@ export async function POST(request) {
     const records = ranked.map(({ lead, scoring, linkedinUrl }, i) => {
       const f = lead.fields || {};
       const d = drafts[i];
+      // uiBullets = clean 1-3 line summary for chatbot (replaces raw Signal blob)
+      const cleanReasons = (d.uiBullets && d.uiBullets.length)
+        ? d.uiBullets.join("\n")
+        : scoring.reasons.join(" · ");
+      // Find the most recent linkedin post URL from relevant tasks (if any)
+      let postUrl = "";
+      for (const t of (scoring.relevantTasks || [])) {
+        const sig = t.fields?.Signal || "";
+        const m = sig.match(/https:\/\/(www\.)?linkedin\.com\/feed\/update\/[^\s)\]]+/);
+        if (m) { postUrl = m[0]; break; }
+      }
       return {
         "Lead Name": f.Name || f["Full Name"] || "Unknown",
         "LinkedIn URL": linkedinUrl,
@@ -412,7 +508,8 @@ export async function POST(request) {
         "Generated DM 2": d.dm2,
         "Generated DM 3": d.dm3,
         "Batch ID": todayKey,
-        "Why Reasons": scoring.reasons.join(" · "),
+        "Why Reasons": cleanReasons,             // clean bullets for chatbot card
+        "Post URL": postUrl,                     // clickable in chatbot UI
         "Composite Score": scoring.score,
       };
     });

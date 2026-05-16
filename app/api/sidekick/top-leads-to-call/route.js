@@ -90,15 +90,16 @@ export async function GET(request) {
         lead_title: title || "",
         lead_email: email || "",
         lead_linkedin: linkedinUrl || "",
-        lead_phone: phone || "",                 // empty when needs enrichment
-        needs_phone_enrich: !!needsPhoneEnrich,  // chatbot renders Enrich CTA instead of Call
+        lead_phone: phone || "",
+        needs_phone_enrich: !!needsPhoneEnrich,
         score: scoring.score,
         base_score: scoring.baseScore,
         bonus: scoring.bonus,
+        bonus_breakdown: scoring.bonusBreakdown || { ga: 0, li: 0, topx: 0 },
         has_movement: scoring.hasMovement,
         movement_type: movementTaskFields["Movement Type"] || "",
-        reasons: scoring.reasons,                  // "why now" array — full justifications
-        why_summary: scoring.reasons.join(" · "),  // joined for compact display
+        reasons: scoring.reasons,
+        why_summary: scoring.reasons.join(" · "),
       };
     });
 

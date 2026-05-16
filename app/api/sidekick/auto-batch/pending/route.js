@@ -89,6 +89,7 @@ function groupBatches(records) {
       title: f.Title || "",
       email: f.Email || "",
       linkedin_url: f["LinkedIn URL"] || "",
+      post_url: f["Post URL"] || "",
       composite_score: f["Composite Score"] || 0,
       why_reasons: f["Why Reasons"] || "",
       connection_note: f["Generated Connection Note"] || "",
