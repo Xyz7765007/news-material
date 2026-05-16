@@ -240,6 +240,17 @@ const CAMPAIGN_TABLES = {
     { name: "Reviewer Notes", type: "multilineText" },
     { name: "Reviewed At", type: "dateTime", options: TZ_ISO },
   ],
+
+  // ─── Task Rules — needed by auto-batch + outreach engines ──────
+  // Veloka and other campaigns may not have this table at all; setup-fix
+  // bootstraps it with the minimum schema the auto-batch needs. The
+  // "Outreach Config" field stores the per-rule JSON (DM cadence, AI
+  // prompts, scheduling, etc).
+  "Task Rules": [
+    { name: "Name", type: "singleLineText" },
+    { name: "Task Type", type: "singleLineText" },
+    { name: "Outreach Config", type: "multilineText" },
+  ],
 };
 
 export async function POST(request) {

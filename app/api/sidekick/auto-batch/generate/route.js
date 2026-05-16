@@ -114,7 +114,32 @@ async function atUpdate(baseId, table, records) {
   return all;
 }
 
-async function getOrCreateAutoBatchRule(baseId, campaignAccountId) {
+async function getOrCreateAutoBatchRule(baseId, campaignAccountId, requestOrigin) {
+  // ─── Self-heal Task Rules schema first ───────────────────────
+  // Veloka's Task Rules table may not have "Outreach Config" if the campaign
+  // was created without linkedin_outreach setup. Call ensure_fields to add
+  // missing fields before we try to create the rule.
+  if (requestOrigin) {
+    try {
+      await fetch(new URL("/api/airtable", requestOrigin).toString(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "ensure_fields",
+          baseId,
+          table: "Task Rules",
+          fieldNames: [
+            { name: "Name", type: "singleLineText" },
+            { name: "Task Type", type: "singleLineText" },
+            { name: "Outreach Config", type: "multilineText" },
+          ],
+        }),
+      });
+    } catch (e) {
+      console.warn("[AUTO-BATCH] ensure_fields call failed (non-fatal):", e.message);
+    }
+  }
+
   const rules = await atList(baseId, "Task Rules");
   let rule = rules.find(r => (r.fields?.Name || "") === AUTO_BATCH_RULE_NAME);
 
@@ -312,7 +337,8 @@ export async function POST(request) {
   }
 
   try {
-    const { rule, ruleId, config } = await getOrCreateAutoBatchRule(baseId, accountId);
+    const requestOrigin = new URL(request.url).origin;
+    const { rule, ruleId, config } = await getOrCreateAutoBatchRule(baseId, accountId, requestOrigin);
 
     // Idempotency
     const todayKey = todayIST6amRollover();
