@@ -514,12 +514,20 @@ export async function POST(request) {
       });
     }
 
-    // ─── On force=true, clear out existing pending_approval rows ─
+    // ─── On force=true, clear out existing stale records ─
+    // Two cleanups happen here:
+    //  1. Old pending_approval records — replaced by fresh batch
+    //  2. ORPHAN queued records that lack Generated Connection Note —
+    //     these came from someone clicking the legacy "Enqueue Leads"
+    //     button on the auto-batch rule (which bypassed AI personalization
+    //     entirely). If we let cron process them, the prospects get
+    //     generic templated outreach. Mark them skipped.
     // Without this, regenerating would leave the old batch's records
     // alongside the new ones (both with Status=pending_approval) — user
-    // sees doubled-up cards. Mark them as skipped so they don't reappear.
+    // sees doubled-up cards.
     if (force) {
       try {
+        // Cleanup 1: stale pending_approval
         const existingPending = await atList(baseId, "Outreach",
           `{Status} = 'pending_approval'`);
         if (existingPending.length) {
@@ -533,8 +541,24 @@ export async function POST(request) {
           await atUpdate(baseId, "Outreach", updates);
           console.log(`[AUTO-BATCH] force=true: cleared ${updates.length} stale pending_approval records`);
         }
+
+        // Cleanup 2: orphan queued records (created via legacy Enqueue Leads)
+        const allQueued = await atList(baseId, "Outreach",
+          `AND({Status} = 'queued', {Campaign} = '${AUTO_BATCH_RULE_NAME}')`);
+        const orphans = allQueued.filter(r => !r.fields?.["Generated Connection Note"]);
+        if (orphans.length) {
+          const updates = orphans.map(r => ({
+            id: r.id,
+            fields: {
+              Status: "skipped",
+              Notes: `${r.fields?.Notes || ""}\n[${new Date().toISOString()}] Orphan queued record cleanup — created via legacy Enqueue Leads (no AI personalization). Re-enqueue via Side Kick chatbot if intended.`.trim(),
+            },
+          }));
+          await atUpdate(baseId, "Outreach", updates);
+          console.log(`[AUTO-BATCH] force=true: cleared ${updates.length} orphan queued records (no AI personalization)`);
+        }
       } catch (e) {
-        console.warn("[AUTO-BATCH] Failed to clear stale pending records:", e.message);
+        console.warn("[AUTO-BATCH] Failed to clear stale records:", e.message);
       }
     }
 

@@ -2885,7 +2885,18 @@ Output format (strict JSON, no markdown):
 
     {/* Outreach Rules */}
     {(() => {
-      const outRules = rules.filter(r => (r.fields || {})["Task Type"] === "linkedin_outreach");
+      // Filter out the auto-batch infrastructure rule. "Sidekick Auto-Batch v1"
+      // is created by /api/sidekick/auto-batch/generate as scaffolding for the
+      // cron's DM cadence config. It must NOT be manually actionable — clicking
+      // Enqueue Leads on it would create generic outreach records bypassing the
+      // AI-personalization pipeline. Auto-batch is managed exclusively via the
+      // Side Kick chatbot (Daily LinkedIn Batch card).
+      const outRules = rules.filter(r => {
+        const f = r.fields || {};
+        if (f["Task Type"] !== "linkedin_outreach") return false;
+        if (f.Name === "Sidekick Auto-Batch v1") return false;
+        return true;
+      });
       return outRules.length > 0 ? (
         <div style={{marginBottom:20}}>
           <div style={{fontSize:12,fontWeight:600,marginBottom:8,color:"var(--t2)"}}>Outreach Rules</div>

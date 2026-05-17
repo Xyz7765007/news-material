@@ -1074,6 +1074,37 @@ async function processOutreachQueue(baseId, accountId, ruleConfig, campaignId = 
     // send these until user clicks Send → Status flips to "queued".
     if (status === "pending_approval") continue;
 
+    // ──── Auto-Batch: skip orphaned queued records ───────
+    // If a record is on the Sidekick Auto-Batch v1 campaign but lacks the
+    // Generated Connection Note field, it was created by the legacy manual
+    // Enqueue Leads button (which bypasses AI personalization). Sending it
+    // would use the rule's static template → generic message. Skip and
+    // mark as skipped so it doesn't reappear next cron tick. The right way
+    // to enqueue auto-batch records is via the Side Kick chatbot, which
+    // populates Generated Connection Note before flipping to queued.
+    if (
+      status === "queued" &&
+      f.Campaign === "Sidekick Auto-Batch v1" &&
+      !f["Generated Connection Note"]
+    ) {
+      try {
+        await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Outreach")}/${item.id}`, {
+          method: "PATCH",
+          headers: { ...atHdr, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            fields: {
+              Status: "skipped",
+              Notes: `${f.Notes || ""}\n[${new Date().toISOString()}] Cron-skipped: orphan auto-batch queued record (no Generated Connection Note — created via legacy manual Enqueue). Approve via Side Kick chatbot instead.`.trim(),
+            },
+          }),
+        });
+        console.warn(`[OUTREACH-CRON] Skipped orphan auto-batch queued record ${item.id} (${f["Lead Name"] || "Unknown"})`);
+      } catch (e) {
+        console.warn(`[OUTREACH-CRON] Failed to mark orphan record as skipped:`, e.message);
+      }
+      continue;
+    }
+
     // Skip terminal states early
     if (status === "skipped" || status === "completed" || status === "replied") continue;
 
@@ -1818,6 +1849,19 @@ export async function POST(request) {
 
       case "enqueue_leads": {
         if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
+        // Block manual enqueue against the auto-batch infrastructure rule.
+        // Auto-batch records are created via /api/sidekick/auto-batch/generate
+        // with pre-generated AI messages. Manual Enqueue Leads creates records
+        // with NO AI personalization and the rule's static template — which
+        // would result in generic outreach. Reject hard.
+        const ruleName = body.ruleConfig?.name || "";
+        if (ruleName === "Sidekick Auto-Batch v1") {
+          return NextResponse.json({
+            error: "Manual enqueue disabled for Sidekick Auto-Batch v1. This rule is managed via the Side Kick chatbot — approve leads there to enqueue with AI-personalized messages.",
+            blocked: true,
+            ruleName,
+          }, { status: 400 });
+        }
         // Safety: hard cap manual/auto adds
         const count = Math.min(body.count || body.ruleConfig?.leadsPerBatch || 10, 100);
         const options = { mode: body.mode || "auto", selectedIds: body.selectedIds || [], count };
