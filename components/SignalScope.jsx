@@ -168,6 +168,11 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   // Click "Show history" to flip and reveal them.
   const [outreachShowHistory, setOutreachShowHistory] = useState(false);
   const [outreachCleanupRunning, setOutreachCleanupRunning] = useState(false);
+  // Cron health — polled once on LinkedIn Automation tab mount.
+  // Reads /api/cron/outreach/status which returns last N runs from the
+  // Cron Run Log table in the master base. State === null means "not fetched yet";
+  // state === false means "fetch failed".
+  const [cronStatus, setCronStatus] = useState(null);
   // HubSpot
   const [hsConnected, setHsConnected] = useState(false);
   const [hsKey, setHsKey] = useState(""); // input field
@@ -558,6 +563,17 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       setOutreachItems(data.items || []);
     } catch (e) { console.error("Outreach stats error:", e); }
     setOutreachLoading(false);
+    // Fetch cron health in parallel — cheap read, gives us a health indicator
+    // chip next to the queue. Failure is non-fatal; chip just won't show.
+    try {
+      const r = await fetch("/api/cron/outreach/status?limit=10", { cache: "no-store" });
+      if (r.ok) {
+        const data = await r.json();
+        setCronStatus(data.ok ? data : false);
+      } else {
+        setCronStatus(false);
+      }
+    } catch { setCronStatus(false); }
   };
 
   // Load AI usage stats from the Campaign record. Read the same get_campaign
@@ -2961,6 +2977,27 @@ Output format (strict JSON, no markdown):
             setOutreachCleanupRunning(false);
           }
         };
+        // ─── Next cron run helper ────────────────────────────────
+        // Cron is `0 6 * * *` UTC = 11:30 AM IST daily. If we're before
+        // today's 11:30 AM IST, next run is today; else tomorrow. Display
+        // both the absolute time and a relative countdown so the operator
+        // immediately knows when their queued records will go out.
+        const nextCronRun = (() => {
+          const now = new Date();
+          // 11:30 AM IST = 06:00 UTC. Build today's run time in UTC.
+          const todayUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 6, 0, 0));
+          const target = now < todayUTC
+            ? todayUTC
+            : new Date(todayUTC.getTime() + 24 * 60 * 60 * 1000);
+          const diffMs = target - now;
+          const hours = Math.floor(diffMs / 3600000);
+          const minutes = Math.floor((diffMs % 3600000) / 60000);
+          const relative = hours >= 1
+            ? `in ${hours}h ${minutes}m`
+            : `in ${minutes}m`;
+          const isToday = target.getUTCDate() === now.getUTCDate();
+          return { relative, isToday, queuedCount: activeItems.filter(q => q.fields?.Status === "queued").length };
+        })();
         // Count Sidekick Auto-Batch records across ALL statuses for the reset button
         const sidekickItems = outreachItems.filter(q => q.fields?.Campaign === "Sidekick Auto-Batch v1");
         const resetSidekick = async () => {
@@ -3030,6 +3067,52 @@ Output format (strict JSON, no markdown):
               {outreachCleanupRunning ? "…" : `💣 Reset Sidekick (${sidekickItems.length})`}
             </button>
           )}
+          {nextCronRun.queuedCount > 0 && (
+            <div
+              style={{
+                fontSize: 10,
+                padding: "3px 10px",
+                borderRadius: 4,
+                background: "rgba(245, 158, 11, 0.1)",
+                color: "var(--amb)",
+                fontWeight: 500,
+              }}
+              title={`Cron runs daily at 11:30 AM IST. ${nextCronRun.queuedCount} queued record${nextCronRun.queuedCount === 1 ? "" : "s"} will be processed then.`}
+            >
+              ⏰ Next send: {nextCronRun.relative} ({nextCronRun.isToday ? "today" : "tomorrow"} 11:30 IST)
+            </div>
+          )}
+          {cronStatus && cronStatus.summary && (() => {
+            // Cron health chip — color & label driven by status.summary.health.state
+            const h = cronStatus.summary.health;
+            const colors = {
+              healthy:           { bg: "rgba(93,168,142,0.1)", fg: "var(--grn)",  emoji: "✅" },
+              warning:           { bg: "rgba(245,158,11,0.1)", fg: "var(--amb)",  emoji: "⚠️" },
+              stale:             { bg: "rgba(239,68,68,0.1)",  fg: "var(--red)",  emoji: "🔴" },
+              no_scheduled_runs: { bg: "rgba(239,68,68,0.1)",  fg: "var(--red)",  emoji: "❌" },
+            };
+            const c = colors[h?.state] || { bg: "var(--hover)", fg: "var(--t3)", emoji: "•" };
+            const sum = cronStatus.summary;
+            const tooltip = [
+              `Health: ${h?.state || "unknown"} — ${h?.message || ""}`,
+              `Last run: ${sum.lastRunAt ? new Date(sum.lastRunAt).toLocaleString() : "never"}`,
+              `Last status: ${sum.lastRunStatus} (${sum.lastRunTrigger})`,
+              `Sent in last 24h: ${sum.connectionsLast24h} connections · ${sum.dmsLast24h} DMs`,
+              `Schedule: ${sum.cronSchedule}`,
+            ].join("\n");
+            return (
+              <div
+                style={{
+                  fontSize: 10, padding: "3px 10px", borderRadius: 4,
+                  background: c.bg, color: c.fg, fontWeight: 500,
+                  cursor: "help",
+                }}
+                title={tooltip}
+              >
+                {c.emoji} Cron: {h?.state === "healthy" ? "healthy" : h?.state === "warning" ? "warning" : h?.state === "stale" ? "stuck" : h?.state === "no_scheduled_runs" ? "not running" : "unknown"}
+              </div>
+            );
+          })()}
         </div>
         {outreachItems.filter(q => q.fields?.Status === "replied").length > 0 && (
           <div style={{fontSize:10,color:"var(--t2)",display:"flex",gap:10,alignItems:"center"}}>
@@ -3084,7 +3167,15 @@ Output format (strict JSON, no markdown):
               ) : isReplied ? <span style={{fontSize:10,color:"var(--t3)",fontStyle:"italic"}}>not classified</span> : <span style={{fontSize:10,color:"var(--t3)"}}>—</span>}
             </td>
             <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10}}>{f["DM Step"]||0}</td>
-            <td style={{fontSize:10}}>{status==="replied"?"—":(f["Next Action Date"]||"—")}</td>
+            <td style={{fontSize:10}}>{
+              status === "replied" ? "—"
+              : status === "queued" ? (
+                  <span style={{color:"var(--amb)"}} title={`Cron processes queued records daily at 11:30 AM IST. Next: ${nextCronRun.relative}.`}>
+                    Sends {nextCronRun.relative}
+                  </span>
+                )
+              : (f["Next Action Date"] || "—")
+            }</td>
           </tr>
           {isReplied && (summary || action) && (
             <tr style={{background:rowBg}}>

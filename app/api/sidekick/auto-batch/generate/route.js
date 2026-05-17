@@ -585,15 +585,26 @@ export async function POST(request) {
       console.warn("[AUTO-BATCH] Failed to clean stale records:", e.message);
     }
 
-    // Idempotency — AFTER cleanup, so stale records are gone before this
-    if (!force && config.lastBatchGeneratedAt === todayKey) {
+    // ─── Idempotency check (records-based, not flag-based) ──────
+    // We previously checked config.lastBatchGeneratedAt — a cached flag
+    // updated AFTER atCreate. If that update silently failed (Airtable
+    // rate limit, network blip), records existed but the flag didn't
+    // reflect it → next mount → flag check fails → creates ANOTHER batch
+    // on top of existing → user sees 10 pending instead of 5.
+    //
+    // Now we check the records themselves. If any pending_approval
+    // records exist with today's Batch ID, today's batch is "generated"
+    // — regardless of what the flag says.
+    if (!force) {
       const existing = await atList(baseId, "Outreach",
         `AND({Status} = 'pending_approval', {Batch ID} = '${todayKey}')`);
-      return NextResponse.json({
-        ok: true, alreadyGeneratedToday: true, batchId: todayKey, ruleId,
-        existingCount: existing.length,
-        message: "Batch already generated today. Use force=true to regenerate.",
-      });
+      if (existing.length > 0) {
+        return NextResponse.json({
+          ok: true, alreadyGeneratedToday: true, batchId: todayKey, ruleId,
+          existingCount: existing.length,
+          message: `Batch already generated today (${existing.length} pending records exist). Use force=true to regenerate.`,
+        });
+      }
     }
 
     // Load data
