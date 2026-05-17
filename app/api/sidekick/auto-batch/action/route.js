@@ -106,9 +106,15 @@ export async function POST(request) {
   try {
     if (action === "send_all") {
       if (!batchId) return NextResponse.json({ ok: false, error: "batchId required" }, { status: 400 });
-      const records = await atList(baseId, "Outreach",
-        `AND({Status} = 'pending_approval', {Batch ID} = '${batchId}')`);
-      if (!records.length) return NextResponse.json({ ok: true, count: 0, message: "No pending records in batch" });
+      // Special value "all" means "all pending_approval regardless of Batch ID".
+      // Used by the chatbot when multiple Batch IDs coexist in the pending pool
+      // (e.g. yesterday's stragglers + today's fresh batch). The chatbot merges
+      // them visually into one card; this matches that on the server.
+      const filter = batchId === "all"
+        ? `{Status} = 'pending_approval'`
+        : `AND({Status} = 'pending_approval', {Batch ID} = '${batchId}')`;
+      const records = await atList(baseId, "Outreach", filter);
+      if (!records.length) return NextResponse.json({ ok: true, count: 0, message: "No pending records" });
 
       const updates = records.map(r => ({
         id: r.id,
@@ -141,8 +147,10 @@ export async function POST(request) {
 
     if (action === "skip_all") {
       if (!batchId) return NextResponse.json({ ok: false, error: "batchId required" }, { status: 400 });
-      const records = await atList(baseId, "Outreach",
-        `AND({Status} = 'pending_approval', {Batch ID} = '${batchId}')`);
+      const filter = batchId === "all"
+        ? `{Status} = 'pending_approval'`
+        : `AND({Status} = 'pending_approval', {Batch ID} = '${batchId}')`;
+      const records = await atList(baseId, "Outreach", filter);
       const updates = records.map(r => ({
         id: r.id,
         fields: {

@@ -162,6 +162,12 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const [rapidApiUsageLoading, setRapidApiUsageLoading] = useState(false);
   const [outreachItems, setOutreachItems] = useState([]);
   const [outreachLoading, setOutreachLoading] = useState(false);
+  // Outreach queue UI filter — by default hides terminal/audit-trail statuses
+  // (skipped, completed, replied, error) to keep the table scannable. The
+  // historical records still exist in Airtable but don't clutter the view.
+  // Click "Show history" to flip and reveal them.
+  const [outreachShowHistory, setOutreachShowHistory] = useState(false);
+  const [outreachCleanupRunning, setOutreachCleanupRunning] = useState(false);
   // HubSpot
   const [hsConnected, setHsConnected] = useState(false);
   const [hsKey, setHsKey] = useState(""); // input field
@@ -2932,8 +2938,99 @@ Output format (strict JSON, no markdown):
 
     {/* Queue Table */}
     {outreachItems.length > 0 && (<div style={{marginTop:20}}>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-        <div style={{fontSize:12,fontWeight:600,color:"var(--t2)"}}>Outreach Queue ({outreachItems.length})</div>
+      {(() => {
+        // Split into active vs terminal (audit-trail) records.
+        // Active: queued, pending_approval, connection_sent, connected, dm_*
+        // Terminal: skipped, completed, replied, error
+        const TERMINAL_STATUSES = new Set(["skipped", "completed", "replied", "error"]);
+        const activeItems = outreachItems.filter(q => !TERMINAL_STATUSES.has(q.fields?.Status));
+        const historyItems = outreachItems.filter(q => TERMINAL_STATUSES.has(q.fields?.Status));
+        const skippedItems = outreachItems.filter(q => q.fields?.Status === "skipped");
+        const displayedItems = outreachShowHistory ? outreachItems : activeItems;
+        const cleanupSkipped = async () => {
+          if (!skippedItems.length) return;
+          if (!confirm(`Permanently delete ${skippedItems.length} skipped records from Airtable? This removes the audit trail but cleans up the queue.`)) return;
+          setOutreachCleanupRunning(true);
+          try {
+            // Delete in batches of 10 (Airtable limit)
+            const ids = skippedItems.map(s => s.id);
+            for (let i = 0; i < ids.length; i += 10) {
+              await del("Outreach", ids.slice(i, i + 10), setOutreachItems);
+            }
+          } finally {
+            setOutreachCleanupRunning(false);
+          }
+        };
+        // Count Sidekick Auto-Batch records across ALL statuses for the reset button
+        const sidekickItems = outreachItems.filter(q => q.fields?.Campaign === "Sidekick Auto-Batch v1");
+        const resetSidekick = async () => {
+          if (!sidekickItems.length) return;
+          const byStatus = sidekickItems.reduce((acc, q) => {
+            const s = q.fields?.Status || "unknown";
+            acc[s] = (acc[s] || 0) + 1;
+            return acc;
+          }, {});
+          const breakdown = Object.entries(byStatus).map(([k, v]) => `  · ${k}: ${v}`).join("\n");
+          if (!confirm(`Full Sidekick Auto-Batch reset.\n\nWill delete ${sidekickItems.length} records:\n${breakdown}\n\nManual Outreach records will be untouched.\n\nProceed?`)) return;
+          setOutreachCleanupRunning(true);
+          try {
+            const r = await fetch("/api/sidekick/auto-batch/reset", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ baseId: bid, confirm: true }),
+            });
+            const data = await r.json();
+            if (data.ok) {
+              // Remove deleted records from local state
+              setOutreachItems(prev => prev.filter(q => q.fields?.Campaign !== "Sidekick Auto-Batch v1"));
+              alert(`✓ Reset complete. Deleted ${data.deletedCount} records.\n\nBy status:\n${Object.entries(data.byStatus || {}).map(([k,v]) => `· ${k}: ${v}`).join("\n")}\n\nThe chatbot will auto-generate a fresh batch on next visit.`);
+            } else {
+              alert(`Reset failed: ${data.error || "unknown error"}`);
+            }
+          } catch (e) {
+            alert(`Reset failed: ${e.message}`);
+          } finally {
+            setOutreachCleanupRunning(false);
+          }
+        };
+        return (<>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8,gap:10,flexWrap:"wrap"}}>
+        <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+          <div style={{fontSize:12,fontWeight:600,color:"var(--t2)"}}>
+            Outreach Queue ({outreachShowHistory ? outreachItems.length : activeItems.length}{outreachShowHistory ? "" : " active"})
+          </div>
+          {historyItems.length > 0 && (
+            <button
+              className="btn btn-s"
+              style={{fontSize:10,padding:"3px 8px"}}
+              onClick={() => setOutreachShowHistory(v => !v)}
+            >
+              {outreachShowHistory ? `✕ Hide history` : `📜 Show history (${historyItems.length})`}
+            </button>
+          )}
+          {skippedItems.length >= 10 && (
+            <button
+              className="btn btn-d btn-s"
+              style={{fontSize:10,padding:"3px 8px"}}
+              disabled={outreachCleanupRunning}
+              onClick={cleanupSkipped}
+              title="Permanently delete all skipped records from Airtable (audit trail)"
+            >
+              {outreachCleanupRunning ? "…" : `🗑 Clear ${skippedItems.length} skipped`}
+            </button>
+          )}
+          {sidekickItems.length > 0 && (
+            <button
+              className="btn btn-d btn-s"
+              style={{fontSize:10,padding:"3px 8px",borderColor:"var(--red)",color:"var(--red)"}}
+              disabled={outreachCleanupRunning}
+              onClick={resetSidekick}
+              title="Delete ALL Sidekick Auto-Batch records (every status). Manual Outreach untouched."
+            >
+              {outreachCleanupRunning ? "…" : `💣 Reset Sidekick (${sidekickItems.length})`}
+            </button>
+          )}
+        </div>
         {outreachItems.filter(q => q.fields?.Status === "replied").length > 0 && (
           <div style={{fontSize:10,color:"var(--t2)",display:"flex",gap:10,alignItems:"center"}}>
             {(() => {
@@ -2949,7 +3046,7 @@ Output format (strict JSON, no markdown):
         )}
       </div>
       <div className="tw"><table><thead><tr><th>Lead</th><th>Company</th><th>Campaign</th><th>Status</th><th>Reply Intent</th><th>DM Step</th><th>Next Action</th></tr></thead>
-      <tbody>{outreachItems.slice(0,50).map(q => {
+      <tbody>{displayedItems.slice(0,50).map(q => {
         const f = q.fields || {};
         const status = f.Status || "queued";
         const statusColor = status==="replied"?"cg":status==="completed"?"cg":status==="error"?"cr":status==="connected"||status.startsWith("dm_")?"cp":status==="connection_sent"?"cb":"ca";
@@ -2999,6 +3096,8 @@ Output format (strict JSON, no markdown):
           )}
         </Fragment>);
       })}</tbody></table></div>
+        </>);
+      })()}
     </div>)}
 
     </>)}

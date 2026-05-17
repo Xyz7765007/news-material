@@ -501,9 +501,91 @@ export async function POST(request) {
   try {
     const requestOrigin = new URL(request.url).origin;
     const { rule, ruleId, config } = await getOrCreateAutoBatchRule(baseId, accountId, requestOrigin);
-
-    // Idempotency
     const todayKey = todayIST6amRollover();
+
+    // ─── Always clean stale pending_approval FIRST ────────────
+    // Runs on EVERY generate call BEFORE the idempotency check.
+    //  - Old Batch ID pending records (yesterday's leftover): ALWAYS
+    //    clean. They're stale regardless of whether user passed force.
+    //  - Today's Batch ID pending records: only clean on force=true.
+    //  - Orphan queued records (from legacy manual Enqueue, no AI text):
+    //    ALWAYS clean — they would send generic messages otherwise.
+    //
+    // CRITICAL: this runs BEFORE the idempotency early-return so that even
+    // benign poll-on-mount calls (force=false) clean yesterday's stragglers.
+    // Previously cleanup was inside `if (force)` AFTER the idempotency
+    // return, which meant stale records survived forever when today's batch
+    // already existed → multiple batch cards in the chatbot UI.
+    //
+    // Also: verify cleanup succeeded. atUpdate batches PATCH calls in 10s
+    // and logs-and-continues on individual batch failure. Now we re-check
+    // after cleanup and retry once; if it still fails, abort with 500
+    // rather than create new records that would duplicate the survivors.
+    try {
+      const allPending = await atList(baseId, "Outreach",
+        `{Status} = 'pending_approval'`);
+      const toClean = allPending.filter(r => {
+        const batchId = r.fields?.["Batch ID"] || "";
+        return batchId !== todayKey || force;
+      });
+
+      if (toClean.length) {
+        const updates = toClean.map(r => ({
+          id: r.id,
+          fields: {
+            Status: "skipped",
+            Notes: `${r.fields?.Notes || ""}\n[${new Date().toISOString()}] Stale cleanup (force=${force})`.trim(),
+          },
+        }));
+        await atUpdate(baseId, "Outreach", updates);
+
+        // Verify cleanup actually landed
+        const recheck = await atList(baseId, "Outreach",
+          `{Status} = 'pending_approval'`);
+        const stillStale = recheck.filter(r => {
+          const batchId = r.fields?.["Batch ID"] || "";
+          return batchId !== todayKey || force;
+        });
+        if (stillStale.length) {
+          console.error(`[AUTO-BATCH] cleanup verification failed: ${stillStale.length} stale records survive PATCH — retrying once`);
+          const retry = stillStale.map(r => ({
+            id: r.id,
+            fields: { Status: "skipped", Notes: `${r.fields?.Notes || ""}\n[${new Date().toISOString()}] Retry cleanup`.trim() },
+          }));
+          await atUpdate(baseId, "Outreach", retry);
+          const finalCheck = await atList(baseId, "Outreach",
+            `{Status} = 'pending_approval'`);
+          const survivors = finalCheck.filter(r => (r.fields?.["Batch ID"] || "") !== todayKey || force);
+          if (survivors.length) {
+            return NextResponse.json({
+              error: `Cleanup failed: ${survivors.length} stale pending_approval records could not be marked as skipped. Refusing to create new batch to avoid duplicates. Manual cleanup required (open Veloka Outreach in Airtable and mark them as skipped).`,
+              survivors: survivors.map(r => ({ id: r.id, lead: r.fields?.["Lead Name"], batchId: r.fields?.["Batch ID"] })),
+            }, { status: 500 });
+          }
+        }
+        console.log(`[AUTO-BATCH] cleaned ${toClean.length} stale pending_approval records (force=${force})`);
+      }
+
+      // Orphan queued records (legacy Enqueue Leads path)
+      const allQueued = await atList(baseId, "Outreach",
+        `AND({Status} = 'queued', {Campaign} = '${AUTO_BATCH_RULE_NAME}')`);
+      const orphans = allQueued.filter(r => !r.fields?.["Generated Connection Note"]);
+      if (orphans.length) {
+        const updates = orphans.map(r => ({
+          id: r.id,
+          fields: {
+            Status: "skipped",
+            Notes: `${r.fields?.Notes || ""}\n[${new Date().toISOString()}] Orphan cleanup — no AI personalization. Re-enqueue via chatbot if intended.`.trim(),
+          },
+        }));
+        await atUpdate(baseId, "Outreach", updates);
+        console.log(`[AUTO-BATCH] cleaned ${orphans.length} orphan queued records`);
+      }
+    } catch (e) {
+      console.warn("[AUTO-BATCH] Failed to clean stale records:", e.message);
+    }
+
+    // Idempotency — AFTER cleanup, so stale records are gone before this
     if (!force && config.lastBatchGeneratedAt === todayKey) {
       const existing = await atList(baseId, "Outreach",
         `AND({Status} = 'pending_approval', {Batch ID} = '${todayKey}')`);
@@ -512,54 +594,6 @@ export async function POST(request) {
         existingCount: existing.length,
         message: "Batch already generated today. Use force=true to regenerate.",
       });
-    }
-
-    // ─── On force=true, clear out existing stale records ─
-    // Two cleanups happen here:
-    //  1. Old pending_approval records — replaced by fresh batch
-    //  2. ORPHAN queued records that lack Generated Connection Note —
-    //     these came from someone clicking the legacy "Enqueue Leads"
-    //     button on the auto-batch rule (which bypassed AI personalization
-    //     entirely). If we let cron process them, the prospects get
-    //     generic templated outreach. Mark them skipped.
-    // Without this, regenerating would leave the old batch's records
-    // alongside the new ones (both with Status=pending_approval) — user
-    // sees doubled-up cards.
-    if (force) {
-      try {
-        // Cleanup 1: stale pending_approval
-        const existingPending = await atList(baseId, "Outreach",
-          `{Status} = 'pending_approval'`);
-        if (existingPending.length) {
-          const updates = existingPending.map(r => ({
-            id: r.id,
-            fields: {
-              Status: "skipped",
-              Notes: `${r.fields?.Notes || ""}\n[${new Date().toISOString()}] Replaced by force-regenerated batch`.trim(),
-            },
-          }));
-          await atUpdate(baseId, "Outreach", updates);
-          console.log(`[AUTO-BATCH] force=true: cleared ${updates.length} stale pending_approval records`);
-        }
-
-        // Cleanup 2: orphan queued records (created via legacy Enqueue Leads)
-        const allQueued = await atList(baseId, "Outreach",
-          `AND({Status} = 'queued', {Campaign} = '${AUTO_BATCH_RULE_NAME}')`);
-        const orphans = allQueued.filter(r => !r.fields?.["Generated Connection Note"]);
-        if (orphans.length) {
-          const updates = orphans.map(r => ({
-            id: r.id,
-            fields: {
-              Status: "skipped",
-              Notes: `${r.fields?.Notes || ""}\n[${new Date().toISOString()}] Orphan queued record cleanup — created via legacy Enqueue Leads (no AI personalization). Re-enqueue via Side Kick chatbot if intended.`.trim(),
-            },
-          }));
-          await atUpdate(baseId, "Outreach", updates);
-          console.log(`[AUTO-BATCH] force=true: cleared ${updates.length} orphan queued records (no AI personalization)`);
-        }
-      } catch (e) {
-        console.warn("[AUTO-BATCH] Failed to clear stale records:", e.message);
-      }
     }
 
     // Load data
