@@ -7,13 +7,21 @@ export const dynamic = "force-dynamic";
 export const fetchCache = "force-no-store"; // Critical: disable Next.js fetch cache so Airtable data is always fresh
 export const maxDuration = 300; // Vercel Hobby plan max is 300s; upgrade to Pro for higher
 
-// Vercel Cron — runs daily at 6am UTC (11:30am IST) to process outreach queues.
-// Hobby plan limit: 1 invocation per day. Pro plan can change schedule to
-// "0 */4 * * *" (every 4 hours) or finer.
+// Outreach cron endpoint — hit on a schedule by the GitHub Actions workflow
+// "Outreach Cron (4-hour)" in the repo at .github/workflows/outreach-cron.yml,
+// which fires roughly every 4 hours (GitHub Actions cron has some delay; real
+// observed cadence is ~3-5h). Each invocation iterates every campaign in the
+// master Campaigns table, loads its Task Rules, and runs process_queue for
+// each active linkedin_outreach rule.
+//
+// HISTORICAL NOTE: was previously documented as Vercel cron daily at 6am UTC
+// (= 11:30 AM IST). That was inaccurate after the migration to GitHub Actions;
+// kept causing operator confusion ("UI says next send at 11:30 IST but cron
+// never runs at 11:30").
 //
 // MANUAL TRIGGER: hit GET /api/cron/outreach?manual=1&key=<CRON_SECRET>
 // in your browser to force-run the cron logic immediately (useful for
-// debugging "is the cron actually working?" without waiting until 11:30 IST).
+// debugging "is the cron actually working?" without waiting for the next run).
 
 const AIRTABLE_KEY = process.env.AIRTABLE_API_KEY;
 const MASTER_BASE_ID = process.env.AIRTABLE_BASE_ID;
@@ -168,9 +176,15 @@ export async function GET(request) {
         summary.skipReasons.push(`Campaign "${cf.Name || camp.id}" has no Base ID — skipped`);
         continue;
       }
-      if (!features.includes("linkedin_outreach")) {
-        continue; // silently skip non-outreach campaigns
-      }
+      // NOTE: previously we silently skipped campaigns whose master `Features`
+      // field didn't include "linkedin_outreach" — that caused production silent
+      // failures (e.g. Veloka's Features = "top_x" but its Task Rules table had
+      // an active linkedin_outreach rule with 5 queued items; cron skipped it,
+      // queue stayed forever). Source of truth for "should we run outreach?" is
+      // the Task Rules table itself, NOT the Features hint. We now check rules
+      // for every campaign with a baseId. The Features hint is informational
+      // only and surfaces as a warning when it disagrees with the rule data.
+      const featuresHasOutreach = features.includes("linkedin_outreach");
 
       const campRecord = { name: cf.Name || camp.id, baseId, rulesActive: 0, rulesTotal: 0, errors: [] };
 
@@ -194,6 +208,23 @@ export async function GET(request) {
       const outreachRules = rules.filter(r => (r.fields || {})["Task Type"] === "linkedin_outreach");
       campRecord.rulesTotal = outreachRules.length;
       summary.outreachRulesFound += outreachRules.length;
+
+      // Diagnostic: surface campaigns we touched but found nothing for. Without
+      // this, the operator-visible response showed `campaignsChecked: 5` but
+      // `perCampaign: [test campaign]` only — no way to tell whether the other
+      // 4 had no rules or had been silently skipped by an upstream filter.
+      if (outreachRules.length === 0) {
+        summary.skipReasons.push(`Campaign "${cf.Name || camp.id}" — no linkedin_outreach rule in Task Rules table`);
+        summary.perCampaign.push(campRecord);
+        continue;
+      }
+
+      // Diagnostic: warn if the rule exists but Features hint disagrees. Helps
+      // catch the misconfiguration that caused the original bug (Features=top_x
+      // while Task Rules had an active linkedin_outreach rule).
+      if (!featuresHasOutreach) {
+        campRecord.featuresHintMismatch = `Features="${rawFeatures}" does not include "linkedin_outreach" but Task Rules has ${outreachRules.length} rule(s) — consider updating Features to reflect reality.`;
+      }
 
       for (const rule of outreachRules) {
         const rf = rule.fields || {};

@@ -2978,25 +2978,30 @@ Output format (strict JSON, no markdown):
           }
         };
         // ─── Next cron run helper ────────────────────────────────
-        // Cron is `0 6 * * *` UTC = 11:30 AM IST daily. If we're before
-        // today's 11:30 AM IST, next run is today; else tomorrow. Display
-        // both the absolute time and a relative countdown so the operator
-        // immediately knows when their queued records will go out.
+        // Cron runs every ~4h via GitHub Actions workflow "Outreach Cron
+        // (4-hour)" — was previously documented as daily 11:30 IST which was
+        // wrong and caused operator confusion. Prediction is grounded in the
+        // most recent observed scheduled run + 4h; falls back to a generic
+        // "~4h cycle" when no history is loaded yet.
         const nextCronRun = (() => {
-          const now = new Date();
-          // 11:30 AM IST = 06:00 UTC. Build today's run time in UTC.
-          const todayUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 6, 0, 0));
-          const target = now < todayUTC
-            ? todayUTC
-            : new Date(todayUTC.getTime() + 24 * 60 * 60 * 1000);
-          const diffMs = target - now;
+          const queuedCount = activeItems.filter(q => q.fields?.Status === "queued").length;
+          const lastRunAt = cronStatus?.summary?.lastRunAt;
+          if (!lastRunAt) {
+            return { relative: "in next ~4h cycle", queuedCount, predicted: false, overdue: false };
+          }
+          const lastRunMs = new Date(lastRunAt).getTime();
+          const nextRunMs = lastRunMs + 4 * 3600 * 1000;
+          const diffMs = nextRunMs - Date.now();
+          if (diffMs <= 0) {
+            const overdueMs = -diffMs;
+            const overdueMin = Math.floor(overdueMs / 60000);
+            const overdueLabel = overdueMin < 60 ? `${overdueMin}m` : `${Math.floor(overdueMin/60)}h ${overdueMin % 60}m`;
+            return { relative: `due now (${overdueLabel} overdue)`, queuedCount, predicted: true, overdue: true };
+          }
           const hours = Math.floor(diffMs / 3600000);
           const minutes = Math.floor((diffMs % 3600000) / 60000);
-          const relative = hours >= 1
-            ? `in ${hours}h ${minutes}m`
-            : `in ${minutes}m`;
-          const isToday = target.getUTCDate() === now.getUTCDate();
-          return { relative, isToday, queuedCount: activeItems.filter(q => q.fields?.Status === "queued").length };
+          const relative = hours >= 1 ? `in ~${hours}h ${minutes}m` : `in ~${minutes}m`;
+          return { relative, queuedCount, predicted: true, overdue: false };
         })();
         // Count Sidekick Auto-Batch records across ALL statuses for the reset button
         const sidekickItems = outreachItems.filter(q => q.fields?.Campaign === "Sidekick Auto-Batch v1");
@@ -3073,13 +3078,13 @@ Output format (strict JSON, no markdown):
                 fontSize: 10,
                 padding: "3px 10px",
                 borderRadius: 4,
-                background: "rgba(245, 158, 11, 0.1)",
-                color: "var(--amb)",
+                background: nextCronRun.overdue ? "rgba(196, 107, 107, 0.12)" : "rgba(245, 158, 11, 0.1)",
+                color: nextCronRun.overdue ? "var(--red)" : "var(--amb)",
                 fontWeight: 500,
               }}
-              title={`Cron runs daily at 11:30 AM IST. ${nextCronRun.queuedCount} queued record${nextCronRun.queuedCount === 1 ? "" : "s"} will be processed then.`}
+              title={`Cron runs every ~4h via GitHub Actions. ${nextCronRun.queuedCount} queued record${nextCronRun.queuedCount === 1 ? "" : "s"} will be processed on the next run.`}
             >
-              ⏰ Next send: {nextCronRun.relative} ({nextCronRun.isToday ? "today" : "tomorrow"} 11:30 IST)
+              ⏰ Next send: {nextCronRun.relative}
             </div>
           )}
           {cronStatus && cronStatus.summary && (() => {
@@ -3170,7 +3175,7 @@ Output format (strict JSON, no markdown):
             <td style={{fontSize:10}}>{
               status === "replied" ? "—"
               : status === "queued" ? (
-                  <span style={{color:"var(--amb)"}} title={`Cron processes queued records daily at 11:30 AM IST. Next: ${nextCronRun.relative}.`}>
+                  <span style={{color:"var(--amb)"}} title={`Cron processes queued records every ~4h via GitHub Actions. Next: ${nextCronRun.relative}.`}>
                     Sends {nextCronRun.relative}
                   </span>
                 )

@@ -109,18 +109,24 @@ export async function GET(request) {
       .filter(r => r.runAt && Date.now() - new Date(r.runAt).getTime() < 24 * 3600 * 1000)
       .reduce((s, r) => s + r.dmsSent, 0);
 
-    // Detect cron health
+    // Detect cron health.
+    // Cron actually runs ~every 4 hours via GitHub Actions workflow
+    // "Outreach Cron (4-hour)" (was previously documented as daily 11:30 IST
+    // which is wrong). Thresholds are 1.5× / 3× the interval.
     const now = Date.now();
     const lastScheduledAge = lastScheduled
       ? Math.floor((now - new Date(lastScheduled.runAt).getTime()) / 1000 / 60)  // minutes
       : null;
+    const CRON_INTERVAL_MIN = 4 * 60;        // expected: 240 min between runs
+    const HEALTHY_MAX_MIN   = 6 * 60;        // 1.5× — 6h
+    const WARNING_MAX_MIN   = 12 * 60;       // 3× — 12h
     let health;
     if (!lastScheduled) {
-      health = { state: "no_scheduled_runs", message: "No scheduled cron runs found yet. Only manual triggers detected. Vercel cron may be misconfigured." };
-    } else if (lastScheduledAge < 30 * 60) {  // < 30h
-      health = { state: "healthy", message: `Last scheduled run ${lastScheduledAge < 60 ? lastScheduledAge + 'm' : Math.floor(lastScheduledAge/60) + 'h'} ago. Status: ${lastScheduled.status}.` };
-    } else if (lastScheduledAge < 50 * 60) {  // < 50h
-      health = { state: "warning", message: `Last scheduled run was ${Math.floor(lastScheduledAge/60)}h ago. Cron should run every 24h.` };
+      health = { state: "no_scheduled_runs", message: "No scheduled cron runs found yet. Only manual triggers detected. GitHub Actions workflow may be misconfigured." };
+    } else if (lastScheduledAge < HEALTHY_MAX_MIN) {
+      health = { state: "healthy", message: `Last scheduled run ${lastScheduledAge < 60 ? lastScheduledAge + 'm' : Math.floor(lastScheduledAge/60) + 'h ' + (lastScheduledAge % 60) + 'm'} ago. Status: ${lastScheduled.status}.` };
+    } else if (lastScheduledAge < WARNING_MAX_MIN) {
+      health = { state: "warning", message: `Last scheduled run was ${Math.floor(lastScheduledAge/60)}h ago. Cron should run every ~4h — may be delayed.` };
     } else {
       health = { state: "stale", message: `Last scheduled run was ${Math.floor(lastScheduledAge/60)}h ago — cron appears stuck.` };
     }
@@ -137,7 +143,8 @@ export async function GET(request) {
         recentErrors,
         connectionsLast24h: totalConn24h,
         dmsLast24h: totalDms24h,
-        cronSchedule: "0 6 * * * UTC (= 11:30 AM IST daily)",
+        cronSchedule: "every ~4h via GitHub Actions workflow",
+        cronIntervalMin: CRON_INTERVAL_MIN,
       },
       runs,
     });

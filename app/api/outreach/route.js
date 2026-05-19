@@ -1036,11 +1036,23 @@ async function processOutreachQueue(baseId, accountId, ruleConfig, campaignId = 
   const queue = await atList(baseId, "Outreach");
   const campaign = ruleConfig.name || "Outreach";
 
-  // Filter to this campaign's items AND auto mode only (manual items are user-controlled)
+  // Filter to this campaign's items AND auto mode only (manual items are user-controlled
+  // via the Manual Outreach UI flow: Send Connection → Mark Connected → Trigger DM).
+  // Count the skipped categories so the cron response surfaces them — without this,
+  // an operator sees connectionsSent=0 with no clue why their records weren't processed.
+  let skippedWrongCampaign = 0;
+  let skippedManualMode = 0;
   const items = queue.filter(q => {
     const f = q.fields || {};
-    return (f.Campaign || "") === campaign && (f.Mode || "auto") === "auto";
+    const campMatch = (f.Campaign || "") === campaign;
+    const modeMatch = (f.Mode || "auto") === "auto";
+    if (!campMatch) { skippedWrongCampaign++; return false; }
+    if (!modeMatch) { skippedManualMode++; return false; }
+    return true;
   });
+  if (skippedManualMode > 0) {
+    log.push(`ℹ️ ${skippedManualMode} record(s) on campaign "${campaign}" skipped: Mode=manual (use the Manual Outreach UI flow to progress these — Mark Connected → Trigger DM)`);
+  }
 
   let connSent = 0, dmsSent = 0, errors = 0;
 
@@ -1559,7 +1571,7 @@ async function sendManualConnections(baseId, accountId, outreachItemIds, ruleCon
 // MANUAL DM TRIGGER — send next DM to specific items (user confirms accepted)
 // ═══════════════════════════════════════════════════════════════
 
-async function triggerManualDMs(baseId, accountId, outreachItemIds, ruleConfig) {
+async function triggerManualDMs(baseId, accountId, outreachItemIds, ruleConfig, campaignId = null) {
   const now = new Date();
   const queue = await atList(baseId, "Outreach");
   const items = queue.filter(q => outreachItemIds.includes(q.id));
@@ -2124,7 +2136,7 @@ export async function POST(request) {
         if (ids.length > SAFE_DM_CAP) {
           return NextResponse.json({ error: `Safety limit: max ${SAFE_DM_CAP} DMs per batch`, attempted: ids.length }, { status: 400 });
         }
-        const result = await triggerManualDMs(baseId, accountId, ids, body.ruleConfig || {});
+        const result = await triggerManualDMs(baseId, accountId, ids, body.ruleConfig || {}, campaignId);
         return NextResponse.json(result);
       }
 

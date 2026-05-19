@@ -187,7 +187,12 @@ Write the email${config.sequenceLength > 1 ? "s" : ""} now. Return JSON only.`;
   try {
     const msg = await anthropic.messages.create({
       model: "claude-sonnet-4-6",
-      max_completion_tokens: 1500,
+      // Anthropic's Messages API REQUIRES max_tokens (verified against
+      // docs.anthropic.com). max_completion_tokens is OpenAI-only — previous
+      // code used it here, which would cause the call to either error or
+      // be silently ignored, explaining the "Email engine in development"
+      // banner since generation never worked.
+      max_tokens: 1500,
       temperature: 0.7,
       system: cached.system,
       messages: [{ role: "user", content: userMsg }],
