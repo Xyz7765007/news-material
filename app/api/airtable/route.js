@@ -977,6 +977,15 @@ Return ONLY JSON: [{"idx":0,"score":85,"reason":"max 15 words explaining which d
   }
 
   const tasks = scored.slice(0, topN).map(item => {
+    // Pull each scoring input from `item` rather than relying on outer
+    // closure variables — those don't exist per-record. Pre-2026-05-20
+    // this code used bare `score`, `numScore`, `aiScore`, `f` and threw
+    // ReferenceError on first map iteration. Tracked back to a refactor
+    // that flattened item.* into bare names without re-binding them here.
+    const score = item.compositeScore ?? item.numericScore ?? 0;
+    const numScore = item.numericScore ?? 0;
+    const aiScore = item.aiScore ?? 0;
+    const f = item.record?.fields || {};
 
     // Build a transparent Signal showing how this score was derived
     const signalLines = [];
