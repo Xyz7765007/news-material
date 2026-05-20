@@ -1404,6 +1404,28 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     buildSeenSet();
     try {
       const sf = JSON.parse(ruleFields["Scoring Fields"] || "[]");
+
+      // Build exclude keys from existing Tasks. Server uses these to drop
+      // candidates BEFORE scoring so the topN slice gives the operator
+      // the volume they asked for, not "30 of 150 after post-score dedup".
+      //
+      // Two key shapes — record is excluded if either matches:
+      //   - urls:   normalized LinkedIn URL from the task's URL or LinkedIn URL field
+      //   - nameCo: lowercased "name|company" composite (catches leads with no URL)
+      const normalizeUrl = u => (u || "").trim().toLowerCase()
+        .replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/$/, "")
+        .split("?")[0].split("#")[0];
+      const excludeUrls = new Set();
+      const excludeNameCo = new Set();
+      for (const t of tasks) {
+        const f = t.fields || {};
+        const u = normalizeUrl(f["LinkedIn URL"] || f.URL || "");
+        if (u) excludeUrls.add(u);
+        const name = String(f.Name || "").toLowerCase().trim();
+        const company = String(f.Company || "").toLowerCase().trim();
+        if (name && company) excludeNameCo.add(`${name}|${company}`);
+      }
+
       const ruleBody = {
         name: ruleFields.Name,
         scanTarget: ruleFields["Scan Target"] || "leads",
@@ -1412,6 +1434,10 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         scoringPrompt: ruleFields["Scoring Prompt"] || "",
         useSmartCompile,
         compiledRules,
+        excludeKeys: {
+          urls: Array.from(excludeUrls),
+          nameCo: Array.from(excludeNameCo),
+        },
       };
       const res = await at("run_topx", "", { rule: ruleBody }, bid);
       setScanProg(70);
@@ -1453,7 +1479,15 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
           unique.forEach(t => taskSeenRef.current.add(taskFingerprint(t)));
           const cr = await at("create", "Tasks", { records: unique }, bid);
           setTasks(p => [...(cr.records || []), ...p]);
-          setScanText(`✅ ${unique.length} tasks${aiLabel}${compileLabel}${crossRefLabel} from top ${res.topN}/${res.totalRecords}${duped > 0 ? ` (${duped} dupes skipped)` : ""}${legacyWarning}`);
+          // Build the result string from server-supplied counts so operator
+          // sees the full pipeline: scored pool, pre-excluded volume, fresh tasks.
+          const excludedStr = res.excludedAsAlreadyTasked > 0
+            ? ` (${res.excludedAsAlreadyTasked} already tasked, skipped before scoring)`
+            : "";
+          const scoredOf = res.scoredRecords && res.scoredRecords !== res.totalRecords
+            ? `${res.scoredRecords}/${res.totalRecords}`
+            : `${res.totalRecords}`;
+          setScanText(`✅ ${unique.length} tasks${aiLabel}${compileLabel}${crossRefLabel} from top ${res.topN} of ${scoredOf}${excludedStr}${duped > 0 ? `, ${duped} post-score dupes skipped` : ""}${legacyWarning}`);
         } else {
           setScanText(`✅ All ${res.tasks.length} tasks already exist (no new tasks)`);
         }

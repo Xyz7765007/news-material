@@ -690,6 +690,67 @@ async function updateCampaign(records) {
 // TOP X SCORING ENGINE
 // ═══════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════
+// Pre-scoring dedup helper.
+//
+// The chatbot's Top X flow used to score everything then dedup
+// post-hoc on the client. If the operator asked for 150 and 120 of
+// the top-ranked were already tasks, they got 30. Now the client
+// builds an exclude set from existing tasks and we drop those
+// records BEFORE scoring so the topN slice is full of fresh leads.
+//
+// Exclude key shape (all lowercase, trimmed):
+//   {
+//     urls:      ["linkedin.com/in/foo", ...]   // LinkedIn URLs
+//     nameCo:    ["jane doe|acme corp", ...]    // name|company composite
+//   }
+//
+// Match policy: record is excluded if EITHER its LinkedIn URL
+// matches any urls entry OR its name|company composite matches any
+// nameCo entry. URLs are normalized the same way the chatbot does
+// (lowercased, strip protocol/www, strip trailing slash) — covers
+// the typical mismatches like https://www.linkedin.com/in/foo/
+// vs linkedin.com/in/foo.
+//
+// Returns the records array unchanged if excludeKeys is missing or
+// empty — safe to call unconditionally from any Top X path.
+// ═══════════════════════════════════════════════════════════════
+function applyExcludeKeys(records, excludeKeys) {
+  if (!excludeKeys || typeof excludeKeys !== "object") return records;
+  const urlSet = new Set((excludeKeys.urls || []).map(normalizeUrlForDedup).filter(Boolean));
+  const nameCoSet = new Set((excludeKeys.nameCo || []).map(s => String(s || "").toLowerCase().trim()).filter(Boolean));
+  if (urlSet.size === 0 && nameCoSet.size === 0) return records;
+
+  return records.filter(r => {
+    const f = r.fields || {};
+    // URL match — covers LinkedIn URL field and URL field variants
+    const candidateUrls = [
+      f["LinkedIn URL"], f["Linkedin URL"], f.LinkedIn, f.URL, f.linkedin_url,
+    ].filter(Boolean).map(normalizeUrlForDedup);
+    for (const u of candidateUrls) {
+      if (u && urlSet.has(u)) return false;
+    }
+    // name|company composite match — covers Lead records keyed by person + employer
+    const name = String(f.Name || f["Full Name"] || "").toLowerCase().trim();
+    const company = String(f.Company || f.Account || "").toLowerCase().trim();
+    if (name && company) {
+      const key = `${name}|${company}`;
+      if (nameCoSet.has(key)) return false;
+    }
+    return true;
+  });
+}
+
+function normalizeUrlForDedup(url) {
+  if (!url || typeof url !== "string") return "";
+  return url.trim().toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .replace(/\/$/, "")
+    .split("?")[0]
+    .split("#")[0];
+}
+
 async function runTopXScoring(baseId, rule, campaignId = null) {
   const scanTarget = rule.scanTarget || "leads";
   const topN = rule.topN || 10;
@@ -699,6 +760,19 @@ async function runTopXScoring(baseId, rule, campaignId = null) {
   const table = scanTarget === "accounts" ? "Accounts" : "Leads";
   const records = await listRecords(baseId, table);
   if (!records.length) return { error: `No ${table.toLowerCase()} found`, tasks: [] };
+
+  // Pre-scoring dedup: if the operator passed excludeKeys (built client-side
+  // from existing Tasks), drop those records BEFORE we score so the top N
+  // actually returns N fresh records. Previously dedup ran AFTER scoring on
+  // the client — requesting 150 with 120 already-done would yield 30.
+  const filteredRecords = applyExcludeKeys(records, rule.excludeKeys);
+  const excludedCount = records.length - filteredRecords.length;
+  if (excludedCount > 0) {
+    console.log(`[TOP-X] Pre-scoring dedup: excluded ${excludedCount} records already in Tasks (${filteredRecords.length} remaining to score)`);
+  }
+  if (!filteredRecords.length) {
+    return { error: `All ${records.length} ${table.toLowerCase()} are already tasks — nothing fresh to score`, tasks: [], excludedCount };
+  }
 
   // ─── Step 1: Weighted numeric scoring (skipped if no fields) ──
   // Each field is normalized differently based on type:
@@ -732,7 +806,7 @@ async function runTopXScoring(baseId, rule, campaignId = null) {
   }
 
   for (const sf of scoringFields) {
-    const values = records.map(r => extractFieldValue(r.fields?.[sf.field])).filter(v => v !== null);
+    const values = filteredRecords.map(r => extractFieldValue(r.fields?.[sf.field])).filter(v => v !== null);
     if (values.length === 0) {
       fieldStats[sf.field] = { min: 0, max: 1, allEmpty: true };
       continue;
@@ -746,7 +820,7 @@ async function runTopXScoring(baseId, rule, campaignId = null) {
     }
   }
 
-  const scored = records.map(r => {
+  const scored = filteredRecords.map(r => {
     const fields = r.fields || {};
     let cs = 0;
     if (scoringFields.length > 0) {
@@ -1039,12 +1113,14 @@ Return ONLY JSON: [{"idx":0,"score":85,"reason":"max 15 words explaining which d
   return {
     tasks,
     totalRecords: records.length,
+    scoredRecords: filteredRecords.length,
+    excludedAsAlreadyTasked: excludedCount,
     topN,
     aiScored: !!useAI,
     legacy: {
       skipped_at_cap: skippedAtCap,
       cap_reason: skippedAtCap > 0
-        ? `Legacy AI-per-record mode capped at ${actualCandidateCount} records (Vercel timeout risk). Enable Smart Compile to score all ${records.length} records.`
+        ? `Legacy AI-per-record mode capped at ${actualCandidateCount} records (Vercel timeout risk). Enable Smart Compile to score all ${filteredRecords.length} records.`
         : null,
     },
   };
@@ -1586,6 +1662,19 @@ async function runTopXSmartCompile(baseId, rule, compiled, campaignId = null) {
   recordsListMs = Date.now() - tFetch0;
   if (!records.length) return { error: `No ${table.toLowerCase()} found`, tasks: [] };
 
+  // Pre-scoring dedup: drop records that already have Tasks created from them.
+  // Client passes `rule.excludeKeys` built from the existing Tasks list. This
+  // lets the operator ask for topN=150 and ACTUALLY get 150 — instead of 30
+  // after the client-side post-score dedup kicked 120 already-tasked leads.
+  const filteredRecords = applyExcludeKeys(records, rule.excludeKeys);
+  const excludedCount = records.length - filteredRecords.length;
+  if (excludedCount > 0) {
+    console.log(`[TOP-X-SMART] Pre-scoring dedup: excluded ${excludedCount} records already in Tasks (${filteredRecords.length} remaining to score)`);
+  }
+  if (!filteredRecords.length) {
+    return { error: `All ${records.length} ${table.toLowerCase()} are already tasks — nothing fresh to score`, tasks: [], excludedAsAlreadyTasked: excludedCount };
+  }
+
   if (needsAccounts) {
     const tAcct0 = Date.now();
     try {
@@ -1602,11 +1691,12 @@ async function runTopXSmartCompile(baseId, rule, compiled, campaignId = null) {
     }
   }
 
-  // Step 1: Deterministic scoring across ALL records (zero AI calls)
+  // Step 1: Deterministic scoring across the FILTERED pool (excluded
+  // already-tasked records dropped above). Zero AI calls.
   const t0 = Date.now();
-  const scored = applyCompiledRules(records, compiled, accountIndex);
+  const scored = applyCompiledRules(filteredRecords, compiled, accountIndex);
   const deterministicMs = Date.now() - t0;
-  console.log(`[TOP-X-SMART] Scored ${scored.length} records deterministically in ${deterministicMs}ms`);
+  console.log(`[TOP-X-SMART] Scored ${scored.length} records deterministically in ${deterministicMs}ms (excluded ${excludedCount} already-tasked)`);
 
   // If cross-reference was active, compute match coverage stats
   if (accountIndex) {
@@ -1783,6 +1873,8 @@ async function runTopXSmartCompile(baseId, rule, compiled, campaignId = null) {
   return {
     tasks,
     totalRecords: records.length,
+    scoredRecords: filteredRecords.length,
+    excludedAsAlreadyTasked: excludedCount,
     topN,
     aiScored: fuzzyApiCalls > 0,
     smartCompile: {
