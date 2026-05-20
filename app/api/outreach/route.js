@@ -1036,23 +1036,42 @@ async function processOutreachQueue(baseId, accountId, ruleConfig, campaignId = 
   const queue = await atList(baseId, "Outreach");
   const campaign = ruleConfig.name || "Outreach";
 
-  // Filter to this campaign's items AND auto mode only (manual items are user-controlled
-  // via the Manual Outreach UI flow: Send Connection → Mark Connected → Trigger DM).
-  // Count the skipped categories so the cron response surfaces them — without this,
-  // an operator sees connectionsSent=0 with no clue why their records weren't processed.
+  // Filter to this campaign's items, excluding only explicitly manual ones.
+  //
+  // History of this filter:
+  //   - Original: `(f.Mode||"auto") === "auto"` — accepted only "auto" or
+  //     absent. Auto-batch generate sets Mode="auto_batch", so EVERY
+  //     approved auto-batch record was silently filtered out → cron
+  //     processed Veloka's rule, found zero items, sent nothing, logged
+  //     nothing. The May 20 04:00 IST cron run showed exactly this: rule
+  //     active, log empty, connectionsSent=0.
+  //   - Now: accept everything that isn't Mode="manual". The auto vs
+  //     manual dichotomy is the real distinction — auto_batch is a
+  //     subtype of auto (the user pre-approved a batch instead of
+  //     triggering individual sends).
+  //
+  // Break down skipped counts by mode value so any future silent skip is
+  // immediately diagnosable from the cron response without code-diving.
   let skippedWrongCampaign = 0;
-  let skippedManualMode = 0;
+  const skippedByMode = {};
   const items = queue.filter(q => {
     const f = q.fields || {};
     const campMatch = (f.Campaign || "") === campaign;
-    const modeMatch = (f.Mode || "auto") === "auto";
     if (!campMatch) { skippedWrongCampaign++; return false; }
-    if (!modeMatch) { skippedManualMode++; return false; }
+    const mode = f.Mode || "auto";
+    if (mode === "manual") {
+      skippedByMode.manual = (skippedByMode.manual || 0) + 1;
+      return false;
+    }
     return true;
   });
-  if (skippedManualMode > 0) {
-    log.push(`ℹ️ ${skippedManualMode} record(s) on campaign "${campaign}" skipped: Mode=manual (use the Manual Outreach UI flow to progress these — Mark Connected → Trigger DM)`);
+  if (skippedByMode.manual > 0) {
+    log.push(`ℹ️ ${skippedByMode.manual} record(s) on campaign "${campaign}" skipped: Mode=manual (use the Manual Outreach UI flow to progress these — Mark Connected → Trigger DM)`);
   }
+  // Surface items-found count so an empty log doesn't look like a silent
+  // skip. Operator can tell the difference between "no records exist" and
+  // "records exist but cron didn't act on any of them this run".
+  log.push(`📋 ${items.length} record(s) queued for processing on "${campaign}" (campaignMismatch=${skippedWrongCampaign}, manualSkipped=${skippedByMode.manual || 0})`);
 
   let connSent = 0, dmsSent = 0, errors = 0;
 
