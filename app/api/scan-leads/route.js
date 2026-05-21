@@ -103,16 +103,26 @@ async function createTasksBatch(baseId, taskFieldsArray) {
       const res = await fetch(url, {
         method: "POST",
         headers: atHdr(),
-        body: JSON.stringify({ records: slice.map(f => ({ fields: f })) }),
+        // typecast: true — Airtable coerces field types instead of erroring
+        // (e.g. accepts a string for a number field). Belt-and-suspenders
+        // alongside the schema-ensure step. Doesn't help with
+        // UNKNOWN_FIELD_NAME — for that, the schema must be correct.
+        body: JSON.stringify({ records: slice.map(f => ({ fields: f })), typecast: true }),
       });
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
+        // LOUD logging — this exact silent failure mode (counter ticks up,
+        // no tasks land) cost a debugging session on 2026-05-21. Make sure
+        // any operator inspecting Vercel logs sees this immediately.
+        console.error(`[scan-leads] createTasks FAILED (slice ${i}-${i+slice.length-1}): HTTP ${res.status}: ${errText.slice(0, 400)}`);
+        console.error(`[scan-leads] failed payload sample (first record):`, JSON.stringify(slice[0]).slice(0, 500));
         errors.push(`createTasks ${res.status}: ${errText.slice(0, 200)}`);
         continue;
       }
       const data = await res.json();
       created += (data.records || []).length;
     } catch (e) {
+      console.error(`[scan-leads] createTasks THREW (slice ${i}): ${e.message}`);
       errors.push(`createTasks threw: ${e.message}`);
     }
   }
@@ -217,10 +227,38 @@ async function ensureSchemaForLeadMovement(baseId) {
   }
 
   // ─── Tasks table ──────────────────────────────────────────
+  // CRITICAL: Every field that buildTaskFromMovement (in lib/movement-detection.js)
+  // writes MUST be ensured here. If even ONE is missing, Airtable returns 422
+  // UNKNOWN_FIELD_NAME and the entire batch's tasks fail silently (caught by
+  // createTasksBatch, pushed to errors array, but the counter still ticks up
+  // because the movement WAS detected). Symptom: chatbot's Promoted Count
+  // shows 2 but Airtable's Tasks table has 0 new records.
+  //
+  // Updated 2026-05-21 after user reported this exact silent-fail pattern.
+  // Previously only "Movement Type" was ensured.
   const tasksTable = findTable("Tasks");
   if (tasksTable) {
     const tasksExisting = new Set((tasksTable.fields || []).map(f => f.name));
-    await ensureField(tasksTable.id, tasksExisting, { name: "Movement Type", type: "singleLineText" });
+    const tasksRequired = [
+      { name: "Name",          type: "singleLineText" },
+      { name: "Company",       type: "singleLineText" },
+      { name: "Task Rule",     type: "singleLineText" },
+      { name: "Movement Type", type: "singleLineText" },
+      { name: "Score",         type: "number", options: { precision: 0 } },
+      { name: "Score Reason",  type: "multilineText" },
+      { name: "Scan Target",   type: "singleLineText" },
+      { name: "Signal",        type: "multilineText" },
+      { name: "Source",        type: "singleLineText" },
+      { name: "Lead Title",    type: "singleLineText" },
+      { name: "LinkedIn URL",  type: "url" },
+      { name: "Email",         type: "email" },
+      { name: "Phone",         type: "phoneNumber" },
+    ];
+    for (const f of tasksRequired) {
+      await ensureField(tasksTable.id, tasksExisting, f);
+    }
+  } else {
+    errors.push("Tasks table not found in base — movement scan tasks have nowhere to land. Run setup-fix to create it.");
   }
 
   return { ok: errors.length === 0, errors };
@@ -646,6 +684,18 @@ async function handleScan({
 
   const summary = `${processed.total} leads → ${processed.hired}H / ${processed.promoted}P / ${processed.exited}E / ${processed.none}N / ${processed.stale}S / ${processed.unavailable}U; tasks created: ${taskResult.created}; cost: $${batchCostUSD.toFixed(4)}${timedOut ? ` (TIMED OUT at ${processedCount}/${leadsToProcess.length} — re-run to continue)` : ""}`;
   console.log(`[lead-movement] batch done: ${summary}`);
+
+  // CRITICAL silent-fail detector. The 2026-05-21 bug: movements detected
+  // but zero tasks landed in Airtable because the Tasks table schema was
+  // missing fields buildTaskFromMovement writes. Counter ticked up, no
+  // tasks visible to the operator, errors swallowed silently. This guard
+  // surfaces the discrepancy LOUDLY so the operator + future debuggers
+  // immediately see "wait, 2 movements but 0 tasks — something broke."
+  const expectedTasks = processed.hired + processed.promoted + processed.exited;
+  if (expectedTasks > 0 && taskResult.created < expectedTasks) {
+    console.error(`[lead-movement] ⚠️ TASK CREATE MISMATCH: detected ${expectedTasks} actionable movements but only ${taskResult.created} tasks landed in Airtable. Likely missing fields in Tasks table schema. Check the createTasks error output above for HTTP 422 UNKNOWN_FIELD_NAME messages.`);
+  }
+
   if (Object.keys(errorTallies).length > 0) {
     const breakdown = Object.entries(errorTallies)
       .sort((a, b) => b[1] - a[1])

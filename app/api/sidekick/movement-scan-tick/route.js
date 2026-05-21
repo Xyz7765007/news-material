@@ -178,15 +178,28 @@ export async function POST(request) {
     const isFatal = !!batch.fatalError;
     const newState = isFatal ? "error" : (isDone ? "done" : "running");
 
+    // Non-fatal errors (Airtable 422 on Tasks create, schema setup hiccups,
+    // pagination retries) used to be swallowed at this layer — the operator
+    // saw a green tick reading "2 promoted · 0 tasks created" with no way
+    // to know WHY. Now we surface up to 3 of them inline in the batch
+    // summary and write the most recent error to the Movement Scan Runs
+    // row's Error field so it's visible without code-diving.
+    const batchErrors = Array.isArray(batch.errors) ? batch.errors.filter(Boolean) : [];
+    const tasksDetected = (batch.processed?.hired || 0) + (batch.processed?.promoted || 0) + (batch.processed?.exited || 0);
+    const tasksLost = tasksDetected - (batch.tasksCreated || 0);
+    const writeFailureDetected = tasksLost > 0;
+
     const batchSummary = [
       `Batch ${newBatchesRun}: ${batch.processedCount || 0}/${batch.batchSize || 0} leads`,
       batch.processed?.hired ? `${batch.processed.hired} hired` : null,
       batch.processed?.promoted ? `${batch.processed.promoted} promoted` : null,
       batch.processed?.exited ? `${batch.processed.exited} exited` : null,
       `${batch.tasksCreated || 0} task(s) created`,
+      writeFailureDetected ? `⚠️ ${tasksLost} task(s) DETECTED BUT NOT WRITTEN — check Error field` : null,
       `$${(batch.costUSD || 0).toFixed(4)}`,
       batch.timedOut ? "TIMED OUT (re-running next tick)" : null,
       isDone ? "DONE — all leads scanned" : null,
+      batchErrors.length > 0 ? `Errors: ${batchErrors.slice(0, 3).join(" | ")}` : null,
     ].filter(Boolean).join(" · ");
 
     const patchFields = {
@@ -202,7 +215,16 @@ export async function POST(request) {
       "Latest Batch Summary": batchSummary,
     };
     if (isDone || isFatal) patchFields["Completed At"] = new Date().toISOString();
-    if (isFatal) patchFields["Error"] = batch.fatalError;
+    if (isFatal) {
+      patchFields["Error"] = batch.fatalError;
+    } else if (writeFailureDetected || batchErrors.length > 0) {
+      // Non-fatal but worth surfacing — populate Error field without
+      // changing State (scan continues). First Airtable error usually
+      // reveals the schema issue (e.g., "createTasks 422: UNKNOWN_FIELD_NAME").
+      patchFields["Error"] = batchErrors.length > 0
+        ? `${tasksLost > 0 ? `${tasksLost} task(s) lost. ` : ""}First error: ${batchErrors[0]}`
+        : `${tasksLost} movement(s) detected but task(s) not written. Check Tasks table schema in this base (likely missing Movement Type, Lead Title, Email, or Phone field).`;
+    }
 
     await fetch(`${AT_API}/${MASTER_BASE_ID}/${encodeURIComponent("Movement Scan Runs")}/${runId}`, {
       method: "PATCH",

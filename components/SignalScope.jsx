@@ -2539,6 +2539,38 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
             alert("Movement Scan error: " + err.message);
           }
         }} title="Scan LinkedIn for newly hired / promoted / exited leads">🧭 Movement Scan</button>}
+        {!clientMode&&<button className="btn btn-s" onClick={async()=>{
+          // Rebuild Movement Tasks from existing Lead data — no API spend.
+          // For when a previous Movement Scan detected movements (Lead rows
+          // have Movement Detected = Hired/Promoted/Exited and the Current
+          // Job Title / Previous Job Title / etc. fields populated) but the
+          // Task half failed silently. Idempotent — dedupes against existing
+          // "Lead Movement" tasks by Name + Company + Movement Type.
+          if (!bid) { alert("Select a campaign first"); return; }
+          const proceed = window.confirm("Rebuild Movement Tasks from existing Lead data?\n\nThis reads all Leads with Movement Detected = Hired/Promoted/Exited and creates Tasks for any that don't already have one. No RapidAPI calls — fast + free.\n\nIdempotent — safe to re-run.");
+          if (!proceed) return;
+          try {
+            const r = await fetch("/api/sidekick/movement-rebuild-tasks", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ baseId: bid }),
+            });
+            const data = await r.json();
+            if (data.ok) {
+              alert(`✅ ${data.summary}\n\nLeads with movement: ${data.leadsScanned}\nAlready had tasks: ${data.alreadyHadTasks}\nMissing data skipped: ${data.missingDataSkipped}\nTasks created: ${data.tasksCreated}${data.errors?.length ? `\n\nErrors (${data.errors.length}):\n${data.errors.slice(0,3).join("\n")}` : ""}`);
+              // Refresh tasks list so newly created records show up — uses
+              // the same at() pattern as other refresh paths in this file
+              try {
+                const refreshed = await at("list", "Tasks", {}, bid);
+                if (refreshed?.records) setTasks(refreshed.records.sort((a, b) => ((b.fields?.Created || "") > (a.fields?.Created || "") ? 1 : -1)));
+              } catch {}
+            } else {
+              alert("❌ " + (data.error || "Rebuild failed"));
+            }
+          } catch (e) {
+            alert("❌ Network error: " + e.message);
+          }
+        }} title="Backfill Movement Tasks from existing Lead data (no RapidAPI spend). Use when a previous scan detected movements but tasks weren't created.">🔧 Rebuild Tasks from Lead Data</button>}
       </div></div>
 
     {filteredLeads.length===0?<div className="empty"><div className="em">👤</div><p>{leads.length>0?"No leads match this campaign filter.":"Upload a CSV."}</p></div>:
