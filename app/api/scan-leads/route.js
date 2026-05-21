@@ -445,6 +445,12 @@ async function handleScan({
   console.log(`[lead-movement] Processing ${leadsToProcess.length} leads (concurrency ${concurrency})`);
 
   let apiCallsMade = 0;
+  // Per-slice flush running totals. These accumulate across all slice
+  // flushes + the final safety-net flush, then get passed back via
+  // taskResult / updateResult to keep the rest of the function's logging
+  // shape unchanged.
+  let tasksCreatedFlushed = 0;
+  let leadsUpdatedFlushed = 0;
   let fatalQuotaError = false; // flips true on monthly_quota_exhausted; aborts remaining work
   let timedOut = false;         // flips true when we exceed time budget; lets us exit cleanly
   let processedCount = 0;       // how many leads in this batch we actually completed (for log clarity)
@@ -563,25 +569,69 @@ async function handleScan({
     // Successfully completed this slice — track progress so timeout bailout
     // log shows accurate "X/Y leads processed before timing out"
     processedCount += slice.length;
+
+    // ─── PER-SLICE FLUSH (real-time task visibility) ─────────────
+    // Previously both writes only happened after the ENTIRE batch loop
+    // finished (see post-loop block below). If the operator stopped mid-
+    // scan OR Vercel timed out OR a fatal error threw, the accumulated
+    // arrays died in memory — the user's "2 promoted detected, 0 tasks
+    // in Airtable" bug from 2026-05-21.
+    //
+    // Now: after each 10-lead slice we drain both arrays into Airtable.
+    // Worst case adds ~20 Airtable calls per 200-lead batch — negligible
+    // against the value of crash-safe partial progress + real-time
+    // visibility (chatbot can pick up movement tasks within seconds
+    // instead of waiting for the whole batch).
+    //
+    // Tasks first, then lead updates — if only one half lands, having
+    // the Task is more useful than having the lead's Movement Detected
+    // field stamped (the task drives the chatbot card).
+    if (tasksToCreate.length > 0) {
+      const drained = tasksToCreate.splice(0);
+      try {
+        const r = await createTasksBatch(baseId, drained);
+        tasksCreatedFlushed += r.created;
+        errors.push(...r.errors);
+      } catch (e) {
+        errors.push(`per-slice task flush failed: ${e.message}`);
+      }
+    }
+    if (leadsToUpdate.length > 0) {
+      const drained = leadsToUpdate.splice(0);
+      try {
+        const r = await updateLeadsBatch(baseId, drained);
+        leadsUpdatedFlushed += r.updated;
+        errors.push(...r.errors);
+      } catch (e) {
+        errors.push(`per-slice lead update flush failed: ${e.message}`);
+      }
+    }
   }
 
-  // Bulk update leads
-  let updateResult = { updated: 0, errors: [] };
-  try {
-    updateResult = await updateLeadsBatch(baseId, leadsToUpdate);
-  } catch (e) {
-    errors.push(`bulk lead update failed: ${e.message}`);
+  // Final flush — anything that slipped through (shouldn't happen normally
+  // since we drain after every slice, but safety net for edge cases like
+  // arrays mutated outside the slice loop).
+  if (tasksToCreate.length > 0) {
+    try {
+      const r = await createTasksBatch(baseId, tasksToCreate);
+      tasksCreatedFlushed += r.created;
+      errors.push(...r.errors);
+    } catch (e) {
+      errors.push(`final task flush failed: ${e.message}`);
+    }
   }
-  errors.push(...updateResult.errors);
+  if (leadsToUpdate.length > 0) {
+    try {
+      const r = await updateLeadsBatch(baseId, leadsToUpdate);
+      leadsUpdatedFlushed += r.updated;
+      errors.push(...r.errors);
+    } catch (e) {
+      errors.push(`final lead update flush failed: ${e.message}`);
+    }
+  }
 
-  // Bulk create tasks
-  let taskResult = { created: 0, errors: [] };
-  try {
-    taskResult = await createTasksBatch(baseId, tasksToCreate);
-  } catch (e) {
-    errors.push(`bulk task create failed: ${e.message}`);
-  }
-  errors.push(...taskResult.errors);
+  const taskResult = { created: tasksCreatedFlushed, errors: [] };
+  const updateResult = { updated: leadsUpdatedFlushed, errors: [] };
 
   // Track cost (one batched call instead of per-API-call)
   const batchCostUSD = apiCallsMade * perCallCost;

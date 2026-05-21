@@ -893,10 +893,36 @@ async function classify(signals, taskDefs, companyName, mode, threshold = 50, ca
   // Run ALL tasks in parallel — was serial, made N tasks take N×3s. Now ~3s total.
   const taskPromises = taskDefs.map(async task => {
     // Pre-filter: drop signals that don't even mention task keywords. Big token savings.
-    const candidateIndices = prefilterSignals(signals, task, mode);
+    let candidateIndices = prefilterSignals(signals, task, mode);
+    let usedPrefilterFallback = false;
     if (candidateIndices.length === 0) {
-      console.log(`  [TASK] "${task.name}" → 0 candidates after keyword pre-filter`);
-      return { task, scores: [], error: null };
+      // Narrow-keyword tasks (e.g. Material's "Interim CMO announced",
+      // "MMM/Marketing Effectiveness role") legitimately get 0 candidates
+      // whenever the company's news week doesn't happen to mention those
+      // exact words. Without a fallback, the entire scan dead-ends with
+      // 0 matches across the board — repeatedly hit by Material on news scans.
+      //
+      // Fallback policy: if prefilter returns 0 AND the task has fewer than
+      // 8 keywords (i.e. it's narrow by design, not just badly configured),
+      // send the most-recent N signals to AI anyway as a broader sweep.
+      // Caps at 15 signals → ~1 AI call worth of cost per affected task.
+      // Tasks with many keywords (broad scans) skip fallback — if they
+      // didn't match, the news genuinely isn't relevant.
+      const kwCount = (mode === "jobs"
+        ? [...(task.jobTitleKeywords || []), ...(task.keywords || [])]
+        : (task.keywords || [])).filter(k => k && k.length >= 2).length;
+      const FALLBACK_SIGNAL_CAP = 15;
+      const NARROW_TASK_KEYWORD_CEILING = 8;
+      if (kwCount > 0 && kwCount <= NARROW_TASK_KEYWORD_CEILING && signals.length > 0) {
+        // Take the most recent N signals (signals array is already in
+        // RSS publish order — most recent first for news).
+        candidateIndices = signals.slice(0, FALLBACK_SIGNAL_CAP).map((_, i) => i);
+        usedPrefilterFallback = true;
+        console.log(`  [TASK] "${task.name}" → 0 keyword matches, broad-scanning ${candidateIndices.length} most-recent signals (narrow task with ${kwCount} keywords; AI scores below threshold will be dropped)`);
+      } else {
+        console.log(`  [TASK] "${task.name}" → 0 candidates after keyword pre-filter (kwCount=${kwCount}, fallback skipped: ${kwCount === 0 ? "no keywords" : "broad task, would burn tokens"})`);
+        return { task, scores: [], error: null };
+      }
     }
     // Split into chunks of at most 40 candidates per AI call. With prefilter
     // including article body, candidate count can balloon during high-news weeks.
@@ -1078,12 +1104,31 @@ ${signalBlock}`;
       continue;
     }
     let matchCount = 0;
+    // Track score distribution for diagnostic visibility — when matchCount
+    // is 0, operator wants to know if AI scored everything as 0 (news truly
+    // irrelevant) vs scored 35-49 (near-misses suggesting threshold or
+    // prompt could be tuned down). Material has hit this pattern repeatedly.
+    const scoreBuckets = { zero: 0, low: 0, nearMiss: 0, atOrAbove: 0 };
+    let topNearMiss = { score: -1, idx: null, reason: "" };
     for (const s of scores) {
       const idx = s.idx ?? s.newsIndex ?? s.index;
       // AI may return score as string ("85") even with json_object mode. Coerce defensively.
       const rawScore = s.score ?? s.relevanceScore;
       const score = typeof rawScore === "number" ? rawScore : Number(rawScore);
       const reason = s.reason ?? s.explanation ?? "";
+
+      if (Number.isFinite(score)) {
+        if (score === 0) scoreBuckets.zero++;
+        else if (score < 30) scoreBuckets.low++;
+        else if (score < threshold) {
+          scoreBuckets.nearMiss++;
+          if (score > topNearMiss.score) {
+            topNearMiss = { score: Math.round(score), idx, reason: String(reason).slice(0, 120) };
+          }
+        }
+        else scoreBuckets.atOrAbove++;
+      }
+
       if (idx !== undefined && Number.isFinite(score) && score >= threshold && results[idx]) {
         results[idx].matchedTaskIds.push(task.id);
         results[idx].relevanceScores[task.id] = Math.min(100, Math.max(0, Math.round(score)));
@@ -1092,7 +1137,15 @@ ${signalBlock}`;
         matchCount++;
       }
     }
-    console.log(`  [TASK] "${task.name}" → ${matchCount} matches at threshold ${threshold}+`);
+    // When zero matches, surface the top near-miss so operator can see how
+    // close it got — much more useful than just "0 matches".
+    if (matchCount === 0 && scoreBuckets.nearMiss > 0 && topNearMiss.score >= 0) {
+      const sig = results[topNearMiss.idx];
+      const hdr = sig ? (sig.headline || "").slice(0, 60) : "(unknown)";
+      console.log(`  [TASK] "${task.name}" → 0 matches at threshold ${threshold}+, but ${scoreBuckets.nearMiss} near-misses (top: ${topNearMiss.score}/${threshold} on "${hdr}" — ${topNearMiss.reason})`);
+    } else {
+      console.log(`  [TASK] "${task.name}" → ${matchCount} matches at threshold ${threshold}+ (distribution: ${scoreBuckets.zero} zero, ${scoreBuckets.low} <30, ${scoreBuckets.nearMiss} 30-${threshold-1}, ${scoreBuckets.atOrAbove} ≥${threshold})`);
+    }
   }
 
   // Log summary with diagnostic info
