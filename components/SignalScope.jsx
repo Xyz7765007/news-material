@@ -2557,7 +2557,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
             });
             const data = await r.json();
             if (data.ok) {
-              alert(`✅ ${data.summary}\n\nLeads with movement: ${data.leadsScanned}\nAlready had tasks: ${data.alreadyHadTasks}\nMissing data skipped: ${data.missingDataSkipped}\nTasks created: ${data.tasksCreated}${data.errors?.length ? `\n\nErrors (${data.errors.length}):\n${data.errors.slice(0,3).join("\n")}` : ""}`);
+              alert(`✅ ${data.summary}\n\nLeads with movement: ${data.leadsScanned}\nAlready had tasks: ${data.alreadyHadTasks}\nMissing data skipped: ${data.missingDataSkipped}\nTasks created: ${data.tasksCreated}${data.droppedFields?.length ? `\n\n⚠️ Tasks table missing fields (auto-skipped to make the write succeed):\n  ${data.droppedFields.join(", ")}\n\nRun setup-fix on this base to add them — values for these fields were silently dropped from the tasks just created.` : ""}${data.errors?.length ? `\n\nErrors (${data.errors.length}):\n${data.errors.slice(0,3).join("\n")}` : ""}`);
               // Refresh tasks list so newly created records show up — uses
               // the same at() pattern as other refresh paths in this file
               try {

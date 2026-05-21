@@ -60,33 +60,91 @@ async function listAll(baseId, table, filterFormula = "") {
 }
 
 async function createTasksBatch(baseId, taskFieldsArray) {
-  if (!taskFieldsArray.length) return { created: 0, errors: [] };
+  if (!taskFieldsArray.length) return { created: 0, errors: [], droppedFields: [] };
   const errors = [];
   let created = 0;
-  // Airtable max 10 records per create call
+  // Track fields we've already discovered are missing from this base's
+  // Tasks schema. Once we know "Movement Type" doesn't exist, every
+  // subsequent batch in this call skips it without retrying.
+  const knownMissingFields = new Set();
+
+  // Airtable: max 10 records per create call.
+  // Self-heal: on 422 UNKNOWN_FIELD_NAME, parse the missing field name
+  // from the error message, strip it from every record in the batch,
+  // retry. Loop up to 8 iterations (the task has 17 fields total — 8
+  // is more than enough headroom). This prevents the silent "0 tasks
+  // created" outcome the operator just hit: their Tasks table is
+  // missing one or more of the new fields (Movement Type / Lead Title /
+  // Phone / etc.) and the entire batch dies on the first unknown
+  // field rather than writing what it can.
   for (let i = 0; i < taskFieldsArray.length; i += 10) {
-    const slice = taskFieldsArray.slice(i, i + 10);
-    try {
-      const r = await fetch(`${AT_API}/${baseId}/Tasks`, {
-        method: "POST",
-        headers: atHdr(),
-        body: JSON.stringify({
-          records: slice.map(f => ({ fields: f })),
-          typecast: true,
-        }),
-      });
-      if (!r.ok) {
+    const baseSlice = taskFieldsArray.slice(i, i + 10);
+
+    // Drop any fields we already know are missing for this base
+    let slice = baseSlice.map(f => {
+      const filtered = { ...f };
+      for (const k of knownMissingFields) delete filtered[k];
+      return filtered;
+    });
+
+    let attempts = 0;
+    let succeeded = false;
+    while (attempts < 8 && !succeeded) {
+      attempts++;
+      try {
+        const r = await fetch(`${AT_API}/${baseId}/Tasks`, {
+          method: "POST",
+          headers: atHdr(),
+          body: JSON.stringify({
+            records: slice.map(f => ({ fields: f })),
+            typecast: true,
+          }),
+        });
+        if (r.ok) {
+          const data = await r.json();
+          created += (data.records || []).length;
+          succeeded = true;
+          break;
+        }
+        // Capture more of the error (was 200, now 600) so the field
+        // name is always visible to the operator even without retry.
         const errText = await r.text().catch(() => "");
-        errors.push(`createTasks ${r.status}: ${errText.slice(0, 200)}`);
-        continue;
+        if (r.status === 422) {
+          // Try to extract the missing field from the Airtable response.
+          // Two known shapes:
+          //   { "error": { "type": "UNKNOWN_FIELD_NAME", "message": "Unknown field name: \"Movement Type\"" } }
+          //   { "error": "UNKNOWN_FIELD_NAME", "message": "..." }
+          let missingField = null;
+          try {
+            const parsed = JSON.parse(errText);
+            const message = parsed?.error?.message || parsed?.message || "";
+            const match = message.match(/Unknown field name:?\s*["']([^"']+)["']/i);
+            if (match) missingField = match[1];
+          } catch { /* fall through */ }
+
+          if (missingField && !knownMissingFields.has(missingField)) {
+            knownMissingFields.add(missingField);
+            slice = slice.map(f => {
+              const filtered = { ...f };
+              delete filtered[missingField];
+              return filtered;
+            });
+            continue; // retry without that field
+          }
+          // 422 we can't parse → log and give up on this batch
+          errors.push(`createTasks 422 (unparseable): ${errText.slice(0, 600)}`);
+          break;
+        }
+        // Non-422 error → don't retry, log
+        errors.push(`createTasks ${r.status}: ${errText.slice(0, 600)}`);
+        break;
+      } catch (e) {
+        errors.push(`createTasks threw: ${e.message}`);
+        break;
       }
-      const data = await r.json();
-      created += (data.records || []).length;
-    } catch (e) {
-      errors.push(`createTasks threw: ${e.message}`);
     }
   }
-  return { created, errors };
+  return { created, errors, droppedFields: Array.from(knownMissingFields) };
 }
 
 // Mirror the lib pickLeadField helper for common field-name variants.
@@ -232,9 +290,11 @@ export async function POST(request) {
 
   // ─── 4. Bulk create (unless dry run) ────────────────────────────
   let tasksCreated = 0;
+  let droppedFields = [];
   if (!dryRun && tasksToCreate.length > 0) {
     const result = await createTasksBatch(baseId, tasksToCreate);
     tasksCreated = result.created;
+    droppedFields = result.droppedFields || [];
     errors.push(...result.errors);
   }
 
@@ -248,9 +308,10 @@ export async function POST(request) {
     missingDataSkipped,
     tasksWouldCreate: dryRun ? tasksToCreate.length : undefined,
     tasksCreated,
+    droppedFields,
     errors: errors.slice(0, 20),
     summary: dryRun
       ? `DRY RUN: would create ${tasksToCreate.length} tasks (${alreadyHadTasks} already exist, ${missingDataSkipped} skipped for missing data)`
-      : `Created ${tasksCreated} tasks (${alreadyHadTasks} already existed, ${missingDataSkipped} skipped for missing data)${errors.length ? ` — ${errors.length} error(s)` : ""}`,
+      : `Created ${tasksCreated} tasks (${alreadyHadTasks} already existed, ${missingDataSkipped} skipped for missing data)${droppedFields.length ? `. Tasks table missing fields auto-skipped: ${droppedFields.join(", ")} — run /api/setup-fix?baseId=${baseId} to add them.` : ""}${errors.length ? ` — ${errors.length} unresolved error(s)` : ""}`,
   });
 }
