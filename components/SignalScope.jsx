@@ -1708,7 +1708,15 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   // (Triggers shows ALL Account Routing across campaigns), integration credentials
   // (HubSpot, GA), or admin functions. Clients see only their campaign's
   // operational data + read-only LinkedIn outreach/posts views.
-  const ADMIN_ONLY_TABS = new Set(["triggers", "email_campaign", "google_analytics", "hubspot", "post_demo"]);
+  const ADMIN_ONLY_TABS = new Set([
+    // Originally admin-only (back-office integrations + speculative features)
+    "triggers", "email_campaign", "google_analytics", "hubspot", "post_demo",
+    // Added 2026-05-22 per operator request — client portal should not expose
+    // the rule-building / scoring-tuning surface or the LinkedIn automation
+    // control plane. Client sees results (Dashboard, Accounts, Leads, Tasks)
+    // not the machinery that produced them.
+    "rules", "prompts", "threshold", "outreach", "linkedin_posts",
+  ]);
   const navs = [
     {id:"dashboard",label:"📊 Dashboard",count:null},
     null,
@@ -2578,7 +2586,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   })()}
 
   {/* TASK RULES (unified — signal + top_x) */}
-  {tab==="rules"&&!loading&&(<div><div className="ph"><div><div className="pt">Task Rules</div><div className="pd">{rules.length} rules</div></div>{!clientMode&&<button className="btn btn-s btn-p" onClick={()=>setEditRule({})}><I.Plus/> Add Rule</button>}</div>
+  {tab==="rules"&&!loading&&!clientMode&&(<div><div className="ph"><div><div className="pt">Task Rules</div><div className="pd">{rules.length} rules</div></div>{!clientMode&&<button className="btn btn-s btn-p" onClick={()=>setEditRule({})}><I.Plus/> Add Rule</button>}</div>
 
   {/* Task type guides — show relevant ones based on campaign features */}
   {rules.length===0&&(<div style={{display:"flex",flexDirection:"column",gap:12,marginBottom:20}}>
@@ -2691,7 +2699,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   </>}</div>)}
 
   {/* PROMPTS */}
-  {tab==="prompts"&&!loading&&(<div>
+  {tab==="prompts"&&!loading&&!clientMode&&(<div>
   <div className="ph">
     <div>
       <div className="pt">Scoring Prompts</div>
@@ -2790,7 +2798,7 @@ Output format (strict JSON, no markdown):
   </div>)})}</div></div>)}
 
   {/* THRESHOLD */}
-  {tab==="threshold"&&!loading&&(<div><div className="ph"><div><div className="pt">Scoring Threshold</div><div className="pd">Minimum score for signals to become tasks</div></div></div>
+  {tab==="threshold"&&!loading&&!clientMode&&(<div><div className="ph"><div><div className="pt">Scoring Threshold</div><div className="pd">Minimum score for signals to become tasks</div></div></div>
   <div style={{padding:24,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:12,maxWidth:500}}>
   <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:16}}><span style={{fontSize:12,color:"var(--t2)"}}>Threshold</span><input type="range" className="sld" min="0" max="100" value={threshold} onChange={e=>setThreshold(+e.target.value)}/><span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:14,fontWeight:600,color:"var(--acc)",minWidth:30,textAlign:"center"}}>{threshold}</span></div>
   <div style={{display:"flex",gap:16,fontSize:10,color:"var(--t3)"}}><span>0-49: Weak</span><span>50-69: Partial</span><span style={{color:"var(--acc)"}}>70-89: Strong</span><span style={{color:"var(--grn)"}}>90-100: Exact</span></div></div></div>)}
@@ -2850,10 +2858,10 @@ Output format (strict JSON, no markdown):
   </div>)}
 
   {/* ════ LINKEDIN POSTS SCANNER ════ */}
-  {tab==="linkedin_posts"&&!loading&&(<LinkedInPostsTab baseId={bid} campaign={camp} leads={leads} onCampaignProvisioned={(newCamp)=>{setCamp(newCamp);setCampaigns(p=>p.map(c=>c.id===newCamp.id?newCamp:c));}}/>)}
+  {tab==="linkedin_posts"&&!loading&&!clientMode&&(<LinkedInPostsTab baseId={bid} campaign={camp} leads={leads} onCampaignProvisioned={(newCamp)=>{setCamp(newCamp);setCampaigns(p=>p.map(c=>c.id===newCamp.id?newCamp:c));}}/>)}
 
   {/* ════ LINKEDIN AUTOMATION ════ */}
-  {tab==="outreach"&&!loading&&(<div>
+  {tab==="outreach"&&!loading&&!clientMode&&(<div>
     <div className="ph"><div><div className="pt">💬 LinkedIn Automation</div><div className="pd">Connection requests, DM sequences & outreach tracking</div></div>
       <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
         {linkedinAccount && <button className="btn btn-s btn-p" onClick={()=>setManualModal({mode:"select_leads"})} disabled={outreachLoading}>✋ Manual Mode</button>}
