@@ -2913,8 +2913,22 @@ Output format (strict JSON, no markdown):
             <div style={{fontSize:10,color:"var(--t3)",lineHeight:1.5,marginBottom:14}}>Generate a secure login link to email your client so they can connect their LinkedIn.</div>
             <button className="btn btn-s" style={{width:"100%",justifyContent:"center"}} onClick={async()=>{
               try{
-                const data = await outreachAPI("get_auth_link",{callbackUrl:window.location.href});
-                if(data.url){navigator.clipboard.writeText(data.url);alert("Auth link copied! Paste it in an email to your client.\n\nLink: "+data.url.slice(0,60)+"...")}
+                // CRITICAL: the link generated here gets emailed to the CLIENT,
+                // so the success/failure redirect MUST be the client portal URL
+                // for THIS campaign — never the admin URL we're currently on.
+                // Previously this passed window.location.href, which meant the
+                // client landed on the admin portal after login and could see
+                // every other client's data. Data-leak fix 2026-05-22.
+                if (!camp?.airtableId) {
+                  alert("Save this campaign first — the client portal URL needs a campaign ID to redirect to.");
+                  return;
+                }
+                const clientPortalUrl = `${window.location.origin}/client/${camp.airtableId}`;
+                const data = await outreachAPI("get_auth_link",{callbackUrl: clientPortalUrl});
+                if(data.url){
+                  navigator.clipboard.writeText(data.url);
+                  alert(`Auth link copied! Paste it in an email to your client.\n\nAfter login, they'll land on:\n${clientPortalUrl}\n\nLink: ${data.url.slice(0,60)}...`);
+                }
                 else alert("Could not generate link. Check Unipile credentials.");
               }catch(e){alert("Error: "+e.message+"\n\nMake sure UNIPILE_DSN and UNIPILE_API_KEY are set.")}
             }}>📋 Copy Auth Link</button>
