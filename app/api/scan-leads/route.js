@@ -92,41 +92,90 @@ async function listAccounts(baseId) {
 }
 
 async function createTasksBatch(baseId, taskFieldsArray) {
-  if (!taskFieldsArray.length) return { created: 0, errors: [] };
+  if (!taskFieldsArray.length) return { created: 0, errors: [], droppedFields: [] };
   const errors = [];
   let created = 0;
-  // Airtable max 10 records per create call
+  // Self-heal against missing schema fields. If Veloka's (or any other
+  // campaign's) Tasks table is missing a field that buildTaskFromMovement
+  // writes — most commonly `Movement Type`, `Lead Title`, or `URL` —
+  // the entire batch used to die silently with 422. Now we parse the
+  // unknown field name from Airtable's error, strip it from every record,
+  // and retry. Mirrors the rebuild endpoint's pattern. Loop caps at 8
+  // iterations (task has ~17 fields total, so 8 is more than enough).
+  const knownMissingFields = new Set();
+
   for (let i = 0; i < taskFieldsArray.length; i += 10) {
-    const slice = taskFieldsArray.slice(i, i + 10);
-    const url = `${AT_API}/${baseId}/Tasks`;
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: atHdr(),
-        // typecast: true — Airtable coerces field types instead of erroring
-        // (e.g. accepts a string for a number field). Belt-and-suspenders
-        // alongside the schema-ensure step. Doesn't help with
-        // UNKNOWN_FIELD_NAME — for that, the schema must be correct.
-        body: JSON.stringify({ records: slice.map(f => ({ fields: f })), typecast: true }),
-      });
-      if (!res.ok) {
+    const baseSlice = taskFieldsArray.slice(i, i + 10);
+    let slice = baseSlice.map(f => {
+      const filtered = { ...f };
+      for (const k of knownMissingFields) delete filtered[k];
+      return filtered;
+    });
+
+    let attempts = 0;
+    let succeeded = false;
+    while (attempts < 8 && !succeeded) {
+      attempts++;
+      const url = `${AT_API}/${baseId}/Tasks`;
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: atHdr(),
+          // typecast: true — Airtable coerces field types instead of erroring
+          // (e.g. accepts a string for a number field). Belt-and-suspenders
+          // alongside the auto-heal. Doesn't help with UNKNOWN_FIELD_NAME —
+          // for that the loop below handles it.
+          body: JSON.stringify({ records: slice.map(f => ({ fields: f })), typecast: true }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          created += (data.records || []).length;
+          succeeded = true;
+          break;
+        }
         const errText = await res.text().catch(() => "");
-        // LOUD logging — this exact silent failure mode (counter ticks up,
-        // no tasks land) cost a debugging session on 2026-05-21. Make sure
-        // any operator inspecting Vercel logs sees this immediately.
+        if (res.status === 422) {
+          // Parse the missing field from Airtable's response.
+          //   { "error": { "type": "UNKNOWN_FIELD_NAME", "message": "Unknown field name: \"Movement Type\"" } }
+          let missingField = null;
+          try {
+            const parsed = JSON.parse(errText);
+            const message = parsed?.error?.message || parsed?.message || "";
+            const match = message.match(/Unknown field name:?\s*["']([^"']+)["']/i);
+            if (match) missingField = match[1];
+          } catch { /* fall through */ }
+
+          if (missingField && !knownMissingFields.has(missingField)) {
+            knownMissingFields.add(missingField);
+            console.warn(`[scan-leads] auto-healing: Tasks table missing "${missingField}" — dropping from payload and retrying`);
+            slice = slice.map(f => {
+              const filtered = { ...f };
+              delete filtered[missingField];
+              return filtered;
+            });
+            continue;
+          }
+          // 422 we can't parse → loud log + give up on this batch
+          console.error(`[scan-leads] createTasks 422 (unparseable): ${errText.slice(0, 400)}`);
+          console.error(`[scan-leads] failed payload sample:`, JSON.stringify(slice[0]).slice(0, 500));
+          errors.push(`createTasks 422 (unparseable): ${errText.slice(0, 200)}`);
+          break;
+        }
+        // Non-422 — log loudly, no retry
         console.error(`[scan-leads] createTasks FAILED (slice ${i}-${i+slice.length-1}): HTTP ${res.status}: ${errText.slice(0, 400)}`);
-        console.error(`[scan-leads] failed payload sample (first record):`, JSON.stringify(slice[0]).slice(0, 500));
         errors.push(`createTasks ${res.status}: ${errText.slice(0, 200)}`);
-        continue;
+        break;
+      } catch (e) {
+        console.error(`[scan-leads] createTasks THREW (slice ${i}): ${e.message}`);
+        errors.push(`createTasks threw: ${e.message}`);
+        break;
       }
-      const data = await res.json();
-      created += (data.records || []).length;
-    } catch (e) {
-      console.error(`[scan-leads] createTasks THREW (slice ${i}): ${e.message}`);
-      errors.push(`createTasks threw: ${e.message}`);
     }
   }
-  return { created, errors };
+  if (knownMissingFields.size > 0) {
+    console.warn(`[scan-leads] dropped fields from Tasks (run setup-fix to add): ${Array.from(knownMissingFields).join(", ")}`);
+  }
+  return { created, errors, droppedFields: Array.from(knownMissingFields) };
 }
 
 async function updateLeadsBatch(baseId, leadUpdates) {

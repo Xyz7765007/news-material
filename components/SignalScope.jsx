@@ -1273,7 +1273,14 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   };
 
   // Check if a new task is a duplicate of anything we've seen
-  const isDuplicate = (newTask, existingTasks) => {
+  // existingTasks is the campaign's current Tasks list.
+  // opts.strict — when true, skip Layer 3 (fuzzy company+rule+signal overlap).
+  //   Use this for Top X / Smart Compile flows where multiple distinct leads
+  //   at the same company legitimately share the same compiled match-reason,
+  //   so a fuzzy match on signal text would wrongly kill every fresh task.
+  //   Server-side excludeKeys (URL + name|company) is the source of truth for
+  //   those flows; client-side fuzzy dedup is unnecessary on top.
+  const isDuplicate = (newTask, existingTasks, opts = {}) => {
     const fp = taskFingerprint(newTask);
     // Layer 1: exact fingerprint
     if (taskSeenRef.current.has(fp)) return true;
@@ -1286,7 +1293,14 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         if ((f.URL || "").toLowerCase().trim() === newUrl && (f.Company || "").toLowerCase().trim() === newCo) return true;
       }
     }
-    // Layer 3: fuzzy — same company + same rule + similar signal text
+    // Layer 3: fuzzy — same company + same rule + similar signal text.
+    // Designed for repeated news/signal scans (so the same news headline
+    // doesn't get re-created each scan run). For Top X compile flows,
+    // however, every lead at the same account legitimately gets the same
+    // compiled match-reason text, so this layer wrongly nukes valid leads.
+    // Skipped in strict mode.
+    if (opts.strict) return false;
+
     const co = (newTask.Company || "").toLowerCase().trim();
     const ru = (newTask["Task Rule"] || "").toLowerCase().trim();
     for (const t of existingTasks) {
@@ -1471,7 +1485,13 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         legacyWarning = ` ⚠ ${res.legacy.skipped_at_cap} records skipped (legacy mode cap). Enable Smart Compile for full coverage.`;
       }
       if (res.tasks?.length > 0) {
-        const unique = res.tasks.filter(t => !isDuplicate(t, tasks));
+        // STRICT mode: trust server's pre-scoring excludeKeys as the source
+        // of truth. Layer 3 fuzzy (same company + same rule + similar signal)
+        // would wrongly kill every fresh Top X result at any account that
+        // already has a Top X task, since Smart Compile naturally generates
+        // the same signal text for all leads matched against the same compiled
+        // rule. Server already filtered URL + name|company before scoring.
+        const unique = res.tasks.filter(t => !isDuplicate(t, tasks, { strict: true }));
         const duped = res.tasks.length - unique.length;
         setScanText(`🔍 ${duped > 0 ? duped + " duplicates removed, " : ""}creating ${unique.length} tasks...`);
         setScanProg(85);
