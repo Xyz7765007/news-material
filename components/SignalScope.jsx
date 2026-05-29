@@ -7302,6 +7302,10 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
   const [count, setCount] = useState(10);
   const [companyFilter, setCompanyFilter] = useState("");
   const [connectionMessage, setConnectionMessage] = useState("Hey {first_name}, came across your profile and would love to connect.");
+  // Skip the connection note entirely — sends the invite with no message attached.
+  // Useful for LinkedIn free-tier accounts (note is optional anyway), and for
+  // clients who prefer the higher acceptance rate that note-less invites can show.
+  const [skipConnectionNote, setSkipConnectionNote] = useState(false);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState(null);
   const [previews, setPreviews] = useState(null);
@@ -7341,12 +7345,19 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
   });
 
   const ruleConfig = (() => {
-    if (!selectedRule) return { name: "Manual Outreach", connectionMessage, dmSequence: [] };
+    // When skipConnectionNote is on, force connectionMessage to "" so the
+    // server-side resolver (outreach/route.js line ~1169) hits its
+    // `: undefined` branch and Unipile sends the invite with no message.
+    // This override must beat the fallback to saved rule's cfg.connectionMessage.
+    const effectiveMessage = skipConnectionNote ? "" : connectionMessage;
+    if (!selectedRule) return { name: "Manual Outreach", connectionMessage: effectiveMessage, dmSequence: [] };
     const r = rules.find(x => x.id === selectedRule);
     try {
       const cfg = JSON.parse(r?.fields?.["Outreach Config"] || "{}");
-      return { ...cfg, name: r?.fields?.Name || "Manual", connectionMessage: connectionMessage || cfg.connectionMessage };
-    } catch { return { name: "Manual", connectionMessage, dmSequence: [] }; }
+      // When skipping, hard-override to empty; otherwise fall back to saved rule's text.
+      const finalMsg = skipConnectionNote ? "" : (connectionMessage || cfg.connectionMessage);
+      return { ...cfg, name: r?.fields?.Name || "Manual", connectionMessage: finalMsg };
+    } catch { return { name: "Manual", connectionMessage: effectiveMessage, dmSequence: [] }; }
   })();
 
   // ─── Actions ───
@@ -7363,8 +7374,11 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
   };
 
   const enqueueManual = async () => {
-    if (!connectionMessage || connectionMessage.length > 300) { setResult({ error: "Connection note must be 1-300 characters" }); return; }
-    if (!confirm(`Add ${selected.size} lead${selected.size!==1?"s":""} to queue and send connection request${selected.size!==1?"s":""} now?\n\nThis uses your LinkedIn account. Hard cap: 30 per batch.`)) return;
+    if (!skipConnectionNote && (!connectionMessage || connectionMessage.length > 300)) { setResult({ error: "Connection note must be 1-300 characters (or check 'Send without a note')" }); return; }
+    const noteDescriptor = skipConnectionNote
+      ? "without a note (LinkedIn free-tier compatible)"
+      : `with your custom note (${connectionMessage.length} chars)`;
+    if (!confirm(`Add ${selected.size} lead${selected.size!==1?"s":""} to queue and send connection request${selected.size!==1?"s":""} ${noteDescriptor} now?\n\nThis uses your LinkedIn account. Hard cap: 30 per batch.`)) return;
     setBusy(true); setResult(null);
     try {
       const ids = [...selected];
@@ -7557,11 +7571,17 @@ function ManualOutreachModal({ leads, rules, linkedinAccount, outreachAPI, onClo
 
       {/* Connection Message */}
       <div className="ig">
-        <div className="il">Connection Note <span style={{fontWeight:400,textTransform:"none",color:"var(--t3)"}}>— sent with the invite. Merge fields: {"{first_name}"}, {"{company}"}, {"{title}"}</span></div>
-        <textarea className="inp" value={connectionMessage} onChange={e=>{setConnectionMessage(e.target.value);setPreviews(null)}} style={{minHeight:60}} maxLength={300} placeholder="Hey {first_name}, came across your profile and would love to connect."/>
+        <div className="il" style={{display:"flex",justifyContent:"space-between",alignItems:"flex-end",gap:8,flexWrap:"wrap"}}>
+          <div>Connection Note <span style={{fontWeight:400,textTransform:"none",color:"var(--t3)"}}>— sent with the invite. Merge fields: {"{first_name}"}, {"{company}"}, {"{title}"}</span></div>
+          <label style={{display:"flex",alignItems:"center",gap:6,fontSize:10,fontWeight:500,textTransform:"none",color:"var(--t2)",cursor:"pointer",userSelect:"none"}}>
+            <input type="checkbox" checked={skipConnectionNote} onChange={e=>{setSkipConnectionNote(e.target.checked);setPreviews(null);}} style={{margin:0,cursor:"pointer"}}/>
+            Send without a note <span style={{color:"var(--t3)",fontWeight:400}}>(LinkedIn free-tier compatible)</span>
+          </label>
+        </div>
+        <textarea className="inp" value={connectionMessage} onChange={e=>{setConnectionMessage(e.target.value);setPreviews(null)}} style={{minHeight:60,opacity:skipConnectionNote?0.4:1}} maxLength={300} disabled={skipConnectionNote} placeholder="Hey {first_name}, came across your profile and would love to connect."/>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:4}}>
-          <div style={{fontSize:9,color:connectionMessage.length>300?"var(--red)":"var(--t3)"}}>{connectionMessage.length}/300 chars · LinkedIn free-tier limit</div>
-          <button className="btn btn-s" disabled={busy||selected.size===0} onClick={()=>previewMessages(connectionMessage,"connection_note")} style={{fontSize:10}}>{busy?"⏳":"👁 Preview on "+Math.min(selected.size,5)+" sample"+(Math.min(selected.size,5)!==1?"s":"")}</button>
+          <div style={{fontSize:9,color:skipConnectionNote?"var(--acc)":(connectionMessage.length>300?"var(--red)":"var(--t3)")}}>{skipConnectionNote ? "Note will be skipped — invite sends with no message" : `${connectionMessage.length}/300 chars · LinkedIn free-tier limit`}</div>
+          <button className="btn btn-s" disabled={busy||selected.size===0||skipConnectionNote} onClick={()=>previewMessages(connectionMessage,"connection_note")} style={{fontSize:10}}>{busy?"⏳":"👁 Preview on "+Math.min(selected.size,5)+" sample"+(Math.min(selected.size,5)!==1?"s":"")}</button>
         </div>
       </div>
 
