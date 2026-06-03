@@ -407,9 +407,8 @@ async function fetchArticle(url) {
 // ─── Date Filter ──────────────────────────────────────────────────
 
 const MAX_AGE_DAYS = 7;
-// Jobs are kept longer because non-tech companies post less frequently. A "VP Marketing
-// role open" 3 weeks ago is still actionable. News at 7 days makes sense (old news isn't
-// actionable), but jobs we keep for 30 days. Override via env if needed.
+// Jobs use the same 7-day recency cutoff as news — only postings opened within the last
+// week are actionable. Override via MAX_JOB_AGE_DAYS env if a campaign needs a wider window.
 const MAX_JOB_AGE_DAYS = parseInt(process.env.MAX_JOB_AGE_DAYS) || 7;
 
 function filterRecent(items) {
@@ -631,6 +630,12 @@ async function scanNews(company, taskDefs, threshold = 50, campaignId = null) {
 // Returns results grouped by company for the frontend to process
 // ═══════════════════════════════════════════════════════════════════
 
+// Accent/punctuation-insensitive normaliser for company-name matching.
+// "L'Oreal" (account) and "L'Oréal" (Apify) must match — strip diacritics + non-alnum.
+function normCo(s) {
+  return (s || "").normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
 async function scanJobsBatch(companies, taskDefs, threshold = 50, campaignId = null) {
   const tokens = getApifyTokens();
   if (tokens.length === 0) {
@@ -638,117 +643,74 @@ async function scanJobsBatch(companies, taskDefs, threshold = 50, campaignId = n
     return companies.map(c => ({ company: c.name, signals: [] }));
   }
 
-  // Build URLs — keyword-based per-company URLs (no batching).
-  // Drop the prior withIds/withoutIds split since both paths now use the
-  // same shape of URL. f_C as a filter has been retired (see comment below).
-  const urls = [];
-
   // f_TPR window (in seconds): r604800 = 7 days, r2592000 = 30 days, r7776000 = 90 days
   // Override via APIFY_JOBS_TPR env var if you need a different window.
-  const TPR = process.env.APIFY_JOBS_TPR || "r604800"; // 604800s = 7 days, matches MAX_JOB_AGE_DAYS=7
-
-  // 2026-05-08: Empirical evidence (Mastercard debug runs) showed that
-  // f_C=<id>&keywords=marketing returns the ALL-JOBS feed for a company,
-  // not marketing-only jobs. LinkedIn ignores `keywords` when `f_C` is
-  // present. The all-jobs feed contains ~2 marketing roles out of every 25
-  // (most are product/sales/ops/finance), and our keyword prefilter then
-  // drops everything → 0 tasks.
-  //
-  // Fix: drop f_C entirely. Use keyword-based URLs for every company,
-  // pattern: keywords="${name}" marketing — the same shape that the
-  // existing `withoutIds` fallback has been using (and getting marketing-
-  // focused results from). Downstream company-name matching filters out
-  // any cross-pollution from companies that mention "Mastercard" in JDs.
-  //
-  // Trade-off: lose batching (was 5 companies → 1 URL, now 5 → 5 URLs).
-  // Apify cost increases ~5×, but each company gets its own 100-result
-  // ceiling instead of sharing 100 across the batch, so per-company
-  // recall improves. Net cost vs accuracy is favorable.
-
-  for (const c of companies) {
-    const cleanName = cleanCompanyName(c.name);
-    if (!cleanName) continue;
-    const url = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${cleanName}" marketing`)}&f_TPR=${TPR}&sortBy=DD`;
-    urls.push(url);
-    console.log(`  [JOBS-BATCH] ${cleanName}: keyword URL ${url}`);
-  }
-
-  console.log(`  [JOBS-BATCH] Total URLs: ${urls.length} (was ${companies.length} before combining)`);
+  const TPR = process.env.APIFY_JOBS_TPR || "r604800"; // 7 days — matches MAX_JOB_AGE_DAYS=7
 
   const actorId = process.env.APIFY_ACTOR_ID || "curious_coder/linkedin-jobs-scraper";
   const baseInput = { count: 100, scrapeCompany: false, includeJobDescription: true };
 
-  // Use fallback helper — tries all 3 tokens automatically
-  let { data, error } = await apifyCallWithFallback(actorId, { urls, ...baseInput }, 480000);
-  let allJobs = Array.isArray(data) ? data : [];
-
-  if (error) console.error(`  [JOBS-BATCH] ${error}`);
-  console.log(`  [JOBS-BATCH] Got ${allJobs.length} total job listings`);
-
-  // ── Retry: Drop f_TPR entirely (no time filter) if first attempt returned 0 ──
-  // Reason: even 30-day windows fail for some companies. Without f_TPR, LinkedIn
-  // returns ALL jobs ever posted by the company, sorted by date — newest first via
-  // sortBy=DD. We then filter by date in JS using filterRecentJobs().
+  // 2026-06-03: Two fixes vs the prior batched approach.
   //
-  // (Old retry-2 "individual URLs per company" is no longer needed — we're already
-  // per-company since dropping f_C batching, so the retry just removes the time filter.)
-  if (allJobs.length === 0 && urls.length > 0 && !error) {
-    console.log(`  [JOBS-BATCH] 0 results — retrying without time filter (f_TPR)...`);
-    const retryUrls = [];
-    for (const c of companies) {
-      const cleanName = cleanCompanyName(c.name);
-      if (!cleanName) continue;
-      retryUrls.push(`https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${cleanName}" marketing`)}&sortBy=DD`);
-    }
-    const retry1 = await apifyCallWithFallback(actorId, { urls: retryUrls, ...baseInput }, 480000);
-    allJobs = Array.isArray(retry1.data) ? retry1.data : [];
-    console.log(`  [JOBS-BATCH] After retry (no time filter): ${allJobs.length} jobs`);
-  }
+  // (1) PER-COMPANY APIFY CALLS. The old code put every company's URL into ONE
+  //     run-sync call with count:100. `count` is a TOTAL dataset cap, so a batch of
+  //     5 companies SHARED 100 items — not "100 each" as the old comment claimed.
+  //     High-volume posters (e.g. TJX: 53 retail-ops roles) flooded the cap and
+  //     starved everyone else (live proof: L'Oréal returned 18 marketing roles
+  //     alone but 0 inside the TJX batch). We now fire one Apify call per company
+  //     (concurrent, own 100-item ceiling). ~5× Apify cost per batch, large recall win.
+  //
+  // (2) MARKETING-BIASED QUERY. `"<Name>" marketing` returned mostly non-marketing
+  //     roles, burying the rare CMO/VP/Director-Marketing roles Material wants. The
+  //     biased query surfaces ~2× more marketing-relevant roles. Downstream company-
+  //     name matching (normCo) drops cross-pollination from other brands in the JD.
+  const buildUrl = (cleanName, withTpr) =>
+    `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(`"${cleanName}" (marketing OR brand OR CMO OR CGO OR growth OR communications)`)}${withTpr ? `&f_TPR=${TPR}` : ""}&sortBy=DD`;
 
-  if (allJobs.length === 0) {
-    console.log(`  [JOBS-BATCH] FINAL: 0 jobs after all retries. Possible causes:`);
-    console.log(`    1. Companies have no recent postings`);
-    console.log(`    2. LinkedIn IDs are stale/wrong (verify by pasting one URL above into a browser)`);
-    console.log(`    3. Apify actor blocked by LinkedIn (try rerunning later)`);
-    return companies.map(c => ({ company: c.name, signals: [] }));
+  // Fetch each company's jobs concurrently, in chunks to bound parallelism (UI sends
+  // batches of 5; chunking keeps us safe if a caller passes more). Each company gets
+  // its own Apify call + a no-time-filter retry if the windowed call returns 0.
+  const CONC = 5;
+  const fetched = []; // { c, jobs }
+  for (let i = 0; i < companies.length; i += CONC) {
+    const chunk = companies.slice(i, i + CONC);
+    const chunkResults = await Promise.all(chunk.map(async (c) => {
+      const cleanName = cleanCompanyName(c.name);
+      if (!cleanName) return { c, jobs: [] };
+      let { data, error } = await apifyCallWithFallback(actorId, { urls: [buildUrl(cleanName, true)], ...baseInput }, 240000);
+      let jobs = Array.isArray(data) ? data : [];
+      if (jobs.length === 0 && !error) {
+        const retry = await apifyCallWithFallback(actorId, { urls: [buildUrl(cleanName, false)], ...baseInput }, 240000);
+        jobs = Array.isArray(retry.data) ? retry.data : [];
+      }
+      console.log(`  [JOBS-BATCH] ${cleanName}: ${jobs.length} jobs fetched`);
+      return { c, jobs };
+    }));
+    fetched.push(...chunkResults);
   }
 
   // Group jobs by company — match using companyName from Apify results
   const results = [];
-  for (let i = 0; i < companies.length; i++) {
-    const c = companies[i];
-    const hasId = !!c.linkedinCompanyId;
-    // Use cleaned name for matching against Apify's companyName field — Apify returns
-    // LinkedIn's official name like "American Standard", not internal notes.
+  for (const { c, jobs: allJobs } of fetched) {
     const cleanName = cleanCompanyName(c.name);
-    const companyLower = cleanName.toLowerCase().trim();
+    const companyNorm = normCo(cleanName);
     // Domain base: strip protocol/www/path, then take first segment.
-    // Handles all TLDs (.com, .in, .io, .tech) by ignoring everything after first dot.
-    // Skip short bases (≤2 chars) — they over-match in jobCoName.includes() (e.g., "ai" matches "Air France").
+    // Skip short bases (<3 chars) — they over-match (e.g., "ai" matches "Air France").
     const cleanedDomain = (c.domain || "").replace(/^https?:\/\//i, "").replace(/^www\./i, "").split("/")[0];
-    const rawBase = cleanedDomain.split(".")[0].toLowerCase();
+    const rawBase = normCo(cleanedDomain.split(".")[0]);
     const domainBase = rawBase.length >= 3 ? rawBase : "";
-    const companySlug = (c.linkedinSlug || "").toLowerCase();
+    const companySlug = normCo(c.linkedinSlug || "");
 
-    // Match jobs to this company
-    const companyJobs = !companyLower ? [] : allJobs.filter(job => {
-      const jobCoName = (job.companyName || "").toLowerCase().trim();
+    // Match jobs to this company — accent/punctuation-insensitive (normCo on both sides).
+    const companyJobs = !companyNorm ? [] : allJobs.filter(job => {
+      const jobCoName = normCo(job.companyName || "");
       const jobLinkedinUrl = (job.companyLinkedinUrl || job.companyUrl || "").toLowerCase();
-      const jobSlug = jobLinkedinUrl.match(/linkedin\.com\/company\/([^\/?\s]+)/)?.[1] || "";
-      // Skip jobs with empty or trivially short company names — would false-match.
-      // Real LinkedIn companies always have names of 3+ chars.
+      const jobSlug = normCo(jobLinkedinUrl.match(/linkedin\.com\/company\/([^\/?\s]+)/)?.[1] || "");
+      // Skip jobs with empty/trivially short company names — would false-match.
       if (!jobCoName || jobCoName.length < 3) return false;
-
-      if (hasId) {
-        // When we used f_C, match by slug or name
-        return jobSlug === companySlug || jobCoName.includes(companyLower) || companyLower.includes(jobCoName) ||
-          (domainBase && jobCoName.includes(domainBase)) ||
-          (companySlug && jobCoName.replace(/[^a-z0-9]/g, "").includes(companySlug.replace(/[^a-z0-9]/g, "")));
-      } else {
-        // Keyword fallback — strict name matching
-        return jobCoName.includes(companyLower) || companyLower.includes(jobCoName) ||
-          (domainBase && jobCoName.includes(domainBase));
-      }
+      return jobCoName.includes(companyNorm) || companyNorm.includes(jobCoName) ||
+        (domainBase && jobCoName.includes(domainBase)) ||
+        (companySlug && companySlug.length >= 3 && jobCoName.includes(companySlug));
     });
 
     // Convert to signals
@@ -766,8 +728,9 @@ async function scanJobsBatch(companies, taskDefs, threshold = 50, campaignId = n
       articleContent: cl(job.descriptionText || job.descriptionHtml || "").slice(0, 800),
     })).filter(j => j.jobTitle.length > 2);
 
-    // Always apply 30-day filter post-fetch. The URL's f_TPR is best-effort (may have
-    // been dropped in retry attempts). filterRecentJobs is the authoritative cutoff.
+    // Always apply the recency filter post-fetch (MAX_JOB_AGE_DAYS = 7). The URL's f_TPR
+    // is best-effort (may have been dropped in the no-time-filter retry). filterRecentJobs
+    // is the authoritative cutoff.
     const recent = filterRecentJobs(signals);
 
     console.log(`  [JOBS-BATCH] ${c.name}: ${companyJobs.length} matched → ${recent.length} within ${MAX_JOB_AGE_DAYS} days`);
