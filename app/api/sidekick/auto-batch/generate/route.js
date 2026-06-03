@@ -356,6 +356,24 @@ challenge. Curious how TraviYo is approaching that motion right now.
 Open to connecting?"
 
 ═════════════════════════════════════════════════════════════
+PLAIN-LANGUAGE RULES (read at a 10-year-old's level):
+═════════════════════════════════════════════════════════════
+Write so a sharp 10-year-old could follow it. Assume they know the
+technical/industry terms (keep "ACV", "Qcom", "outbound", "D2C" etc.) —
+but keep the SENTENCES simple:
+  - Short sentences. One idea per sentence. Aim ≤ 15 words each.
+  - Plain everyday verbs: "saw", "build", "help", "set up" — not
+    "leverage", "facilitate", "utilize", "spearhead", "orchestrate".
+  - No stacked jargon or buzzword chains (✗ "best-in-class scalable
+    synergy"). Say the thing plainly.
+  - No long wind-up clauses. Get to the point in the first sentence.
+  - Prefer active voice ("we help D2C brands…") over passive
+    ("D2C brands are helped by…").
+  - If a sentence needs to be re-read to be understood, rewrite it.
+A simple message that a busy person grasps in 2 seconds beats a clever
+one. Specificity (the cited fact) stays; complexity goes.
+
+═════════════════════════════════════════════════════════════
 PER-MESSAGE REQUIREMENTS:
 ═════════════════════════════════════════════════════════════
 - connectionNote (max 260 chars): open with a specific reference to their
@@ -407,7 +425,7 @@ Generate the 4 messages following ALL rules above. Cite ONLY from PUBLIC FACTS. 
       temperature: 0.7,
       // CRITICAL: gpt-5.4-mini requires max_completion_tokens, not max_tokens.
       // Using max_tokens silently caps the response → AI returns empty fields
-      // → every message falls back to deterministic template (the bug Kunal
+      // → every message falls back to deterministic template (the bug Samarth
       // hit on 2026-05-16). All other working OpenAI calls in this codebase
       // use max_completion_tokens.
       max_completion_tokens: 1400,

@@ -27,7 +27,7 @@ Read this file at the start of every session. Read `CLAUDE.md` next.
 - Never push to GitHub / re-zip the deployment artifact without explicit deployment approval.
 - Approval is given per-deployment, not per-session. Each deployment needs its own ack.
 - Before asking for deployment approval, you must have run `npx next build` and confirmed clean compile.
-- Bhuvesh reviews code before any production push — flag this in your approval request so the operator can hand off.
+- Samarth reviews and approves every production push directly — there is no separate reviewer or hand-off. Samarth owns and manages everything.
 
 ### A4. Use browser tools for testing
 
@@ -322,7 +322,7 @@ Top X Smart Compile generates identical match-reason text for multiple leads at 
 
 ### J4. Movement signals priority
 
-In `lib/composite-score.js`, movement signals (Hired/Promoted/Exited) are forced to the top of the chatbot card stack. This is Kunal's call from May 16. Don't "fix" it.
+In `lib/composite-score.js`, movement signals (Hired/Promoted/Exited) are forced to the top of the chatbot card stack. This is Samarth's call from May 16. Don't "fix" it.
 
 ### J5. Read-after-write staleness
 

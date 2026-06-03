@@ -14,7 +14,7 @@ SignalScope is the operating system for **Side Kick** — a Mumbai-based B2B out
 - High-scoring signals become **Tasks** (one signal × one lead = one task)
 - Tasks become outreach (LinkedIn via Unipile, email via Smartlead)
 
-Owner: Kunal. All code written by Kunal with Claude. Bhuvesh reviews before Vercel deploy.
+Owner: Samarth. Samarth owns and manages everything — all code, review, approval, and deployment go through Samarth alone. No other people are involved.
 
 ## 2. Tech stack (verified from `package.json`)
 
@@ -158,7 +158,7 @@ All authenticated with `Authorization: Bearer <SIDEKICK_API_KEY>`.
 
 - **`ai-usage.js`** — Per-campaign OpenAI/Anthropic spend tracking. Pricing table for `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-nano`, `gpt-5.4-pro`, `gpt-5`, etc.
 - **`company-match.js`** — Pure string normalization for company names. **No AI** (explicitly avoided — prevents hallucinated matches).
-- **`composite-score.js`** — Lead ranking for chatbot auto-batch. Movement signals forced to top (Kunal's call May 16).
+- **`composite-score.js`** — Lead ranking for chatbot auto-batch. Movement signals forced to top (Samarth's call May 16).
 - **`constants.js`** — Scoring constants (`EASE_SCORE`, `STRENGTH_SCORE`), Task Rule source options
 - **`google-news-decoder.js`** — Decodes obfuscated `news.google.com` URLs (v2 per-article fetch)
 - **`lead-brief.js`** — Builds a structured `brief` from a Lead + relevant Tasks. **`briefToPromptBlock` is the key function** — splits data into PUBLIC FACTS (citable) and INTERNAL CONTEXT (DO NOT CITE), used by auto-batch and personalization
@@ -337,7 +337,7 @@ zip -rq /mnt/user-data/outputs/signalscope-vercel.zip . \
   -x "node_modules/*" ".next/*" ".git/*" "package-lock.json"
 ```
 
-Deploy path: zip → Bhuvesh uploads to GitHub via "Add files via upload" → Vercel auto-deploys on push to main.
+Deploy path: push to main (or zip → upload via "Add files via upload") → Vercel auto-deploys. Samarth owns and approves every deploy.
 
 ## 17. Operator conventions
 

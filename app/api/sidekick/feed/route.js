@@ -69,14 +69,14 @@ function formatCard(record) {
 
 // Filter formula:
 //   1. Handled At must be empty (pending)
-//   2. LinkedIn URL must NOT be empty — per Kunal, the chatbot only shows
+//   2. LinkedIn URL must NOT be empty — per Samarth, the chatbot only shows
 //      tasks where the lead has a LinkedIn URL, so the operator always has
 //      a path to action. Tasks for leads missing this field stay in Airtable
 //      (for re-enrichment / manual fix) but don't appear in the chatbot.
 //   3. AND: either the task is NOT one of the time-sensitive types
 //      (engagement = GA, linkedin_engagement = LinkedIn Posts, lead_movement = RapidAPI movement),
 //      OR Created within last 7 days.
-//   Per Kunal: GA, LinkedIn engagement, and movement-detected signals all
+//   Per Samarth: GA, LinkedIn engagement, and movement-detected signals all
 //   go stale after a week. Top X and Unipile triggers stay regardless.
 //
 //   FIND("engagement", {Task Type}) matches BOTH "engagement" (GA) and
