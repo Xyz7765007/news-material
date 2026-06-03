@@ -1002,8 +1002,11 @@ async function runLinkedInPostScan({
     days_back: daysBack,
     task_rule_name: taskRuleName,
     system_prompt_override: systemPromptOverride || null,
-    // Preserve the original leadIds (if user scanned a subset) so resume stays scoped to same set
-    original_lead_ids: prior?.original_lead_ids || (leadIds || null),
+    // Persist the scan's lead scope. On a FRESH scan (resume=false) use THIS run's leadIds —
+    // a new scoped run must NOT inherit a previous completed scan's scope (that hijacks it back
+    // onto the old lead set). On resume, preserve the original scope so cron-triggered resumes
+    // (which pass no leadIds) stay scoped to the same subset.
+    original_lead_ids: resume ? (prior?.original_lead_ids || null) : (leadIds || null),
     last_log: "Scan started",
   };
   await writeProgress(campaignAirtableId, progress);
