@@ -155,8 +155,9 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   // Signal Review tab — archive rows (unqualified + duplicates) lazy-loaded on open.
   const [archiveRecs, setArchiveRecs] = useState(null); // null = not loaded yet
   const [archiveLoading, setArchiveLoading] = useState(false);
-  const [srFilter, setSrFilter] = useState({ status: "all", account: "all", rule: "all", type: "all", days: "7", q: "" });
+  const [srFilter, setSrFilter] = useState({ status: "all", account: "all", rule: "all", type: "all", days: "7", q: "", role: "all", person: "all", group: "none" });
   const [srPurging, setSrPurging] = useState(false);
+  const [srVerifying, setSrVerifying] = useState(false); // role-freshness check in progress
   // AI usage stats — populated from the campaign record after each load.
   // Used to display per-client OpenAI cost on the dashboard for billing transparency.
   // Hidden in clientMode (admin-only billing data).
@@ -3020,32 +3021,61 @@ Output format (strict JSON, no markdown):
     // Unify two sources into one reviewable shape:
     //   • live Tasks (the signal pipeline — excludes Top X lead-scoring) = "qualified"
     //   • Signal Archive rows = "unqualified" | "duplicate"
-    const normRow=(t,status)=>{const f=t.fields||{};return{id:t.id,company:f.Company||"",rule:f["Task Rule"]||"",type:f["Task Type"]||"news",score:Number(f.Score)||0,status,reason:f["Score Reason"]||"",signal:f.Signal||"",url:f.URL||"",source:f.Source||"",date:f.Date||"",created:f.Created||"",leadTitle:f["Lead Title"]||"",target:f["Scan Target"]||"accounts",dupOf:f["Dup Of"]||""};};
+    const F=k=>srFilter[k]??"all"; // tolerate older state shapes missing newer keys
+    const normRow=(t,status)=>{const f=t.fields||{};return{id:t.id,company:f.Company||"",rule:f["Task Rule"]||"",type:f["Task Type"]||"news",score:Number(f.Score)||0,status,reason:f["Score Reason"]||"",signal:f.Signal||"",url:f.URL||"",source:f.Source||"",date:f.Date||"",created:f.Created||"",leadTitle:f["Lead Title"]||"",target:f["Scan Target"]||"accounts",dupOf:f["Dup Of"]||"",name:f.Name||"",linkedinUrl:f["LinkedIn URL"]||"",roleStatus:(f["Role Status"]||"").toLowerCase(),roleNote:f["Role Check Note"]||"",roleCheckedAt:f["Role Checked At"]||"",assignedTo:f["Assigned To"]||""};};
     const srQualified=tasks.filter(t=>((t.fields||{})["Task Type"]||"news")!=="top_x").map(t=>normRow(t,"qualified"));
     const srArchive=(archiveRecs||[]).map(t=>normRow(t,((t.fields||{})["Signal Status"]||"unqualified").toLowerCase()));
     const srAll=[...srQualified,...srArchive];
     const srAccounts=[...new Set(srAll.map(r=>r.company).filter(Boolean))].sort();
     const srRules=[...new Set(srAll.map(r=>r.rule).filter(Boolean))].sort();
     const srTypes=[...new Set(srAll.map(r=>r.type).filter(Boolean))].sort();
-    const now=Date.now();const winMs=srFilter.days==="all"?Infinity:Number(srFilter.days)*86400000;
+    const srPeople=[...new Set(srAll.map(r=>r.assignedTo).filter(Boolean))].sort();
+    const now=Date.now();const winMs=F("days")==="all"?Infinity:Number(F("days"))*86400000;
     const inWindow=r=>{if(winMs===Infinity)return true;const t=new Date(r.created||r.date).getTime();return !Number.isFinite(t)||(now-t)<=winMs;};
     // "scoped" = all filters EXCEPT status (so the status pills show contextual counts)
-    const scoped=srAll.filter(r=>(srFilter.account==="all"||r.company===srFilter.account)&&(srFilter.rule==="all"||r.rule===srFilter.rule)&&(srFilter.type==="all"||r.type===srFilter.type)&&inWindow(r)&&(!srFilter.q||(r.company+" "+r.rule+" "+r.signal+" "+r.reason+" "+r.leadTitle).toLowerCase().includes(srFilter.q.toLowerCase())));
+    const scoped=srAll.filter(r=>(F("account")==="all"||r.company===F("account"))&&(F("rule")==="all"||r.rule===F("rule"))&&(F("type")==="all"||r.type===F("type"))&&(F("role")==="all"||(r.roleStatus||"none")===F("role"))&&(F("person")==="all"||r.assignedTo===F("person"))&&inWindow(r)&&(!srFilter.q||(r.company+" "+r.rule+" "+r.signal+" "+r.reason+" "+r.leadTitle+" "+r.name+" "+r.assignedTo).toLowerCase().includes(srFilter.q.toLowerCase())));
     const cnt=s=>s==="all"?scoped.length:scoped.filter(r=>r.status===s).length;
-    const rows=scoped.filter(r=>srFilter.status==="all"||r.status===srFilter.status).sort((a,b)=>new Date(b.created||b.date)-new Date(a.created||a.date));
+    const rows=scoped.filter(r=>F("status")==="all"||r.status===F("status")).sort((a,b)=>new Date(b.created||b.date)-new Date(a.created||a.date));
     const STA={qualified:{bg:"var(--grn-d)",fg:"var(--grn)",lbl:"Qualified"},unqualified:{bg:"rgba(245,158,11,.15)",fg:"var(--amb)",lbl:"Unqualified"},duplicate:{bg:"var(--hover)",fg:"var(--t2)",lbl:"Duplicate"}};
+    // Role-freshness badge map: status stamped by /api/role-check.
+    const ROLE={verified:{t:"✅ in role",c:"var(--grn)"},changed:{t:"⚠ title changed",c:"var(--amb)"},stale:{t:"⛔ left role",c:"var(--red)"},unverified:{t:"❔ unverified",c:"var(--t3)"},unknown:{t:"— no URL",c:"var(--t3)"}};
+    const staleCount=scoped.filter(r=>r.roleStatus==="stale"||r.roleStatus==="changed").length;
     const promote=async r=>{if(!confirm(`Promote this unqualified signal (score ${r.score}) to a live Task?\n\n${r.signal}`))return;const nt={Company:r.company,"Task Rule":r.rule,Score:r.score,"Score Reason":r.reason,"Scan Target":r.target,Signal:r.signal,Source:r.source,URL:r.url,"Task Type":r.type,Date:r.date,Created:new Date().toISOString()};try{const res=await at("create","Tasks",{records:[nt]},bid);setTasks(p=>[...(res.records||[]),...p]);await at("delete","Signal Archive",{recordIds:[r.id]},bid);setArchiveRecs(p=>(p||[]).filter(x=>x.id!==r.id));}catch(e){alert("Promote failed: "+e.message);}};
+    const assign=async r=>{const who=prompt(`Route "${(r.name||r.signal||"").slice(0,48)}" to which person? (e.g. Jonathan, Chris — blank to unassign)`,r.assignedTo||"");if(who===null)return;const v=who.trim();try{await at("update","Tasks",{records:[{id:r.id,fields:{"Assigned To":v}}]},bid);setTasks(p=>p.map(t=>t.id===r.id?{...t,fields:{...t.fields,"Assigned To":v}}:t));}catch(e){alert("Assign failed: "+e.message);}};
+    // Role-freshness verification — runs only on the lead-level LinkedIn signals
+    // currently in view (Kunal: few signals go out, cheap to check). Isolated
+    // /api/role-check endpoint stamps Role Status back onto each Task.
+    const verifyRoles=async()=>{
+      const targets=rows.filter(r=>r.type==="linkedin_engagement"&&r.linkedinUrl&&r.status==="qualified");
+      if(!targets.length){alert("No lead-level LinkedIn signals with a profile URL in the current view to verify.");return;}
+      const items=targets.slice(0,25).map(r=>({taskId:r.id,linkedinUrl:r.linkedinUrl,storedTitle:r.leadTitle,storedCompany:r.company}));
+      if(!confirm(`Verify current role for ${items.length} lead${items.length===1?"":"s"} against live LinkedIn?\n\nUses RapidAPI credits. Stale / changed roles get flagged so you don't send "engage with this CMO" to someone who left.`))return;
+      try{setSrVerifying(true);
+        const res=await fetch("/api/role-check",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({baseId:bid,items,stamp:true,maxChecks:25})});
+        const d=await res.json();
+        if(!res.ok||d.error){alert("Role check failed: "+(d.error||("HTTP "+res.status)));setSrVerifying(false);return;}
+        const byId={};for(const x of(d.results||[]))if(x.taskId)byId[x.taskId]=x;
+        setTasks(p=>p.map(t=>byId[t.id]?{...t,fields:{...t.fields,"Role Status":byId[t.id].status,"Role Check Note":byId[t.id].reason,"Role Checked At":d.checkedAt}}:t));
+        const s=d.summary||{};alert(`Role check done (${d.checked}/${d.requested}):\n✅ in role: ${s.verified||0}\n⚠ title changed: ${s.changed||0}\n⛔ left role: ${s.stale||0}\n❔ unverified: ${s.unverified||0}${s.unknown?`\n— no URL: ${s.unknown}`:""}`);
+      }catch(e){alert("Role check error: "+e.message);}
+      setSrVerifying(false);
+    };
+    // Group-by rollup — answers "what are we tracking / what came in per account / lead-owner / rule / type".
+    const gk=F("group");
+    const groupOf=r=>gk==="account"?(r.company||"(none)"):gk==="person"?(r.assignedTo||"(unassigned)"):gk==="rule"?(r.rule||"(none)"):gk==="type"?(r.type||"news"):null;
+    const groups=gk==="none"?null:Object.entries(scoped.reduce((m,r)=>{const k=groupOf(r);const g=m[k]||(m[k]={q:0,u:0,d:0,t:0});if(r.status==="qualified")g.q++;else if(r.status==="unqualified")g.u++;else if(r.status==="duplicate")g.d++;g.t++;return m;},{})).sort((a,b)=>b[1].t-a[1].t);
     const archiveAbsent=archiveRecs!==null&&archiveRecs.length===0;
     return(<div>
-      <div className="ph"><div><div className="pt">🔎 Signal Review</div><div className="pd">Everything the scan caught — qualified, disqualified, and de-duplicated — in one place. Clients never see this surface.</div></div>
+      <div className="ph"><div><div className="pt">🔎 Signal Review</div><div className="pd">Everything the scan caught — qualified, disqualified, de-duplicated, role-checked, and routed — in one place. Clients never see this surface.</div></div>
       <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+        <button className="btn btn-s btn-p" onClick={verifyRoles} disabled={srVerifying} title="Check that lead-level LinkedIn signals in view are still in the role we think — flags 'no longer CMO' before an SDR engages">{srVerifying?"⏳ Verifying…":"🛡 Verify roles"}</button>
         <button className="btn btn-s" onClick={loadSignalArchive} disabled={archiveLoading}>{archiveLoading?"⏳ Loading…":"↻ Refresh"}</button>
         <button className="btn btn-s btn-d" onClick={purgeOldArchive} disabled={srPurging||!archiveRecs?.length} title={`Delete archived signals older than ${ARCHIVE_RETAIN_DAYS} days`}>{srPurging?"⏳":`🧹 Clear >${ARCHIVE_RETAIN_DAYS}d`}</button>
       </div></div>
 
       {/* Cross-map summary — answers "what are we tracking, what came in" at a glance */}
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:10,marginBottom:14}}>
-        {[{k:"Accounts in view",v:[...new Set(scoped.map(r=>r.company).filter(Boolean))].length},{k:"Rules firing",v:[...new Set(scoped.map(r=>r.rule).filter(Boolean))].length},{k:"Qualified",v:cnt("qualified"),c:"var(--grn)"},{k:"Unqualified",v:cnt("unqualified"),c:"var(--amb)"},{k:"Duplicates",v:cnt("duplicate"),c:"var(--t2)"}].map(s=>(
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10,marginBottom:14}}>
+        {[{k:"Accounts in view",v:[...new Set(scoped.map(r=>r.company).filter(Boolean))].length},{k:"Rules firing",v:[...new Set(scoped.map(r=>r.rule).filter(Boolean))].length},{k:"Qualified",v:cnt("qualified"),c:"var(--grn)"},{k:"Unqualified",v:cnt("unqualified"),c:"var(--amb)"},{k:"Duplicates",v:cnt("duplicate"),c:"var(--t2)"},{k:"Stale / changed roles",v:staleCount,c:staleCount?"var(--red)":"var(--t2)"}].map(s=>(
           <div key={s.k} style={{padding:"10px 14px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10}}><div style={{fontSize:22,fontWeight:600,color:s.c||"var(--t1)",fontFamily:"'JetBrains Mono',monospace"}}>{s.v}</div><div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>{s.k}</div></div>
         ))}
       </div>
@@ -3053,30 +3083,44 @@ Output format (strict JSON, no markdown):
       {/* Status pills */}
       <div className="fb">
         {[{v:"all",l:"All"},{v:"qualified",l:"Qualified"},{v:"unqualified",l:"Unqualified"},{v:"duplicate",l:"Duplicates"}].map(p=>(
-          <button key={p.v} className="btn btn-s" style={{fontSize:11,background:srFilter.status===p.v?"var(--acc-d)":"var(--card)",color:srFilter.status===p.v?"var(--acc)":"var(--t2)",borderColor:srFilter.status===p.v?"var(--acc)":"var(--bdr)"}} onClick={()=>setSrFilter(f=>({...f,status:p.v}))}>{p.l} <span style={{opacity:.7,marginLeft:4,fontFamily:"'JetBrains Mono',monospace"}}>{cnt(p.v)}</span></button>
+          <button key={p.v} className="btn btn-s" style={{fontSize:11,background:F("status")===p.v?"var(--acc-d)":"var(--card)",color:F("status")===p.v?"var(--acc)":"var(--t2)",borderColor:F("status")===p.v?"var(--acc)":"var(--bdr)"}} onClick={()=>setSrFilter(f=>({...f,status:p.v}))}>{p.l} <span style={{opacity:.7,marginLeft:4,fontFamily:"'JetBrains Mono',monospace"}}>{cnt(p.v)}</span></button>
         ))}
       </div>
 
       {/* Cross-map filters */}
       <div className="fb">
-        <input className="inp" placeholder="Search signal, company, person, reason…" value={srFilter.q} onChange={e=>setSrFilter(f=>({...f,q:e.target.value}))} style={{maxWidth:260}}/>
-        <select className="inp" style={{width:160}} value={srFilter.account} onChange={e=>setSrFilter(f=>({...f,account:e.target.value}))}><option value="all">All Accounts</option>{srAccounts.map(a=><option key={a} value={a}>{a}</option>)}</select>
-        <select className="inp" style={{width:170}} value={srFilter.rule} onChange={e=>setSrFilter(f=>({...f,rule:e.target.value}))}><option value="all">All Rules</option>{srRules.map(r=><option key={r} value={r}>{r}</option>)}</select>
-        <select className="inp" style={{width:130}} value={srFilter.type} onChange={e=>setSrFilter(f=>({...f,type:e.target.value}))}><option value="all">All Types</option>{srTypes.map(t=><option key={t} value={t}>{t.replace(/_/g," ")}</option>)}</select>
-        <select className="inp" style={{width:120}} value={srFilter.days} onChange={e=>setSrFilter(f=>({...f,days:e.target.value}))}><option value="1">24h</option><option value="7">7 days</option><option value="14">14 days</option><option value="30">30 days</option><option value="all">All time</option></select>
+        <input className="inp" placeholder="Search signal, company, person, owner, reason…" value={srFilter.q} onChange={e=>setSrFilter(f=>({...f,q:e.target.value}))} style={{maxWidth:240}}/>
+        <select className="inp" style={{width:150}} value={F("account")} onChange={e=>setSrFilter(f=>({...f,account:e.target.value}))}><option value="all">All Accounts</option>{srAccounts.map(a=><option key={a} value={a}>{a}</option>)}</select>
+        <select className="inp" style={{width:160}} value={F("rule")} onChange={e=>setSrFilter(f=>({...f,rule:e.target.value}))}><option value="all">All Rules</option>{srRules.map(r=><option key={r} value={r}>{r}</option>)}</select>
+        <select className="inp" style={{width:120}} value={F("type")} onChange={e=>setSrFilter(f=>({...f,type:e.target.value}))}><option value="all">All Types</option>{srTypes.map(t=><option key={t} value={t}>{t.replace(/_/g," ")}</option>)}</select>
+        <select className="inp" style={{width:130}} value={F("role")} onChange={e=>setSrFilter(f=>({...f,role:e.target.value}))} title="Role-freshness status"><option value="all">Any role status</option><option value="verified">✅ In role</option><option value="changed">⚠ Title changed</option><option value="stale">⛔ Left role</option><option value="unverified">❔ Unverified</option><option value="none">· Not checked</option></select>
+        <select className="inp" style={{width:130}} value={F("person")} onChange={e=>setSrFilter(f=>({...f,person:e.target.value}))} title="Routed to (Assigned To)"><option value="all">Any owner</option>{srPeople.map(p=><option key={p} value={p}>{p}</option>)}</select>
+        <select className="inp" style={{width:110}} value={F("days")} onChange={e=>setSrFilter(f=>({...f,days:e.target.value}))}><option value="1">24h</option><option value="7">7 days</option><option value="14">14 days</option><option value="30">30 days</option><option value="all">All time</option></select>
+        <select className="inp" style={{width:130}} value={gk} onChange={e=>setSrFilter(f=>({...f,group:e.target.value}))} title="Group the view"><option value="none">Flat list</option><option value="account">Group: Account</option><option value="person">Group: Owner</option><option value="rule">Group: Rule</option><option value="type">Group: Type</option></select>
       </div>
 
       {archiveRecs===null?<div className="empty"><div className="em">🔎</div><p>Loading signal archive…</p></div>:
+       gk!=="none"?(groups.length===0?<div className="empty"><div className="em">📊</div><p>Nothing in view to group.</p></div>:
+        <div className="tw"><table><thead><tr><th>{gk==="person"?"Owner":gk[0].toUpperCase()+gk.slice(1)}</th><th>Qualified</th><th>Unqualified</th><th>Duplicate</th><th>Total</th></tr></thead>
+        <tbody>{groups.map(([k,g])=>(<tr key={k} style={{cursor:gk==="account"||gk==="person"||gk==="rule"||gk==="type"?"pointer":"default"}} onClick={()=>{const m={account:"account",person:"person",rule:"rule",type:"type"};const fk=m[gk];if(fk)setSrFilter(f=>({...f,[fk]:k==="(unassigned)"||k==="(none)"?"all":k,group:"none"}));}} title="Click to drill into this group">
+          <td style={{color:"var(--t1)",fontWeight:500}}>{k}</td>
+          <td style={{color:"var(--grn)",fontFamily:"'JetBrains Mono',monospace"}}>{g.q||""}</td>
+          <td style={{color:"var(--amb)",fontFamily:"'JetBrains Mono',monospace"}}>{g.u||""}</td>
+          <td style={{color:"var(--t3)",fontFamily:"'JetBrains Mono',monospace"}}>{g.d||""}</td>
+          <td style={{color:"var(--t1)",fontWeight:600,fontFamily:"'JetBrains Mono',monospace"}}>{g.t}</td>
+        </tr>))}</tbody></table><div style={{fontSize:10,color:"var(--t3)",padding:"8px 4px"}}>{groups.length} group{groups.length===1?"":"s"} · click a row to drill in</div></div>):
        rows.length===0?<div className="empty"><div className="em">🔎</div><p>{srAll.length===0?"No signals yet — run a scan from the Tasks tab.":"No signals match these filters."}</p>{archiveAbsent&&<div style={{fontSize:10,color:"var(--t3)",marginTop:8,maxWidth:440,textAlign:"center",lineHeight:1.5}}>Unqualified + duplicate retention turns on after the Signal Archive table is provisioned and the next scan runs. Qualified Tasks show here regardless.</div>}</div>:
       <div className="tw"><table><thead><tr>
-        <th>Status</th><th>Company</th><th>Person / Rule</th><th>Score</th><th>Type</th><th>Signal</th><th>Date</th><th>Link</th><th></th>
-      </tr></thead><tbody>{rows.slice(0,400).map((r,i)=>{const st=STA[r.status]||STA.unqualified;return(<tr key={r.id+i}>
+        <th>Status</th><th>Company</th><th>Person / Rule</th><th>Role</th><th>Score</th><th>Type</th><th>Signal</th><th>Owner</th><th>Date</th><th>Link</th><th></th>
+      </tr></thead><tbody>{rows.slice(0,400).map((r,i)=>{const st=STA[r.status]||STA.unqualified;const rl=r.roleStatus&&ROLE[r.roleStatus];return(<tr key={r.id+i}>
         <td><span className="chip" style={{background:st.bg,color:st.fg}}>{st.lbl}</span></td>
         <td style={{color:"var(--t1)",fontWeight:500}}>{r.company}</td>
-        <td style={{maxWidth:180}}><div style={{fontSize:11,color:"var(--t1)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.leadTitle||"—"}</div><div style={{fontSize:9,color:"var(--t3)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.rule}</div></td>
-        <td><div className="sb" style={{width:74}} title={r.reason?`AI reason: ${r.reason}`:""}><div className="st"><div className="sf" style={{width:r.score+"%",background:r.score>=80?"var(--grn)":r.score>=60?"var(--amb)":"var(--red)"}}/></div><span className="sv" style={{color:r.score>=80?"var(--grn)":r.score>=60?"var(--amb)":"var(--red)"}}>{r.score}</span></div></td>
+        <td style={{maxWidth:170}}><div style={{fontSize:11,color:"var(--t1)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.name||r.leadTitle||"—"}</div><div style={{fontSize:9,color:"var(--t3)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.leadTitle&&r.name?r.leadTitle+" · ":""}{r.rule}</div></td>
+        <td style={{whiteSpace:"nowrap"}}>{r.type==="linkedin_engagement"?(rl?<span style={{fontSize:9,color:rl.c}} title={r.roleNote||""}>{rl.t}</span>:<span style={{fontSize:9,color:"var(--t3)"}}>·</span>):<span style={{fontSize:9,color:"var(--t3)"}}>—</span>}</td>
+        <td><div className="sb" style={{width:68}} title={r.reason?`AI reason: ${r.reason}`:""}><div className="st"><div className="sf" style={{width:r.score+"%",background:r.score>=80?"var(--grn)":r.score>=60?"var(--amb)":"var(--red)"}}/></div><span className="sv" style={{color:r.score>=80?"var(--grn)":r.score>=60?"var(--amb)":"var(--red)"}}>{r.score}</span></div></td>
         <td><span className={"chip "+(r.type==="job_post"?"cb":r.type==="top_x"?"cp":"cg")}>{(r.type||"news").replace(/_/g," ").toUpperCase()}</span></td>
-        <td style={{maxWidth:240,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={r.signal+(r.reason?"\n\n💡 "+r.reason:"")+(r.dupOf?"\n\n↔ Dup of: "+r.dupOf:"")}>{r.signal}</td>
+        <td style={{maxWidth:230,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={r.signal+(r.reason?"\n\n💡 "+r.reason:"")+(r.dupOf?"\n\n↔ Dup of: "+r.dupOf:"")+(r.roleNote?"\n\n🛡 "+r.roleNote:"")}>{r.signal}</td>
+        <td style={{whiteSpace:"nowrap"}}>{r.status==="qualified"?<button className="btn btn-s" style={{fontSize:9,padding:"3px 7px"}} title="Route this signal to a person" onClick={()=>assign(r)}>{r.assignedTo?`👤 ${r.assignedTo}`:"＋ assign"}</button>:r.assignedTo?<span style={{fontSize:9,color:"var(--t3)"}}>{r.assignedTo}</span>:"—"}</td>
         <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10}}>{(r.date||r.created||"").slice(0,10)}</td>
         <td>{r.url?<a href={r.url} target="_blank" rel="noopener" style={{color:"var(--blu)",fontSize:10}}>↗</a>:"—"}</td>
         <td style={{whiteSpace:"nowrap"}}>{r.status==="unqualified"&&<button className="btn btn-s" style={{fontSize:9,padding:"3px 7px",color:"var(--grn)",borderColor:"rgba(93,168,122,.3)"}} title="Promote to a live Task" onClick={()=>promote(r)}>▲ Promote</button>}{r.status!=="qualified"&&<button className="btn btn-d btn-s" style={{marginLeft:4}} title="Delete from archive" onClick={()=>del("Signal Archive",[r.id],setArchiveRecs)}><I.Trash/></button>}</td>

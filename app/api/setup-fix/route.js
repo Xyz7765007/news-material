@@ -209,6 +209,15 @@ const CAMPAIGN_TABLES = {
     { name: "Handled At", type: "dateTime", options: TZ_ISO },
     { name: "Handled As", type: "singleSelect", options: { choices: [{ name: "done" }, { name: "skip" }] } },
     { name: "Handled Notes", type: "multilineText" },
+    // ─── Signal Review: role-freshness + routing ───────────────
+    // Role Status is stamped by /api/role-check so a lead-level signal carries
+    // proof the person still holds the role before an SDR engages (2026-06-04
+    // Material review). Assigned To routes a signal to a named person
+    // (Jonathan / Chris / …) — the app's in-app assignment dimension.
+    { name: "Role Status", type: "singleSelect", options: { choices: [{ name: "verified" }, { name: "changed" }, { name: "stale" }, { name: "unverified" }, { name: "unknown" }] } },
+    { name: "Role Checked At", type: "dateTime", options: TZ_ISO },
+    { name: "Role Check Note", type: "multilineText" },
+    { name: "Assigned To", type: "singleLineText" },
   ],
 
   // ─── Signal Archive — retained-but-not-actioned signals ────────
