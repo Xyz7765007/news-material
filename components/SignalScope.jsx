@@ -1633,6 +1633,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     const ruleMatches = (tt) => {
       if (mode === "news") return tt === "news" || tt === "both";
       if (mode === "jobs") return tt === "job_post" || tt === "both";
+      if (mode === "company_posts") return tt === "company_post"; // explicit-only, not bundled into "all"
       return tt === "news" || tt === "job_post" || tt === "both";
     };
     const sigRules=rules.filter(r=>ruleMatches((r.fields||{})["Task Type"]||"news"));
@@ -1645,6 +1646,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     const companies=accounts.map(a=>{const f=a.fields||{};const li=f["LinkedIn URL"]||f.LinkedIn||"";return{name:f.Name||f.Company||"",domain:f.Domain||f.Website||"",linkedinSlug:extractLinkedInSlug(li),linkedinCompanyId:extractLinkedInId(li)}}).filter(c=>c.name);
     const nT=taskDefs.filter(t=>t.taskType==="news"||t.taskType==="both");
     const jT=taskDefs.filter(t=>t.taskType==="job_post"||t.taskType==="both");
+    const cT=taskDefs.filter(t=>t.taskType==="company_post"); // account-level LinkedIn company posts
     const total=companies.length;
     // Progress allocation: if running a single mode, that mode gets the full 0-90% range.
     // If running "all", news is 0-50% and jobs is 50-90% (legacy split).
@@ -1659,6 +1661,10 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     // ── JOBS phase ──
     if(scanRef.current&&mode!=="news"&&jT.length>0){const need=companies.filter(c=>c.linkedinSlug&&!c.linkedinCompanyId);if(need.length>0){setScanText("🔗 Resolving LinkedIn IDs...");try{const res=await fetch("/api/resolve-linkedin",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({slugs:need.map(c=>c.linkedinSlug)})});if(res.ok){const{ids}=await res.json();for(const c of companies){if(c.linkedinSlug&&!c.linkedinCompanyId&&ids[c.linkedinSlug.toLowerCase()])c.linkedinCompanyId=ids[c.linkedinSlug.toLowerCase()]}}}catch(e){console.error(e)}}
     const BS=5;for(let b=0;b<companies.length;b+=BS){if(!scanRef.current)break;const batch=companies.slice(b,b+BS);setScanText("📋 Jobs — Batch "+(Math.floor(b/BS)+1));setScanProg(jobsBase+Math.round(b/companies.length*jobsRange));try{const res=await fetch("/api/scan",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({companies:batch,taskDefs:jT,mode:"jobs-batch",threshold,campaignId:camp?.airtableId})});if(res.ok){const d=await res.json();for(const result of(d.results||[])){const co=batch.find(c=>c.name===result.company);if(co)bufferSignals(result.signals||[],co,taskDefs)}}}catch(e){console.error(e)}await sleep(200)}}
+    // ── COMPANY POSTS phase (account-level LinkedIn page posts) ──
+    // Explicit mode only. Batches of 5 companies → /api/company-posts → bufferSignals
+    // (qualified → Tasks, retain band → Signal Archive — same retention as news/jobs).
+    if(scanRef.current&&mode==="company_posts"&&cT.length>0){const BS=5;for(let b=0;b<companies.length;b+=BS){if(!scanRef.current)break;const batch=companies.slice(b,b+BS);setScanText("📣 Company Posts — Batch "+(Math.floor(b/BS)+1));setScanProg(Math.round(b/companies.length*90));try{const res=await fetch("/api/company-posts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({companies:batch,taskDefs:cT,threshold,campaignId:camp?.airtableId})});if(res.ok){const d=await res.json();for(const result of(d.results||[])){const co=batch.find(c=>c.name===result.company);if(co)bufferSignals(result.signals||[],co,taskDefs)}}else{console.error(`[Scan] company-posts batch failed: HTTP ${res.status}`)}}catch(e){console.error(e)}await sleep(200)}}
 
     // ─── Post-scan: AI dedup + save ───────────────────────────
     const buffered = scanBufferRef.current;
@@ -1853,10 +1859,11 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   </>)}
 
   // ═══ DASHBOARD ═════════════════════════════════════════════
-  const signalRules = rules.filter(r => { const tt = (r.fields||{})["Task Type"]; return !tt || tt==="news" || tt==="job_post" || tt==="both"; });
+  const signalRules = rules.filter(r => { const tt = (r.fields||{})["Task Type"]; return !tt || tt==="news" || tt==="job_post" || tt==="both" || tt==="company_post"; });
   // Per-mode counts for the split scan buttons. "both" rules count toward BOTH news and jobs.
   const newsRuleCount = signalRules.filter(r => { const tt=(r.fields||{})["Task Type"]||"news"; return tt==="news"||tt==="both"; }).length;
   const jobsRuleCount = signalRules.filter(r => { const tt=(r.fields||{})["Task Type"]||"news"; return tt==="job_post"||tt==="both"; }).length;
+  const companyPostRuleCount = signalRules.filter(r => ((r.fields||{})["Task Type"]||"news")==="company_post").length;
   const topXRules = rules.filter(r => (r.fields||{})["Task Type"] === "top_x");
 
   // Admin-only tabs hidden from clientMode. These either expose master-base data
@@ -2778,6 +2785,9 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       {!clientMode&&signalRules.filter(r=>{const tt=(r.fields||{})["Task Type"];return tt==="job_post"||tt==="both"}).length===0&&(
         <button className="btn btn-s btn-ai" style={{marginTop:10}} onClick={()=>setEditRule({taskType:"job_post",sources:["Job Posts"]})}><I.Plus/> Create Job Post Rule</button>
       )}
+      {!clientMode&&(
+        <button className="btn btn-s btn-ai" style={{marginTop:10,marginLeft:8}} title="Watch each account's own LinkedIn company-page posts (product launches, exec announcements, campaigns) — runs via the 📣 Company Posts scan button on the Tasks tab" onClick={()=>setEditRule({taskType:"company_post",sources:["Social"],scanTarget:"accounts"})}><I.Plus/> Create Company Post Rule</button>
+      )}
     </div>)}
 
     {(hasTopX||rules.length===0||configFeatures.includes("top_x"))&&(
@@ -2972,6 +2982,7 @@ Output format (strict JSON, no markdown):
       {hasSignals&&!clientMode&&<>
         <button className="btn btn-p btn-s" onClick={()=>startScan("news")} disabled={scanning||!accounts.length||!newsRuleCount} title={!newsRuleCount?"No news or both-type rules":`Scan ${newsRuleCount} news rule${newsRuleCount===1?"":"s"}`}>{scanning?"Scanning "+Math.round(scanProg)+"%":<>📰 News</>}</button>
         <button className="btn btn-p btn-s" onClick={()=>startScan("jobs")} disabled={scanning||!accounts.length||!jobsRuleCount} title={!jobsRuleCount?"No job_post or both-type rules":`Scan ${jobsRuleCount} jobs rule${jobsRuleCount===1?"":"s"}`}>{scanning?"Scanning "+Math.round(scanProg)+"%":<>📋 Jobs</>}</button>
+        {companyPostRuleCount>0&&<button className="btn btn-p btn-s" onClick={()=>startScan("company_posts")} disabled={scanning||!accounts.length} title={`Scan ${companyPostRuleCount} company-post rule${companyPostRuleCount===1?"":"s"} across all accounts' LinkedIn pages`}>{scanning?"Scanning "+Math.round(scanProg)+"%":<>📣 Company Posts</>}</button>}
       </>}
     </div></div>
     {scanning&&<div className="scan-s"><div className="scan-d"/><span style={{fontSize:12,flex:1}}>{scanText}</span><span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:11,color:"var(--acc)"}}>{Math.round(scanProg)}%</span>{hasSignals&&<button className="btn btn-d btn-s" onClick={()=>{scanRef.current=false;setScanning(false)}}>Stop</button>}</div>}
@@ -8352,6 +8363,10 @@ function RuleEditor({rule,onSave,onClose,availableFields,baseId}){
       onSave({...f, taskType: "linkedin_outreach", outreachConfig: oc});
     } else if (mode === "top_x") {
       onSave({...f, taskType: "top_x"});
+    } else if (f.taskType === "company_post") {
+      // Account-level LinkedIn company-page posts — preserve explicitly; do NOT
+      // let source-checkbox derivation coerce it to news/job_post.
+      onSave({...f, taskType: "company_post"});
     } else {
       const hJP = f.sources.includes("Job Posts");
       const hN = f.sources.some(s => ["News","New Hires","Social","Exits / Promotions","Custom","Earnings","SEC Filings"].includes(s));

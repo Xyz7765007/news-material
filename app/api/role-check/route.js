@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { fetchLinkedInProfile } from "@/lib/linkedin-fetch";
+import { checkRoleFreshness } from "@/lib/role-freshness";
 
 // ─── Role-freshness check ─────────────────────────────────────────
 // Isolated, on-demand verification that a tracked lead STILL holds the role
@@ -30,55 +30,6 @@ export const fetchCache = "force-no-store";
 
 const AT_API = "https://api.airtable.com/v0";
 const AIRTABLE_KEY = process.env.AIRTABLE_API_KEY;
-
-const norm = (s) => (s || "").toLowerCase().normalize("NFKD").replace(/[̀-ͯ]/g, "").replace(/[^a-z0-9]/g, "");
-function companyMatch(a, b) {
-  const x = norm(a), y = norm(b);
-  if (!x || !y) return false;
-  return x === y || x.includes(y) || y.includes(x);
-}
-// Meaningful tokens of a job title — drop filler + generic seniority words so
-// "VP, Marketing" vs "Vice President Marketing" still matches, but "VP Marketing"
-// vs "VP Sales" does not.
-const TITLE_FILLER = new Set(["the", "and", "for", "of", "global", "senior", "snr", "sr", "junior", "jr", "lead", "head", "vp", "svp", "evp", "vice", "president", "chief", "officer", "director", "manager", "interim", "acting", "group", "regional", "international"]);
-function titleTokens(t) {
-  return (t || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(w => w.length > 2 && !TITLE_FILLER.has(w));
-}
-function titleStillMatches(stored, current) {
-  const s = titleTokens(stored);
-  if (!s.length) return true; // nothing distinctive to compare → don't flag
-  const c = (current || "").toLowerCase();
-  const hits = s.filter(tok => c.includes(tok)).length;
-  return hits >= Math.ceil(s.length / 2); // at least half the distinctive tokens persist
-}
-
-function assess(storedTitle, storedCompany, profile) {
-  if (!profile) return { status: "unverified", currentTitle: "", reason: "profile fetch returned no data" };
-  const exps = profile.experiences || [];
-  const current = exps.filter(e => e.isCurrent);
-  // Among current roles, is there one at the company we have on file?
-  const atCompany = storedCompany ? current.find(e => companyMatch(e.company, storedCompany)) : null;
-  if (storedCompany && current.length && !atCompany) {
-    // They hold current roles, but none at the stored company → they've moved on.
-    const where = current[0];
-    return {
-      status: "stale",
-      currentTitle: where ? `${where.title} @ ${where.company}` : "",
-      reason: `No current role at "${storedCompany}"${where ? ` — now ${where.title} @ ${where.company}` : ""}.`,
-    };
-  }
-  const ref = atCompany || current[0] || exps[0];
-  if (!ref) return { status: "unverified", currentTitle: "", reason: "no experience data on profile" };
-  const curTitle = ref.title || profile.headline || "";
-  if (storedTitle && !titleStillMatches(storedTitle, curTitle)) {
-    return {
-      status: "changed",
-      currentTitle: `${curTitle}${ref.company ? ` @ ${ref.company}` : ""}`,
-      reason: `Title changed: was "${storedTitle}", now "${curTitle}".`,
-    };
-  }
-  return { status: "verified", currentTitle: `${curTitle}${ref.company ? ` @ ${ref.company}` : ""}`, reason: "Still in role." };
-}
 
 async function stampTasks(baseId, updates) {
   // Airtable PATCH caps at 10 records/call. Best-effort — a missing Role Status
@@ -113,15 +64,8 @@ export async function POST(request) {
     for (let i = 0; i < toCheck.length; i += CONC) {
       const batch = toCheck.slice(i, i + CONC);
       const r = await Promise.all(batch.map(async (it) => {
-        const url = (it.linkedinUrl || "").trim();
-        if (!url) return { ...it, status: "unknown", currentTitle: "", reason: "no LinkedIn URL on lead" };
-        try {
-          const res = await fetchLinkedInProfile(url);
-          if (!res.ok) return { ...it, status: "unverified", currentTitle: "", reason: `profile fetch failed (${res.error || res.statusCode || "unknown"})` };
-          return { ...it, ...assess(it.storedTitle, it.storedCompany, res.profile), fullName: res.profile?.fullName || "" };
-        } catch (e) {
-          return { ...it, status: "unverified", currentTitle: "", reason: e.message };
-        }
+        const f = await checkRoleFreshness({ linkedinUrl: it.linkedinUrl, storedTitle: it.storedTitle, storedCompany: it.storedCompany });
+        return { ...it, ...f };
       }));
       results.push(...r);
     }
