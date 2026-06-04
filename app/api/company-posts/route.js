@@ -37,7 +37,10 @@ const RAPIDAPI_HOST = process.env.LINKEDIN_SCRAPER_HOST || "fresh-linkedin-scrap
 // diagnostic below — once the working combo is known, set the env vars to pin it.
 const COMPANY_PROFILE_PATHS = process.env.COMPANY_PROFILE_PATH ? [process.env.COMPANY_PROFILE_PATH] : ["/api/v1/company/profile", "/api/v1/company/details", "/api/v1/company"];
 const COMPANY_POSTS_PATHS = process.env.COMPANY_POSTS_PATH ? [process.env.COMPANY_POSTS_PATH] : ["/api/v1/company/posts", "/api/v1/company/updates"];
-const COMPANY_PARAMS = ["username", "company", "company_username", "public_id", "slug", "universal_name"];
+// "company" / "company_id" first — the fresh-linkedin-scraper-api company/profile
+// endpoint Zod-validates for exactly these (QA 2026-06-04: "Either company or
+// company_id must be provided").
+const COMPANY_PARAMS = ["company", "company_id", "username", "public_id", "slug", "universal_name"];
 const MAX_AGE_DAYS = parseInt(process.env.MAX_AGE_DAYS) || 7;
 const SIGNAL_RETAIN_FLOOR = (() => { const v = parseInt(process.env.SIGNAL_RETAIN_FLOOR); return Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : 40; })();
 const MAX_POSTS_PER_COMPANY = parseInt(process.env.MAX_COMPANY_POSTS) || 10;
@@ -95,16 +98,17 @@ async function resolveCompanyUrn(c) {
     for (const p of COMPANY_PARAMS) {
       const r = await rapidCall(path, { [p]: slug }, { retries: 1, timeoutMs: 30000 });
       if (!r.ok) { if (r.status === 404) break; /* path missing → next path */ diag = `${path}?${p}= → ${r.status} ${String(r.error).slice(0, 60)}`; continue; }
+      // A 200 with success:false is the API rejecting THIS param — keep probing
+      // other params (do NOT bail; that was the QA-1 bug).
+      if (r.data && r.data.success === false) { diag = `${path}?${p}= → success:false ${JSON.stringify(r.data.error || r.data.message || "").slice(0, 80)}`; continue; }
       const urn = extractUrn(r.data);
-      if (urn) return { urn: String(urn), via: `${path}?${p}=` };
-      // 200 but no URN where expected → capture the shape and stop (path exists).
+      if (urn) return { urn: String(urn), slug, via: `${path}?${p}=` };
+      // Real 200 payload but URN not in the keys we know → capture shape so we can pin it.
       const d = r.data?.data || r.data || {};
-      const keys = Object.keys(d).slice(0, 14).join(",");
-      const sample = JSON.stringify(d).slice(0, 220);
-      return { error: `200 at ${path}?${p}= but no urn. keys:[${keys}] sample:${sample}` };
+      diag = `200 at ${path}?${p}= but no urn. keys:[${Object.keys(d).slice(0, 16).join(",")}] sample:${JSON.stringify(d).slice(0, 220)}`;
     }
   }
-  return { error: diag };
+  return { error: diag, slug };
 }
 
 function parsePosts(data) {
@@ -125,13 +129,18 @@ function postDateMs(p) {
   return Number.isFinite(d) ? d : null;
 }
 
-async function fetchCompanyPosts(urn) {
-  let r = null, lastErr = "no posts path worked";
+async function fetchCompanyPosts(urn, slug) {
+  // Try the param combos the company/profile endpoint taught us (company_id /
+  // company), by urn and by slug. Skip 200-with-success:false (wrong param).
+  const combos = [
+    { company_id: urn }, { company: slug }, { urn }, { company: urn }, { company_id: slug }, { id: urn },
+  ];
+  let r = null, lastErr = "no posts path/param worked";
   for (const path of COMPANY_POSTS_PATHS) {
-    for (const key of ["urn", "company_id", "company_urn", "id"]) {
-      const rr = await rapidCall(path, { [key]: urn, page: "1" }, { retries: 1, timeoutMs: 30000 });
-      if (rr.ok) { r = rr; break; }
-      lastErr = `${path}?${key}= → ${rr.status} ${String(rr.error).slice(0, 50)}`;
+    for (const params of combos) {
+      const rr = await rapidCall(path, { ...params, page: "1" }, { retries: 1, timeoutMs: 30000 });
+      if (rr.ok && !(rr.data && rr.data.success === false)) { r = rr; break; }
+      lastErr = `${path}?${Object.keys(params)[0]}= → ${rr.ok ? "success:false " + JSON.stringify(rr.data?.error || rr.data?.message || "").slice(0, 60) : rr.status + " " + String(rr.error).slice(0, 40)}`;
       if (rr.status === 404) break; // path missing → next path
     }
     if (r) break;
@@ -197,7 +206,7 @@ export async function POST(request) {
       try {
         const ru = await resolveCompanyUrn(c);
         if (ru.error) { results.push({ company: c.name, signals: [], error: ru.error }); continue; }
-        const fp = await fetchCompanyPosts(ru.urn);
+        const fp = await fetchCompanyPosts(ru.urn, ru.slug);
         if (!fp.ok) { results.push({ company: c.name, signals: [], error: fp.error }); continue; }
         if (!fp.posts.length) { results.push({ company: c.name, signals: [] }); continue; }
         const scored = await scorePosts(c.name, fp.posts, taskDefs, threshold, campaignId);
