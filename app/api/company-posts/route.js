@@ -32,8 +32,12 @@ export const fetchCache = "force-no-store";
 
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
 const RAPIDAPI_HOST = process.env.LINKEDIN_SCRAPER_HOST || "fresh-linkedin-scraper-api.p.rapidapi.com";
-const COMPANY_PROFILE_PATH = process.env.COMPANY_PROFILE_PATH || "/api/v1/company/profile";
-const COMPANY_POSTS_PATH = process.env.COMPANY_POSTS_PATH || "/api/v1/company/posts";
+// Candidate company endpoints. Env override pins an exact one (fastest); otherwise
+// we probe these in order. PARAM names are tried per path. Discovered via the QA
+// diagnostic below — once the working combo is known, set the env vars to pin it.
+const COMPANY_PROFILE_PATHS = process.env.COMPANY_PROFILE_PATH ? [process.env.COMPANY_PROFILE_PATH] : ["/api/v1/company/profile", "/api/v1/company/details", "/api/v1/company"];
+const COMPANY_POSTS_PATHS = process.env.COMPANY_POSTS_PATH ? [process.env.COMPANY_POSTS_PATH] : ["/api/v1/company/posts", "/api/v1/company/updates"];
+const COMPANY_PARAMS = ["username", "company", "company_username", "public_id", "slug", "universal_name"];
 const MAX_AGE_DAYS = parseInt(process.env.MAX_AGE_DAYS) || 7;
 const SIGNAL_RETAIN_FLOOR = (() => { const v = parseInt(process.env.SIGNAL_RETAIN_FLOOR); return Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : 40; })();
 const MAX_POSTS_PER_COMPANY = parseInt(process.env.MAX_COMPANY_POSTS) || 10;
@@ -75,16 +79,32 @@ function companySlug(c) {
   return m ? m[1].toLowerCase() : "";
 }
 
-// Resolve a company's URN/id from its slug. Shape-tolerant across response variants.
+function extractUrn(data) {
+  const d = data?.data || data || {};
+  return d.urn || d.company_urn || d.entity_urn || d.companyUrn || d.id || d.company_id || d.companyId || d.universal_name || d.universalName || d.public_id || "";
+}
+// Resolve a company's URN/id. Probes candidate paths × params until one 200s with
+// a URN. On total failure returns a rich diagnostic (which path 200'd + its keys +
+// a value sample) so a single QA run reveals the exact shape to pin via env.
 async function resolveCompanyUrn(c) {
   if (c.linkedinId) return { urn: String(c.linkedinId) };
   const slug = companySlug(c);
   if (!slug) return { error: "no LinkedIn company slug/id" };
-  const r = await rapidCall(COMPANY_PROFILE_PATH, { username: slug });
-  if (!r.ok) return { error: `company profile (${r.status}): ${r.error}` };
-  const d = r.data?.data || r.data || {};
-  const urn = d.urn || d.company_urn || d.entity_urn || d.id || d.company_id || "";
-  return urn ? { urn: String(urn) } : { error: "no company urn in response" };
+  let diag = "all company-profile candidates failed";
+  for (const path of COMPANY_PROFILE_PATHS) {
+    for (const p of COMPANY_PARAMS) {
+      const r = await rapidCall(path, { [p]: slug }, { retries: 1, timeoutMs: 30000 });
+      if (!r.ok) { if (r.status === 404) break; /* path missing → next path */ diag = `${path}?${p}= → ${r.status} ${String(r.error).slice(0, 60)}`; continue; }
+      const urn = extractUrn(r.data);
+      if (urn) return { urn: String(urn), via: `${path}?${p}=` };
+      // 200 but no URN where expected → capture the shape and stop (path exists).
+      const d = r.data?.data || r.data || {};
+      const keys = Object.keys(d).slice(0, 14).join(",");
+      const sample = JSON.stringify(d).slice(0, 220);
+      return { error: `200 at ${path}?${p}= but no urn. keys:[${keys}] sample:${sample}` };
+    }
+  }
+  return { error: diag };
 }
 
 function parsePosts(data) {
@@ -106,8 +126,17 @@ function postDateMs(p) {
 }
 
 async function fetchCompanyPosts(urn) {
-  const r = await rapidCall(COMPANY_POSTS_PATH, { urn, page: "1" });
-  if (!r.ok) return { ok: false, error: `company posts (${r.status}): ${r.error}`, posts: [] };
+  let r = null, lastErr = "no posts path worked";
+  for (const path of COMPANY_POSTS_PATHS) {
+    for (const key of ["urn", "company_id", "company_urn", "id"]) {
+      const rr = await rapidCall(path, { [key]: urn, page: "1" }, { retries: 1, timeoutMs: 30000 });
+      if (rr.ok) { r = rr; break; }
+      lastErr = `${path}?${key}= → ${rr.status} ${String(rr.error).slice(0, 50)}`;
+      if (rr.status === 404) break; // path missing → next path
+    }
+    if (r) break;
+  }
+  if (!r) return { ok: false, error: `company posts: ${lastErr}`, posts: [] };
   const cutoff = Date.now() - MAX_AGE_DAYS * 86400000;
   const posts = parsePosts(r.data)
     .map(p => ({ text: postText(p), url: postUrl(p), ms: postDateMs(p) }))
