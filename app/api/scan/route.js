@@ -411,6 +411,23 @@ const MAX_AGE_DAYS = 7;
 // week are actionable. Override via MAX_JOB_AGE_DAYS env if a campaign needs a wider window.
 const MAX_JOB_AGE_DAYS = parseInt(process.env.MAX_JOB_AGE_DAYS) || 7;
 
+// ─── Signal retention floor ───────────────────────────────────────
+// Signals scoring at/above the user's threshold become live Tasks (current
+// behaviour, unchanged). Signals scoring BELOW threshold used to be discarded
+// silently — the operator could never answer "what did we catch but disqualify?"
+// (the Material/Qualcomm review on 2026-06-04 surfaced this gap directly).
+//
+// We now ALSO return signals that scored in a retain band — at/above this floor
+// but below the user's threshold — tagged separately so the orchestrator can
+// archive them for review (NOT create them as live Tasks). The floor keeps the
+// archive useful: genuine near-misses are retained, pure noise (score 0-39) is
+// not. Tunable via SIGNAL_RETAIN_FLOOR; 40 captures "almost qualified" without
+// flooding the archive with every irrelevant headline.
+const SIGNAL_RETAIN_FLOOR = (() => {
+  const v = parseInt(process.env.SIGNAL_RETAIN_FLOOR);
+  return Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : 40;
+})();
+
 function filterRecent(items) {
   const cutoff = Date.now() - MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
   return items.filter(item => {
@@ -848,9 +865,14 @@ function formatSignalForAI(sig, idx, mode) {
 async function classify(signals, taskDefs, companyName, mode, threshold = 50, campaignId = null) {
   if (!signals.length || !taskDefs.length) return [];
 
-  // Initialize results — each signal starts with no matches
+  // Initialize results — each signal starts with no matches.
+  // subThreshold* mirror the matched* fields but hold scores in the retain band
+  // (SIGNAL_RETAIN_FLOOR ≤ score < threshold). These never become live Tasks —
+  // the orchestrator archives them so the operator can review what was caught but
+  // disqualified. Qualified behaviour (matched*) is unchanged.
   const results = signals.map(sig => ({
     ...sig, matchedTaskIds: [], confidence: 0, relevanceScores: {}, scoreReasons: {},
+    subThresholdTaskIds: [], subThresholdScores: {}, subThresholdReasons: {},
   }));
 
   // Run ALL tasks in parallel — was serial, made N tasks take N×3s. Now ~3s total.
@@ -1098,6 +1120,13 @@ ${signalBlock}`;
         results[idx].scoreReasons[task.id] = String(reason).slice(0, 200);
         results[idx].confidence = Math.max(results[idx].confidence, score / 100);
         matchCount++;
+      } else if (idx !== undefined && Number.isFinite(score) && score >= SIGNAL_RETAIN_FLOOR && score < threshold && results[idx]) {
+        // Retain band: scored a real near-miss but below the user's threshold.
+        // Not a live Task — the orchestrator archives it for weekly review so
+        // "what did we disqualify?" is always answerable.
+        results[idx].subThresholdTaskIds.push(task.id);
+        results[idx].subThresholdScores[task.id] = Math.min(100, Math.max(0, Math.round(score)));
+        results[idx].subThresholdReasons[task.id] = String(reason).slice(0, 200);
       }
     }
     // When zero matches, surface the top near-miss so operator can see how

@@ -152,6 +152,11 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const [showExportModal, setShowExportModal] = useState(false);
   const [linkedinAccount, setLinkedinAccount] = useState(null);
   const [outreachStats, setOutreachStats] = useState(null);
+  // Signal Review tab — archive rows (unqualified + duplicates) lazy-loaded on open.
+  const [archiveRecs, setArchiveRecs] = useState(null); // null = not loaded yet
+  const [archiveLoading, setArchiveLoading] = useState(false);
+  const [srFilter, setSrFilter] = useState({ status: "all", account: "all", rule: "all", type: "all", days: "7", q: "" });
+  const [srPurging, setSrPurging] = useState(false);
   // AI usage stats — populated from the campaign record after each load.
   // Used to display per-client OpenAI cost on the dashboard for billing transparency.
   // Hidden in clientMode (admin-only billing data).
@@ -553,6 +558,45 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     setLinkedinError(`✅ Cleaned up ${deleted} disconnected account${deleted!==1?"s":""}`);
     await loadLinkedInAccounts();
     setOutreachLoading(false);
+  };
+
+  // ─── Signal Review: load + purge the Signal Archive ───────────
+  // Lazy-loaded when the operator opens the tab (and on demand via Refresh).
+  // Tolerates a missing table (campaign never scanned/archived) by showing an
+  // empty, enable-instructions state rather than erroring.
+  const loadSignalArchive = async () => {
+    if (!bid) return;
+    try {
+      setArchiveLoading(true);
+      const res = await at("list", "Signal Archive", { params: { pageSize: 100, sort: [{ field: "Created", direction: "desc" }] } }, bid);
+      setArchiveRecs(res.records || []);
+    } catch (e) {
+      console.log("[SignalReview] Archive not available:", e.message);
+      setArchiveRecs([]); // distinguishes "loaded, empty/absent" from "not loaded"
+    }
+    setArchiveLoading(false);
+  };
+
+  // Manual retention purge — delete archive rows older than ARCHIVE_RETAIN_DAYS.
+  // Operator-triggered (no cron) to avoid the flaky Airtable date-formula footgun;
+  // "retain for a week, then review" stays a human decision.
+  const purgeOldArchive = async () => {
+    if (!bid || !archiveRecs?.length) return;
+    const cutoff = Date.now() - ARCHIVE_RETAIN_DAYS * 24 * 60 * 60 * 1000;
+    const stale = archiveRecs.filter(r => {
+      const c = (r.fields || {}).Created;
+      const t = c ? new Date(c).getTime() : NaN;
+      return Number.isFinite(t) && t < cutoff;
+    });
+    if (!stale.length) { alert(`Nothing older than ${ARCHIVE_RETAIN_DAYS} days to clear.`); return; }
+    if (!confirm(`Delete ${stale.length} archived signal${stale.length===1?"":"s"} older than ${ARCHIVE_RETAIN_DAYS} days? Qualified Tasks are untouched.`)) return;
+    try {
+      setSrPurging(true);
+      const ids = stale.map(r => r.id);
+      for (let i = 0; i < ids.length; i += 10) await at("delete", "Signal Archive", { recordIds: ids.slice(i, i + 10) }, bid);
+      setArchiveRecs(p => (p || []).filter(r => !ids.includes(r.id)));
+    } catch (e) { alert("Purge failed: " + e.message); }
+    setSrPurging(false);
   };
 
   const loadOutreachStats = async (campaign) => {
@@ -1519,6 +1563,65 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   // ─── Run Signal Scan (news + jobs) ─────────────────────────
   const scanBufferRef = useRef([]); // collects all new tasks during scan
   const dupCountRef = useRef(0);
+  // Signal Archive (separate Airtable table) — retained-but-not-actioned signals.
+  // archiveBuffer collects unqualified (retain-band) + duplicate signals during a
+  // scan; archiveSeen dedupes within the run AND against existing archive rows so
+  // a weekly re-scan doesn't pile up identical rows; archiveEnabled flips true only
+  // if the Signal Archive table exists on this campaign's base (archiving is fully
+  // best-effort — a missing table or a write failure never breaks a scan).
+  const archiveBufferRef = useRef([]);
+  const archiveSeenRef = useRef(new Set());
+  const archiveEnabledRef = useRef(false);
+  const ARCHIVE_RETAIN_DAYS = 14;
+
+  // Stable-ish fingerprint for archive dedup: company + rule + status + URL (or a
+  // signal-text prefix when there's no URL). Mirrors the dimensions a reviewer
+  // would consider "the same archived signal".
+  const archiveFingerprint = (f) =>
+    `${(f.Company||"").toLowerCase().trim()}|${(f["Task Rule"]||"").toLowerCase().trim()}|${(f["Signal Status"]||"").toLowerCase().trim()}|${(f.URL||"").toLowerCase().trim()||(f.Signal||"").toLowerCase().trim().slice(0,80)}`;
+
+  // Probe the archive table once per scan: load existing fingerprints for cross-run
+  // dedup, and enable archiving only if the table is reachable. Best-effort: any
+  // error (table absent on this campaign, transient 5xx) just disables archiving
+  // for the run — the scan itself is unaffected.
+  const buildArchiveSeen = async () => {
+    archiveSeenRef.current = new Set();
+    archiveEnabledRef.current = false;
+    archiveBufferRef.current = [];
+    if (!bid) return;
+    try {
+      const res = await at("list", "Signal Archive", { params: { pageSize: 100, sort: [{ field: "Created", direction: "desc" }] } }, bid);
+      archiveEnabledRef.current = true;
+      for (const r of (res.records || [])) archiveSeenRef.current.add(archiveFingerprint(r.fields || {}));
+    } catch (e) {
+      console.log("[Archive] Signal Archive table unavailable — archiving disabled this run. Enable via setup-fix?baseId=" + bid + "&table=Signal%20Archive");
+    }
+  };
+
+  // Buffer one retained signal (unqualified near-miss or suppressed duplicate).
+  // No-op when archiving is disabled or the fingerprint was already seen.
+  const archiveSignal = (sig, td, score, reason, company, status, dupOf = "") => {
+    if (!archiveEnabledRef.current) return;
+    const rec = {
+      Company: company.name,
+      "Signal Status": status,
+      Score: Math.max(0, Math.min(100, Number(score) || 0)),
+      "Score Reason": reason || "",
+      Signal: sig.headline || "",
+      "Task Rule": td.name,
+      "Task Type": sig.taskType || "news",
+      Source: sig.source || "",
+      URL: sig.url || "",
+      "Dup Of": dupOf || "",
+      "Scan Target": td.scanTarget || "accounts",
+      Date: sig.date ? sig.date.slice(0, 10) : new Date().toISOString().slice(0, 10),
+      Created: new Date().toISOString(),
+    };
+    const fp = archiveFingerprint(rec);
+    if (archiveSeenRef.current.has(fp)) return;
+    archiveSeenRef.current.add(fp);
+    archiveBufferRef.current.push(rec);
+  };
 
   // mode: "all" | "news" | "jobs"
   // Allows user to run only news scans, only jobs scans, or both. Each mode
@@ -1536,6 +1639,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     if(scanning||scanRef.current||!accounts.length||!sigRules.length)return;
     setScanning(true);scanRef.current=true;setScanProg(0);
     buildSeenSet(); scanBufferRef.current = []; dupCountRef.current = 0;
+    await buildArchiveSeen(); // probe + load Signal Archive for cross-run dedup
     const taskDefs=rules.filter(r=>ruleMatches((r.fields||{})["Task Type"]||"news")).map(r=>{const f=r.fields||{};const kws=(f.Keywords||"").split(",").map(k=>k.trim()).filter(Boolean);const jtk=(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()).filter(Boolean);let sp=f["Scoring Prompt"]||"";if(!sp){const ak=[...kws,...jtk].slice(0,5).join(", ");sp="Rate this signal for \""+f.Name+"\". Score 90-100 for exact matches ("+ak+"). 70-89 strong. 50-69 partial. Below 50 unrelated."}return{id:r.id,name:f.Name||"",description:f.Description||"",taskType:f["Task Type"]||"news",scanTarget:f["Scan Target"]||"accounts",ease:f.Ease||"Medium",strength:f.Strength||"Medium",sources:(f.Sources||"").split(",").map(s=>s.trim()).filter(Boolean),keywords:kws,jobTitleKeywords:jtk,scoringPrompt:sp}});
     const companies=accounts.map(a=>{const f=a.fields||{};const li=f["LinkedIn URL"]||f.LinkedIn||"";return{name:f.Name||f.Company||"",domain:f.Domain||f.Website||"",linkedinSlug:extractLinkedInSlug(li),linkedinCompanyId:extractLinkedInId(li)}}).filter(c=>c.name);
     const nT=taskDefs.filter(t=>t.taskType==="news"||t.taskType==="both");
@@ -1593,14 +1697,34 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     } else {
       setScanText((exactDupes > 0 ? `✅ Scan complete — ${exactDupes} duplicates skipped, no new tasks` : "✅ Scan complete — no signals found") + fetchWarning);
     }
+    // ── Flush Signal Archive (unqualified near-misses + suppressed duplicates) ──
+    // Best-effort and non-blocking on failure: archiving must never sink a scan.
+    // Airtable create caps at 10 records/call, so chunk.
+    const archived = archiveBufferRef.current;
+    if (archiveEnabledRef.current && archived.length > 0) {
+      try {
+        let saved = 0;
+        for (let i = 0; i < archived.length; i += 10) {
+          const r = await at("create", "Signal Archive", { records: archived.slice(i, i + 10) }, bid);
+          saved += (r.records || []).length;
+        }
+        console.log(`[Archive] ${saved} retained signals written to Signal Archive (unqualified + duplicates)`);
+      } catch (e) { console.error("[Archive] write failed (non-fatal):", e); }
+    }
     setScanProg(100);setScanning(false);scanRef.current=false;
   },[accounts,rules,threshold,scanning,bid,tasks]);
 
-  // Buffer signals with instant dedup (layers 1-3), defer AI dedup to post-scan
+  // Buffer signals with instant dedup (layers 1-3), defer AI dedup to post-scan.
+  // Two buckets now persist instead of one being silently dropped:
+  //   • qualified (≥ threshold, not a duplicate) → live Tasks (scanBuffer)
+  //   • duplicate (≥ threshold, suppressed)      → Signal Archive (status=duplicate)
+  //   • unqualified (retain band, < threshold)   → Signal Archive (status=unqualified)
+  // Nothing the scan catches in the retain band is thrown away anymore.
   const bufferSignals = (signals, company, taskDefs)=>{
     for(const sig of signals){
       const scores=sig.relevanceScores||{};
       const reasons=sig.scoreReasons||{};
+      // ── Qualified (≥ threshold) ──
       for(const tid of(sig.matchedTaskIds||[])){
         const td=taskDefs.find(t=>t.id===tid);if(!td)continue;
         // Use ?? not || so score=0 is preserved (|| would fall through to confidence-based).
@@ -1621,13 +1745,23 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
           Date:sig.date?sig.date.slice(0,10):new Date().toISOString().slice(0,10),
           Created:new Date().toISOString()
         };
-        // Instant dedup: fingerprint + URL + fuzzy against existing + buffer
+        // Instant dedup: fingerprint + URL + fuzzy against existing + buffer.
+        // A duplicate is no longer discarded — it's archived (status=duplicate) so
+        // "why didn't I see signal X — was it caught?" is always answerable.
         if(isDuplicate(newTask, [...tasks, ...scanBufferRef.current.map(t=>({fields:t}))])){
           dupCountRef.current++;
+          archiveSignal(sig, td, score, reasons[tid]||"", company, "duplicate");
           continue;
         }
         taskSeenRef.current.add(taskFingerprint(newTask));
         scanBufferRef.current.push(newTask);
+      }
+      // ── Unqualified (retain band: SIGNAL_RETAIN_FLOOR ≤ score < threshold) ──
+      const subScores=sig.subThresholdScores||{};
+      const subReasons=sig.subThresholdReasons||{};
+      for(const tid of(sig.subThresholdTaskIds||[])){
+        const td=taskDefs.find(t=>t.id===tid);if(!td)continue;
+        archiveSignal(sig, td, subScores[tid], subReasons[tid]||"", company, "unqualified");
       }
     }
   };
@@ -1736,6 +1870,9 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     // control plane. Client sees results (Dashboard, Accounts, Leads, Tasks)
     // not the machinery that produced them.
     "rules", "prompts", "threshold", "outreach", "linkedin_posts",
+    // Signal Review is the back-office QA surface (qualified vs unqualified vs
+    // duplicate, cross-mapped) — operators only, never the client portal.
+    "signal_review",
   ]);
   const navs = [
     {id:"dashboard",label:"📊 Dashboard",count:null},
@@ -1747,6 +1884,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     {id:"prompts",label:"Prompts",count:rules.length},
     {id:"threshold",label:"Scoring",count:null},
     {id:"tasks",label:"Tasks",count:tasks.length},
+    {id:"signal_review",label:"🔎 Signal Review",count:null},
     null,
     {id:"outreach",label:"💬 LinkedIn Automation",count:null},
     {id:"linkedin_posts",label:"📝 LinkedIn Posts",count:null},
@@ -1762,7 +1900,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   <div className="side"><div className="side-hd"><div className="side-brand">SignalScope</div><div className="side-camp">{camp.name}</div>{!clientMode&&<div className="side-back" onClick={()=>setCamp(null)}><I.Back/> All Campaigns</div>}{clientMode&&camp.desc&&<div style={{fontSize:10,color:"var(--t3)",marginTop:4,lineHeight:1.4}}>{camp.desc}</div>}</div>
   <div className="side-nav">{navs.map((n,i)=> n===null
     ? <div key={"sep"+i} style={{height:1,background:"var(--bdr)",margin:"6px 12px"}}/>
-    : <div key={n.id} className={"nav-i"+(tab===n.id?" on":"")} onClick={()=>{setTab(n.id);if(n.id==="outreach")loadOutreachStats()}}><span>{n.label}</span>{n.count!==null&&n.count>0&&<span className="cnt">{n.count}</span>}</div>
+    : <div key={n.id} className={"nav-i"+(tab===n.id?" on":"")} onClick={()=>{setTab(n.id);if(n.id==="outreach")loadOutreachStats();if(n.id==="signal_review")loadSignalArchive()}}><span>{n.label}</span>{n.count!==null&&n.count>0&&<span className="cnt">{n.count}</span>}</div>
   )}</div>
   <div style={{padding:"12px 16px",borderTop:"1px solid var(--bdr)"}}>
     {/* Airtable Base — admin only */}
@@ -2876,6 +3014,75 @@ Output format (strict JSON, no markdown):
       {!clientMode&&<td><button className="btn btn-d btn-s" onClick={()=>del("Tasks",[t.id],setTasks)}><I.Trash/></button></td>}
     </tr>)})}</tbody></table></div>}
   </div>)}
+
+  {/* ════ SIGNAL REVIEW — qualified vs unqualified vs duplicate, cross-mapped ════ */}
+  {tab==="signal_review"&&!loading&&!clientMode&&(()=>{
+    // Unify two sources into one reviewable shape:
+    //   • live Tasks (the signal pipeline — excludes Top X lead-scoring) = "qualified"
+    //   • Signal Archive rows = "unqualified" | "duplicate"
+    const normRow=(t,status)=>{const f=t.fields||{};return{id:t.id,company:f.Company||"",rule:f["Task Rule"]||"",type:f["Task Type"]||"news",score:Number(f.Score)||0,status,reason:f["Score Reason"]||"",signal:f.Signal||"",url:f.URL||"",source:f.Source||"",date:f.Date||"",created:f.Created||"",leadTitle:f["Lead Title"]||"",target:f["Scan Target"]||"accounts",dupOf:f["Dup Of"]||""};};
+    const srQualified=tasks.filter(t=>((t.fields||{})["Task Type"]||"news")!=="top_x").map(t=>normRow(t,"qualified"));
+    const srArchive=(archiveRecs||[]).map(t=>normRow(t,((t.fields||{})["Signal Status"]||"unqualified").toLowerCase()));
+    const srAll=[...srQualified,...srArchive];
+    const srAccounts=[...new Set(srAll.map(r=>r.company).filter(Boolean))].sort();
+    const srRules=[...new Set(srAll.map(r=>r.rule).filter(Boolean))].sort();
+    const srTypes=[...new Set(srAll.map(r=>r.type).filter(Boolean))].sort();
+    const now=Date.now();const winMs=srFilter.days==="all"?Infinity:Number(srFilter.days)*86400000;
+    const inWindow=r=>{if(winMs===Infinity)return true;const t=new Date(r.created||r.date).getTime();return !Number.isFinite(t)||(now-t)<=winMs;};
+    // "scoped" = all filters EXCEPT status (so the status pills show contextual counts)
+    const scoped=srAll.filter(r=>(srFilter.account==="all"||r.company===srFilter.account)&&(srFilter.rule==="all"||r.rule===srFilter.rule)&&(srFilter.type==="all"||r.type===srFilter.type)&&inWindow(r)&&(!srFilter.q||(r.company+" "+r.rule+" "+r.signal+" "+r.reason+" "+r.leadTitle).toLowerCase().includes(srFilter.q.toLowerCase())));
+    const cnt=s=>s==="all"?scoped.length:scoped.filter(r=>r.status===s).length;
+    const rows=scoped.filter(r=>srFilter.status==="all"||r.status===srFilter.status).sort((a,b)=>new Date(b.created||b.date)-new Date(a.created||a.date));
+    const STA={qualified:{bg:"var(--grn-d)",fg:"var(--grn)",lbl:"Qualified"},unqualified:{bg:"rgba(245,158,11,.15)",fg:"var(--amb)",lbl:"Unqualified"},duplicate:{bg:"var(--hover)",fg:"var(--t2)",lbl:"Duplicate"}};
+    const promote=async r=>{if(!confirm(`Promote this unqualified signal (score ${r.score}) to a live Task?\n\n${r.signal}`))return;const nt={Company:r.company,"Task Rule":r.rule,Score:r.score,"Score Reason":r.reason,"Scan Target":r.target,Signal:r.signal,Source:r.source,URL:r.url,"Task Type":r.type,Date:r.date,Created:new Date().toISOString()};try{const res=await at("create","Tasks",{records:[nt]},bid);setTasks(p=>[...(res.records||[]),...p]);await at("delete","Signal Archive",{recordIds:[r.id]},bid);setArchiveRecs(p=>(p||[]).filter(x=>x.id!==r.id));}catch(e){alert("Promote failed: "+e.message);}};
+    const archiveAbsent=archiveRecs!==null&&archiveRecs.length===0;
+    return(<div>
+      <div className="ph"><div><div className="pt">🔎 Signal Review</div><div className="pd">Everything the scan caught — qualified, disqualified, and de-duplicated — in one place. Clients never see this surface.</div></div>
+      <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+        <button className="btn btn-s" onClick={loadSignalArchive} disabled={archiveLoading}>{archiveLoading?"⏳ Loading…":"↻ Refresh"}</button>
+        <button className="btn btn-s btn-d" onClick={purgeOldArchive} disabled={srPurging||!archiveRecs?.length} title={`Delete archived signals older than ${ARCHIVE_RETAIN_DAYS} days`}>{srPurging?"⏳":`🧹 Clear >${ARCHIVE_RETAIN_DAYS}d`}</button>
+      </div></div>
+
+      {/* Cross-map summary — answers "what are we tracking, what came in" at a glance */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:10,marginBottom:14}}>
+        {[{k:"Accounts in view",v:[...new Set(scoped.map(r=>r.company).filter(Boolean))].length},{k:"Rules firing",v:[...new Set(scoped.map(r=>r.rule).filter(Boolean))].length},{k:"Qualified",v:cnt("qualified"),c:"var(--grn)"},{k:"Unqualified",v:cnt("unqualified"),c:"var(--amb)"},{k:"Duplicates",v:cnt("duplicate"),c:"var(--t2)"}].map(s=>(
+          <div key={s.k} style={{padding:"10px 14px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10}}><div style={{fontSize:22,fontWeight:600,color:s.c||"var(--t1)",fontFamily:"'JetBrains Mono',monospace"}}>{s.v}</div><div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>{s.k}</div></div>
+        ))}
+      </div>
+
+      {/* Status pills */}
+      <div className="fb">
+        {[{v:"all",l:"All"},{v:"qualified",l:"Qualified"},{v:"unqualified",l:"Unqualified"},{v:"duplicate",l:"Duplicates"}].map(p=>(
+          <button key={p.v} className="btn btn-s" style={{fontSize:11,background:srFilter.status===p.v?"var(--acc-d)":"var(--card)",color:srFilter.status===p.v?"var(--acc)":"var(--t2)",borderColor:srFilter.status===p.v?"var(--acc)":"var(--bdr)"}} onClick={()=>setSrFilter(f=>({...f,status:p.v}))}>{p.l} <span style={{opacity:.7,marginLeft:4,fontFamily:"'JetBrains Mono',monospace"}}>{cnt(p.v)}</span></button>
+        ))}
+      </div>
+
+      {/* Cross-map filters */}
+      <div className="fb">
+        <input className="inp" placeholder="Search signal, company, person, reason…" value={srFilter.q} onChange={e=>setSrFilter(f=>({...f,q:e.target.value}))} style={{maxWidth:260}}/>
+        <select className="inp" style={{width:160}} value={srFilter.account} onChange={e=>setSrFilter(f=>({...f,account:e.target.value}))}><option value="all">All Accounts</option>{srAccounts.map(a=><option key={a} value={a}>{a}</option>)}</select>
+        <select className="inp" style={{width:170}} value={srFilter.rule} onChange={e=>setSrFilter(f=>({...f,rule:e.target.value}))}><option value="all">All Rules</option>{srRules.map(r=><option key={r} value={r}>{r}</option>)}</select>
+        <select className="inp" style={{width:130}} value={srFilter.type} onChange={e=>setSrFilter(f=>({...f,type:e.target.value}))}><option value="all">All Types</option>{srTypes.map(t=><option key={t} value={t}>{t.replace(/_/g," ")}</option>)}</select>
+        <select className="inp" style={{width:120}} value={srFilter.days} onChange={e=>setSrFilter(f=>({...f,days:e.target.value}))}><option value="1">24h</option><option value="7">7 days</option><option value="14">14 days</option><option value="30">30 days</option><option value="all">All time</option></select>
+      </div>
+
+      {archiveRecs===null?<div className="empty"><div className="em">🔎</div><p>Loading signal archive…</p></div>:
+       rows.length===0?<div className="empty"><div className="em">🔎</div><p>{srAll.length===0?"No signals yet — run a scan from the Tasks tab.":"No signals match these filters."}</p>{archiveAbsent&&<div style={{fontSize:10,color:"var(--t3)",marginTop:8,maxWidth:440,textAlign:"center",lineHeight:1.5}}>Unqualified + duplicate retention turns on after the Signal Archive table is provisioned and the next scan runs. Qualified Tasks show here regardless.</div>}</div>:
+      <div className="tw"><table><thead><tr>
+        <th>Status</th><th>Company</th><th>Person / Rule</th><th>Score</th><th>Type</th><th>Signal</th><th>Date</th><th>Link</th><th></th>
+      </tr></thead><tbody>{rows.slice(0,400).map((r,i)=>{const st=STA[r.status]||STA.unqualified;return(<tr key={r.id+i}>
+        <td><span className="chip" style={{background:st.bg,color:st.fg}}>{st.lbl}</span></td>
+        <td style={{color:"var(--t1)",fontWeight:500}}>{r.company}</td>
+        <td style={{maxWidth:180}}><div style={{fontSize:11,color:"var(--t1)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.leadTitle||"—"}</div><div style={{fontSize:9,color:"var(--t3)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.rule}</div></td>
+        <td><div className="sb" style={{width:74}} title={r.reason?`AI reason: ${r.reason}`:""}><div className="st"><div className="sf" style={{width:r.score+"%",background:r.score>=80?"var(--grn)":r.score>=60?"var(--amb)":"var(--red)"}}/></div><span className="sv" style={{color:r.score>=80?"var(--grn)":r.score>=60?"var(--amb)":"var(--red)"}}>{r.score}</span></div></td>
+        <td><span className={"chip "+(r.type==="job_post"?"cb":r.type==="top_x"?"cp":"cg")}>{(r.type||"news").replace(/_/g," ").toUpperCase()}</span></td>
+        <td style={{maxWidth:240,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={r.signal+(r.reason?"\n\n💡 "+r.reason:"")+(r.dupOf?"\n\n↔ Dup of: "+r.dupOf:"")}>{r.signal}</td>
+        <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10}}>{(r.date||r.created||"").slice(0,10)}</td>
+        <td>{r.url?<a href={r.url} target="_blank" rel="noopener" style={{color:"var(--blu)",fontSize:10}}>↗</a>:"—"}</td>
+        <td style={{whiteSpace:"nowrap"}}>{r.status==="unqualified"&&<button className="btn btn-s" style={{fontSize:9,padding:"3px 7px",color:"var(--grn)",borderColor:"rgba(93,168,122,.3)"}} title="Promote to a live Task" onClick={()=>promote(r)}>▲ Promote</button>}{r.status!=="qualified"&&<button className="btn btn-d btn-s" style={{marginLeft:4}} title="Delete from archive" onClick={()=>del("Signal Archive",[r.id],setArchiveRecs)}><I.Trash/></button>}</td>
+      </tr>)})}</tbody></table>{rows.length>400&&<div style={{fontSize:10,color:"var(--t3)",padding:"8px 4px"}}>Showing first 400 of {rows.length} — narrow the filters to see the rest.</div>}</div>}
+    </div>);
+  })()}
 
   {/* ════ LINKEDIN POSTS SCANNER ════ */}
   {tab==="linkedin_posts"&&!loading&&!clientMode&&(<LinkedInPostsTab baseId={bid} campaign={camp} leads={leads} onCampaignProvisioned={(newCamp)=>{setCamp(newCamp);setCampaigns(p=>p.map(c=>c.id===newCamp.id?newCamp:c));}}/>)}

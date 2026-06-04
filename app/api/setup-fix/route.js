@@ -211,6 +211,36 @@ const CAMPAIGN_TABLES = {
     { name: "Handled Notes", type: "multilineText" },
   ],
 
+  // ─── Signal Archive — retained-but-not-actioned signals ────────
+  // Signals the scan CAUGHT but did NOT promote to a live Task:
+  //   - "unqualified": scored in the retain band (SIGNAL_RETAIN_FLOOR ≤ score
+  //     < threshold) — a near-miss kept for weekly review.
+  //   - "duplicate": a qualified signal suppressed because an equivalent signal
+  //     already exists ("Dup Of" points at what it matched).
+  // Kept in a SEPARATE table on purpose: the chatbot feed, count endpoint, Top X
+  // and client task views all read "Tasks" — archiving here means zero risk of
+  // disqualified noise leaking to clients, while the in-app Signal Review surface
+  // unions Tasks + this table. Established from the 2026-06-04 Material review
+  // ("stop deleting unqualified signals; tag and retain for a week").
+  // Company is first so it becomes the Airtable primary (primary can't be select).
+  "Signal Archive": [
+    { name: "Company", type: "singleLineText" },
+    { name: "Signal Status", type: "singleSelect", options: { choices: [{ name: "unqualified" }, { name: "duplicate" }] } },
+    { name: "Score", type: "number", options: { precision: 0 } },
+    { name: "Score Reason", type: "multilineText" },
+    { name: "Signal", type: "multilineText" },
+    { name: "Task Rule", type: "singleLineText" },
+    { name: "Task Type", type: "singleLineText" },
+    { name: "Source", type: "singleLineText" },
+    { name: "URL", type: "url" },
+    { name: "Dup Of", type: "singleLineText" },     // URL/fingerprint the duplicate matched
+    { name: "Scan Target", type: "singleLineText" },
+    { name: "Account ID", type: "singleLineText" },
+    { name: "Lead Title", type: "singleLineText" },
+    { name: "Date", type: "date", options: { dateFormat: { name: "iso" } } },
+    { name: "Created", type: "dateTime", options: TZ_ISO },
+  ],
+
   // ─── Sidekick Chat — persistent chat history + dynamic memory ──
   // The chatbot reads this table on mount to restore prior conversations
   // and writes each user / bot exchange so Claude has multi-session context.
@@ -276,8 +306,18 @@ export async function POST(request) {
   // added to their Tasks table for the Side Kick chatbot integration.
   const overrideBaseId = url.searchParams.get("baseId");
   if (overrideBaseId) {
-    const campReport = { name: `override (${overrideBaseId})`, baseId: overrideBaseId, tables: {} };
-    for (const [tableName, fields] of Object.entries(CAMPAIGN_TABLES)) {
+    // Optional ?table=Name to bootstrap a SINGLE table only (surgical). Lets us
+    // create just "Signal Archive" on a live client base without re-touching
+    // every other table. Falls back to all CAMPAIGN_TABLES when omitted.
+    const onlyTable = url.searchParams.get("table");
+    const tableEntries = onlyTable
+      ? Object.entries(CAMPAIGN_TABLES).filter(([name]) => name === onlyTable)
+      : Object.entries(CAMPAIGN_TABLES);
+    if (onlyTable && tableEntries.length === 0) {
+      return NextResponse.json({ error: `Unknown table "${onlyTable}". Known: ${Object.keys(CAMPAIGN_TABLES).join(", ")}` }, { status: 400 });
+    }
+    const campReport = { name: `override (${overrideBaseId})${onlyTable ? ` [${onlyTable}]` : ""}`, baseId: overrideBaseId, tables: {} };
+    for (const [tableName, fields] of tableEntries) {
       const r = await bootstrapTable(overrideBaseId, tableName, fields);
       campReport.tables[tableName] = r;
       if (r.ok) report.summary.fixed++;
