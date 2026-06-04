@@ -2,6 +2,13 @@ import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import { trackOpenAIUsage } from "@/lib/ai-usage";
 import { pickLeadField } from "@/lib/lead-fields";
+import { checkRoleFreshness } from "@/lib/role-freshness";
+
+// Role-freshness gate: confirm a lead still belongs to the company before we
+// create an engagement task (Kunal, 2026-06-04 — never surface "engage with
+// this CMO" after they've left). Default ON; set ROLE_GATE_ENABLED=false to
+// disable. Fail-open by design: only a confident "left the company" suppresses.
+const ROLE_GATE_ENABLED = process.env.ROLE_GATE_ENABLED !== "false";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LINKEDIN POSTS — FETCH + SCORE + CREATE TASKS
@@ -1260,19 +1267,47 @@ async function runLinkedInPostScan({
       !NEVER_TASK_CATEGORIES.has(sp.category)
     );
 
-    if (taskWorthy.length > 0) {
+    // ── Role-freshness gate ──────────────────────────────────────
+    // Before creating an engagement task, confirm the lead STILL belongs to the
+    // company on file. Best-effort + FAIL-OPEN: any error/uncertainty still
+    // creates the task, so a flaky LinkedIn fetch never silently kills real
+    // signals. Only a confident "they've left the company" (status=stale)
+    // suppresses creation; a same-company title change creates the task with a
+    // visible ⚠ caution. One extra profile fetch per lead that produced a
+    // task-worthy post — rare, so cheap (exactly Kunal's point).
+    let roleInfo = { status: "", currentTitle: "", reason: "" };
+    if (ROLE_GATE_ENABLED && taskWorthy.length > 0) {
+      try {
+        roleInfo = await checkRoleFreshness({ linkedinUrl: pickLeadField(f, "linkedinUrl"), storedTitle: pickLeadField(f, "title"), storedCompany: leadCompany });
+      } catch (_) { roleInfo = { status: "unverified", currentTitle: "", reason: "role check threw" }; }
+    }
+    const roleStale = roleInfo.status === "stale";
+    if (roleStale) {
+      progress.posts_filtered_out += taskWorthy.length;
+      progress.stale_role_skipped = (progress.stale_role_skipped || 0) + taskWorthy.length;
+      rejectionReasons["left_company_role_stale"] = (rejectionReasons["left_company_role_stale"] || 0) + taskWorthy.length;
+      progress.last_log = `[${i + 1}/${leads.length}] ${leadName}: skipped ${taskWorthy.length} task(s) — ${roleInfo.reason}`;
+      if (progress.recent_samples) for (const s of progress.recent_samples) { if (s.lead === leadName && s.outcome === "pending_task_creation") { s.outcome = "skipped_role_stale"; s.error = roleInfo.reason; } }
+      await writeProgress(campaignAirtableId, progress);
+    }
+
+    if (taskWorthy.length > 0 && !roleStale) {
       progress.current_lead_step = "creating_tasks";
       progress.last_log = `[${i + 1}/${leads.length}] ${leadName}: creating ${taskWorthy.length} task(s)...`;
       await writeProgress(campaignAirtableId, progress);
 
       const todayStr = new Date().toISOString().slice(0, 10);
       const nowISO = new Date().toISOString();
+      // Same-company title change → still belongs, but flag it so the SDR knows.
+      const roleCaution = roleInfo.status === "changed" ? `⚠ ROLE CHECK: ${roleInfo.reason}` : null;
       const records = taskWorthy.map(sp => {
         const postUrl = sp.post.url || "";
         // Build a transparent Signal that shows the SDR exactly why this post passed.
         // Put the post URL at the TOP so it's always visible even if a dedicated URL field
         // doesn't exist in the user's Tasks table.
         const signalParts = [
+          roleCaution,
+          roleCaution ? `` : null,
           postUrl ? `🔗 ${postUrl}` : null,
           postUrl ? `` : null,
           `📝 ${sp.structured_sentence}`,
