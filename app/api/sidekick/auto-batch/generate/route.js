@@ -8,6 +8,7 @@ import {
   deriveNames,
 } from "@/lib/message-merge.js";
 import { buildLeadBrief, briefToPromptBlock, briefToUiBullets } from "@/lib/lead-brief.js";
+import { fetchPreferences } from "@/app/api/sidekick/preferences/route.js";
 
 // ═══════════════════════════════════════════════════════════════════
 // SIDEKICK AUTO-BATCH GENERATE
@@ -45,6 +46,34 @@ const DEFAULT_DM_CADENCE = { daysAfterConnect: 2, dm2Gap: 3, dm3Gap: 4 };
 const MODEL = "gpt-5.4-mini";
 
 const atHdr = { Authorization: `Bearer ${AIRTABLE_KEY}`, "Content-Type": "application/json" };
+
+// ─── Feedback-loop prompt block (bounded) ───────────────────────────
+// Turns recent operator feedback rows into a compact "learned
+// preferences" block injected into the generation system prompt.
+// Capped at ~1500 chars total so it can't balloon the prompt or push
+// out the personalization rules. Most-recent-first (prefs already come
+// sorted that way). These are STYLE guidance only — the prompt's
+// internal-vs-public rules still bind, so prefs can never reintroduce
+// scores / rule names into public copy.
+const FEEDBACK_BLOCK_CHAR_CAP = 1500;
+function buildFeedbackBlock(label, prefs) {
+  if (!prefs || !prefs.length) return "";
+  const lines = [];
+  let used = 0;
+  for (const p of prefs) {
+    const note = (p.feedback_text || "").replace(/\s+/g, " ").trim();
+    if (!note) continue;
+    const span = (p.quoted_span || "").replace(/\s+/g, " ").trim();
+    const line = span
+      ? `- on "${span.slice(0, 120)}": ${note.slice(0, 240)}`
+      : `- ${note.slice(0, 240)}`;
+    if (used + line.length + 1 > FEEDBACK_BLOCK_CHAR_CAP) break;
+    lines.push(line);
+    used += line.length + 1;
+  }
+  if (!lines.length) return "";
+  return `OPERATOR FEEDBACK — ${label} (apply these learned preferences, most recent first):\n${lines.join("\n")}`;
+}
 
 function authOk(request) {
   if (!SIDEKICK_API_KEY) return false;
@@ -239,7 +268,7 @@ function detectInternalLeak(text) {
 // char limits, refusal detection) AND detectInternalLeak (catches AI
 // citing internal scoring data back to the prospect). On failure →
 // deterministic fallback.
-async function generateLeadDrafts(lead, scoring, campaignContext) {
+async function generateLeadDrafts(lead, scoring, campaignContext, feedbackBlocks = {}) {
   const f = lead?.fields || {};
   const names = deriveNames(f);
   const firstName = names.first || "there";
@@ -401,6 +430,18 @@ If any check fails, rewrite before outputting.
 Output JSON shape:
 { "connectionNote": "...", "dm1": "...", "dm2": "...", "dm3": "..." }`;
 
+  // ─── Inject learned operator preferences (feedback loop) ──────────
+  // connectionNote applies the connection_note feedback; the 3 DMs apply
+  // the dm feedback. Style guidance only — the internal-vs-public rules
+  // above still bind, so prefs can never reintroduce scores/rule names
+  // into public copy. Bounded per buildFeedbackBlock (~1500 chars each).
+  const cnBlock = feedbackBlocks.connection_note || "";
+  const dmBlock = feedbackBlocks.dm || "";
+  const feedbackSection = [
+    cnBlock ? `For the connectionNote field:\n${cnBlock}` : "",
+    dmBlock ? `For the dm1/dm2/dm3 fields:\n${dmBlock}` : "",
+  ].filter(Boolean).join("\n\n");
+
   const user = `LEAD:
   Name: ${leadName}
   Role: ${title} at ${company}
@@ -410,7 +451,7 @@ ${contextBlock}
 
 CAMPAIGN CONTEXT:
 ${campaignContext || "B2B outbound infrastructure — Side Kick builds AI-driven SDR systems for B2B companies that have outgrown traditional SDR agencies. Customers include companies running cold outbound at scale who want personalization without manual SDR overhead."}
-
+${feedbackSection ? `\n${feedbackSection}\n` : ""}
 Generate the 4 messages following ALL rules above. Cite ONLY from PUBLIC FACTS. NEVER cite anything from INTERNAL CONTEXT. If PUBLIC FACTS is empty, lean on company/role inference — do not invent activity.`;
 
   let resp;
@@ -655,13 +696,27 @@ export async function POST(request) {
       });
     }
 
+    // ─── Feedback loop: fetch recent operator prefs ONCE for the base ──
+    // connection_note prefs drive the connection note; dm prefs drive the
+    // 3 DMs. Fetched once and reused for every lead in the batch. Degrades
+    // gracefully — fetchPreferences returns [] if the table is absent, so
+    // generation still runs with no learned prefs.
+    const [cnPrefs, dmPrefs] = await Promise.all([
+      fetchPreferences(baseId, "connection_note", 15),
+      fetchPreferences(baseId, "dm", 15),
+    ]);
+    const feedbackBlocks = {
+      connection_note: buildFeedbackBlock("connection notes", cnPrefs),
+      dm: buildFeedbackBlock("DMs", dmPrefs),
+    };
+
     // Generate drafts (parallelism capped to avoid rate limits)
     const drafts = [];
     const PARALLEL = 3;
     for (let i = 0; i < ranked.length; i += PARALLEL) {
       const slice = ranked.slice(i, i + PARALLEL);
       const results = await Promise.all(slice.map(r =>
-        generateLeadDrafts(r.lead, r.scoring, campaignContext)
+        generateLeadDrafts(r.lead, r.scoring, campaignContext, feedbackBlocks)
       ));
       drafts.push(...results);
     }

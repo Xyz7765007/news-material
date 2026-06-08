@@ -266,6 +266,23 @@ const CAMPAIGN_TABLES = {
     { name: "Action Type", type: "singleLineText" },     // scan | refresh | status | null
     { name: "Action Result", type: "multilineText" },    // JSON of execution outcome (for bot messages)
   ],
+  // ─── Sidekick Feedback — operator feedback loop (closed loop) ──
+  // DEDICATED table (separate from Sidekick Chat ON PURPOSE): the chat
+  // history read (/api/sidekick/chat-history) reads ONLY Sidekick Chat,
+  // so feedback rows can NEVER pollute the chat orchestrator's context.
+  // The auto-batch + comment generators read these rows back as learned
+  // style preferences. Name MUST be first (primary, singleLineText).
+  "Sidekick Feedback": [
+    { name: "Name", type: "singleLineText" },  // primary — "item_type: note snippet"
+    { name: "Item Type", type: "singleSelect", options: { choices: [
+      { name: "comment" }, { name: "connection_note" }, { name: "dm" },
+    ] } },
+    { name: "Quoted Span", type: "multilineText" },  // the highlighted text reacted to
+    { name: "Feedback Text", type: "multilineText" }, // the operator's note
+    { name: "Lead Name", type: "singleLineText" },
+    { name: "Lead Company", type: "singleLineText" },
+    { name: "Created At", type: "dateTime", options: TZ_ISO },
+  ],
   "Sent Messages Review": [
     { name: "Lead Name", type: "singleLineText" },
     { name: "LinkedIn URL", type: "singleLineText" },
