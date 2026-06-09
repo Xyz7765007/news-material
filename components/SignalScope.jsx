@@ -1900,11 +1900,10 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     {id:"tasks",label:"Tasks",count:tasks.length},
     {id:"signal_review",label:"🔎 Connector Review",count:null},
     null,
-    {id:"outreach",label:"💬 LinkedIn Automation",count:null},
-    {id:"linkedin_posts",label:"📝 LinkedIn Posts",count:null},
-    {id:"email_campaign",label:"📧 Email Campaign",count:null},
+    // outreach / linkedin_posts / email_campaign / hubspot folded into the
+    // Connectors page as "Channels & integrations" instances (Kunal #11-full,
+    // 2026-06-09). Their tab===... panels + setTab(...) deep-links still work.
     {id:"google_analytics",label:"📊 Google Analytics",count:null},
-    {id:"hubspot",label:"🔗 HubSpot",count:null},
     {id:"post_demo",label:"🤖 Post-Demo Auto",count:null},
     ...(!clientMode ? [{id:"coming_soon",label:"🚀 Coming Soon",count:null}] : []),
   ].filter(n => n === null || !clientMode || !ADMIN_ONLY_TABS.has(n.id));
@@ -2023,7 +2022,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       if (accounts.length === 0) issues.push({ severity: "warn", text: "No accounts uploaded — needed for scanning", action: () => setTab("accounts") });
       if (rules.length === 0) issues.push({ severity: "warn", text: "No task rules configured", action: () => setTab("rules") });
       if (leads.length > 0 && leadsWithEmail.length / leads.length < 0.5) issues.push({ severity: "info", text: `${Math.round(leadsWithEmail.length / leads.length * 100)}% of leads have emails — enrich for higher coverage`, action: () => setTab("leads") });
-      if (hasOutreach && !linkedinAccount) issues.push({ severity: "warn", text: "LinkedIn outreach enabled but Unipile not connected", action: () => setTab("linkedin_outreach") });
+      if (hasOutreach && !linkedinAccount) issues.push({ severity: "warn", text: "LinkedIn outreach enabled but Unipile not connected", action: () => setTab("outreach") });
       if (tasks.length > 50 && !hsConnected) issues.push({ severity: "info", text: `${tasks.length} tasks ready — connect HubSpot to push them`, action: () => setTab("hubspot") });
 
       const StatTile = ({ label, value, sub, emoji, color, trend, onClick }) => (
@@ -2070,9 +2069,9 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         <SectionHeader title="📊 Activity Pulse" sub="What's happening right now" />
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(160px,1fr))",gap:10,marginBottom:8}}>
           <StatTile label="Tasks today" value={tasksToday.length} sub={`${tasksWeek.length} this week`} emoji="📋" color="var(--acc)" onClick={()=>setTab("tasks")} />
-          <StatTile label="GA visitors / wk" value={gaThisWeek.length} sub={`${gaTotalSessions} total sessions`} emoji="📈" color="var(--blu)" onClick={()=>setTab("ga")} />
-          <StatTile label="Hot leads (GA)" value={gaHot.length} sub={gaHot.length > 0 ? "Score 51+" : "No hot leads yet"} emoji="🔥" color={gaHot.length>0?"var(--red)":"var(--t3)"} onClick={()=>setTab("ga")} />
-          <StatTile label="LinkedIn replies" value={ot.replied || 0} sub={otReplyRate > 0 ? `${otReplyRate}% reply rate` : "—"} emoji="💬" color={ot.replied>0?"var(--grn)":"var(--t3)"} onClick={()=>setTab("linkedin_outreach")} />
+          <StatTile label="GA visitors / wk" value={gaThisWeek.length} sub={`${gaTotalSessions} total sessions`} emoji="📈" color="var(--blu)" onClick={()=>setTab("google_analytics")} />
+          <StatTile label="Hot leads (GA)" value={gaHot.length} sub={gaHot.length > 0 ? "Score 51+" : "No hot leads yet"} emoji="🔥" color={gaHot.length>0?"var(--red)":"var(--t3)"} onClick={()=>setTab("google_analytics")} />
+          <StatTile label="LinkedIn replies" value={ot.replied || 0} sub={otReplyRate > 0 ? `${otReplyRate}% reply rate` : "—"} emoji="💬" color={ot.replied>0?"var(--grn)":"var(--t3)"} onClick={()=>setTab("outreach")} />
         </div>
 
         {/* ───── PIPELINE ───── */}
@@ -2086,7 +2085,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
 
         {/* ───── GA ENGAGEMENT BREAKDOWN ───── */}
         {gaLeads.length > 0 && (<>
-          <SectionHeader title="📈 Website Engagement (GA)" sub={`${gaLeads.length} leads scored from analytics`} action={()=>setTab("ga")} />
+          <SectionHeader title="📈 Website Engagement (GA)" sub={`${gaLeads.length} leads scored from analytics`} action={()=>setTab("google_analytics")} />
           <div style={{display:"grid",gridTemplateColumns:"2fr 3fr",gap:14,marginBottom:8}}>
             {/* Engagement breakdown */}
             <div style={{padding:16,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10}}>
@@ -2119,7 +2118,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
                 const f = l.fields || {};
                 const score = f["GA Engagement Score"] || 0;
                 return (
-                  <div key={l.id} onClick={()=>setTab("ga")} style={{padding:"6px 0",borderBottom:"1px solid var(--bdr)",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <div key={l.id} onClick={()=>setTab("google_analytics")} style={{padding:"6px 0",borderBottom:"1px solid var(--bdr)",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                     <div style={{flex:1,minWidth:0}}>
                       <div style={{fontSize:11,color:"var(--t1)",fontWeight:500,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{f.Name || "(no name)"}</div>
                       <div style={{fontSize:9,color:"var(--t3)"}}>{f.Title || ""}{f.Title && f.Company ? " · " : ""}{f.Company || ""}</div>
@@ -2137,7 +2136,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
 
         {/* ───── OUTREACH ───── */}
         {(otTotal > 0 || hasOutreach) && (<>
-          <SectionHeader title="💬 LinkedIn Outreach" sub={otTotal > 0 ? `${otTotal} leads in queue` : "Configure rules to start"} action={()=>setTab("linkedin_outreach")} />
+          <SectionHeader title="💬 LinkedIn Outreach" sub={otTotal > 0 ? `${otTotal} leads in queue` : "Configure rules to start"} action={()=>setTab("outreach")} />
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))",gap:10,marginBottom:8}}>
             <StatTile label="Queued" value={ot.queued || 0} emoji="⏱" color="var(--t2)" />
             <StatTile label="Conn. sent" value={ot.connectionSent || 0} emoji="✉" color="var(--blu)" sub={otAcceptRate > 0 ? `${otAcceptRate}% accept` : null} />
@@ -2166,7 +2165,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
                 <div style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:10}}>
                   <div style={{fontSize:11,color:"var(--t3)",marginBottom:10,fontWeight:500,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                     <span>Reply intent distribution ({repliedItems.length} replies)</span>
-                    {interested.length > 0 && <button className="btn btn-s btn-p" style={{fontSize:9}} onClick={()=>setTab("linkedin_outreach")}>{interested.length} hot lead{interested.length===1?"":"s"} to action →</button>}
+                    {interested.length > 0 && <button className="btn btn-s btn-p" style={{fontSize:9}} onClick={()=>setTab("outreach")}>{interested.length} hot lead{interested.length===1?"":"s"} to action →</button>}
                   </div>
                   <div style={{display:"flex",height:8,borderRadius:4,overflow:"hidden",background:"var(--hover)",marginBottom:8}}>
                     {Object.entries(byIntent).sort((a,b) => b[1] - a[1]).map(([k, v]) => {
@@ -2192,7 +2191,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
                       {interested.slice(0,3).map(q => {
                         const f = q.fields || {};
                         return (
-                          <div key={q.id} onClick={()=>setTab("linkedin_outreach")} style={{padding:"6px 0",borderBottom:"1px solid var(--bdr)",cursor:"pointer",fontSize:10}}>
+                          <div key={q.id} onClick={()=>setTab("outreach")} style={{padding:"6px 0",borderBottom:"1px solid var(--bdr)",cursor:"pointer",fontSize:10}}>
                             <div style={{color:"var(--t1)",fontWeight:500}}>{f["Lead Name"] || "—"} <span style={{color:"var(--t3)",fontWeight:400}}>· {f.Company || ""}</span></div>
                             {f["Reply Summary"] && <div style={{color:"var(--t2)",marginTop:2,fontSize:10}}>"{f["Reply Summary"].slice(0, 120)}{f["Reply Summary"].length > 120 ? "..." : ""}"</div>}
                             {f["Reply Suggested Action"] && <div style={{color:"var(--grn)",marginTop:2,fontSize:9}}>→ {f["Reply Suggested Action"].slice(0, 100)}</div>}
@@ -2262,9 +2261,9 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(170px,1fr))",gap:10}}>
           {[
             {n:"Airtable",ok:!!bid,sub:bid?"Connected":"Not connected"},
-            {n:"LinkedIn",ok:!!linkedinAccount,sub:linkedinAccount?linkedinAccount.name:"Not connected",onClick:()=>setTab("linkedin_outreach")},
+            {n:"LinkedIn",ok:!!linkedinAccount,sub:linkedinAccount?linkedinAccount.name:"Not connected",onClick:()=>setTab("outreach")},
             {n:"HubSpot",ok:hsConnected,sub:hsConnected?"Connected":"Not connected",onClick:()=>setTab("hubspot")},
-            {n:"Google Analytics",ok:gaLeads.length > 0,sub:gaLeads.length>0?`${gaLeads.length} leads scored`:"Not configured",onClick:()=>setTab("ga")},
+            {n:"Google Analytics",ok:gaLeads.length > 0,sub:gaLeads.length>0?`${gaLeads.length} leads scored`:"Not configured",onClick:()=>setTab("google_analytics")},
             {n:"Smartlead",ok:false,sub:"Email Campaign tab",onClick:()=>setTab("email_campaign")},
             {n:"Apollo (Enrich)",ok:tasksWithPhone.length>0,sub:tasksWithPhone.length>0?`${tasksWithPhone.length} enriched`:"Not used yet"},
           ].map(ig => (
@@ -2461,6 +2460,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
 
   {/* ════ HUBSPOT — admin only ════ */}
   {tab==="hubspot"&&!loading&&!clientMode&&(<div>
+    <div style={{fontSize:12,color:"var(--acc)",cursor:"pointer",marginBottom:10,display:"inline-block"}} onClick={()=>setTab("rules")}>← Connectors</div>
     <div className="ph"><div><div className="pt">🔗 HubSpot Integration</div><div className="pd">Connect HubSpot, push tasks, manage enrichment</div></div></div>
 
     {/* Connection */}
@@ -2586,7 +2586,10 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   </div>)}
 
   {/* ════ EMAIL CAMPAIGN — admin only ════ */}
-  {tab==="email_campaign"&&!loading&&!clientMode&&(<EmailCampaignTab baseId={bid} campaign={camp} leads={leads} prefilledLeadId={emailPrefilledLeadId} />)}
+  {tab==="email_campaign"&&!loading&&!clientMode&&(<div>
+    <div style={{fontSize:12,color:"var(--acc)",cursor:"pointer",marginBottom:10,display:"inline-block"}} onClick={()=>setTab("rules")}>← Connectors</div>
+    <EmailCampaignTab baseId={bid} campaign={camp} leads={leads} prefilledLeadId={emailPrefilledLeadId} />
+  </div>)}
 
   {/* ════ COMING SOON ════ */}
   {tab==="coming_soon"&&(<div>
@@ -2870,6 +2873,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
             <div style={{display:"flex",alignItems:"center",gap:8,minWidth:0}}><span style={{fontSize:18}}>💬</span><span style={{fontSize:14,fontWeight:600,color:"var(--t1)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{f.Name}</span></div>
             <div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}>
               <span className="chip ca">outreach</span>
+              <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>{deliveryBadge(f)}</span>
               <span className="chip" style={{background:"var(--hover)",color:config.active?"var(--grn)":"var(--amb)"}}>{config.active?"● active":"○ inactive"}</span>
             </div>
           </div>
@@ -2879,6 +2883,36 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
           </div>
         </div>);})}
     </div>}
+
+    {/* Channels & integrations — fixed delivery/integration instances folded in
+        from standalone nav tabs (Kunal #11-full). Always render (independent of
+        the Task-Rule connectors above) so these surfaces stay reachable even with
+        zero signal-source connectors. Not Task-Rule-backed → no count/delete,
+        just an Open affordance. */}
+    <div style={{height:1,background:"var(--bdr)",margin:"24px 0 16px"}}/>
+    <div style={{fontSize:12,fontWeight:600,color:"var(--t2)",marginBottom:4}}>Channels &amp; integrations</div>
+    <div style={{fontSize:11,color:"var(--t3)",marginBottom:12}}>Where detected events get delivered, plus connected systems.</div>
+    <div style={{display:"flex",flexDirection:"column",gap:12}}>
+      {[
+        {emoji:"📝",name:"LinkedIn Posts",desc:"Scan each account's LinkedIn engagement.",tab:"linkedin_posts"},
+        {emoji:"💬",name:"LinkedIn Automation",desc:"Connection requests + DM sequences.",tab:"outreach"},
+        {emoji:"📧",name:"Email Campaign",desc:"Smartlead-driven email sequences.",tab:"email_campaign"},
+        {emoji:"🔗",name:"HubSpot",desc:"Connect HubSpot, push tasks, sync CRM.",tab:"hubspot"},
+      ].map(c=>(
+        <div key={c.tab} style={{padding:16,border:"1px solid var(--bdr)",borderRadius:10,background:"var(--card)"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10}}>
+            <div style={{display:"flex",alignItems:"center",gap:10,minWidth:0}}>
+              <span style={{fontSize:18}}>{c.emoji}</span>
+              <div style={{minWidth:0}}>
+                <div style={{fontSize:14,fontWeight:600,color:"var(--t1)"}}>{c.name}</div>
+                <div style={{fontSize:11,color:"var(--t3)"}}>{c.desc}</div>
+              </div>
+            </div>
+            <button className="btn btn-s btn-p" style={{flexShrink:0}} onClick={()=>{setTab(c.tab);if(c.tab==="outreach")loadOutreachStats();}}>Open →</button>
+          </div>
+        </div>
+      ))}
+    </div>
     </div>);
   })()}
 
@@ -3172,10 +3206,14 @@ Output format (strict JSON, no markdown):
   })()}
 
   {/* ════ LINKEDIN POSTS SCANNER ════ */}
-  {tab==="linkedin_posts"&&!loading&&!clientMode&&(<LinkedInPostsTab baseId={bid} campaign={camp} leads={leads} onCampaignProvisioned={(newCamp)=>{setCamp(newCamp);setCampaigns(p=>p.map(c=>c.id===newCamp.id?newCamp:c));}}/>)}
+  {tab==="linkedin_posts"&&!loading&&!clientMode&&(<div>
+    <div style={{fontSize:12,color:"var(--acc)",cursor:"pointer",marginBottom:10,display:"inline-block"}} onClick={()=>setTab("rules")}>← Connectors</div>
+    <LinkedInPostsTab baseId={bid} campaign={camp} leads={leads} onCampaignProvisioned={(newCamp)=>{setCamp(newCamp);setCampaigns(p=>p.map(c=>c.id===newCamp.id?newCamp:c));}}/>
+  </div>)}
 
   {/* ════ LINKEDIN AUTOMATION ════ */}
   {tab==="outreach"&&!loading&&!clientMode&&(<div>
+    <div style={{fontSize:12,color:"var(--acc)",cursor:"pointer",marginBottom:10,display:"inline-block"}} onClick={()=>setTab("rules")}>← Connectors</div>
     <div className="ph"><div><div className="pt">💬 LinkedIn Automation</div><div className="pd">Connection requests, DM sequences & outreach tracking</div></div>
       <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
         {linkedinAccount && <button className="btn btn-s btn-p" onClick={()=>setManualModal({mode:"select_leads"})} disabled={outreachLoading}>✋ Manual Mode</button>}
