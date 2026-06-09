@@ -2141,11 +2141,71 @@ export async function POST(request) {
       }
 
       case "mark_connected": {
-        // Manually mark a lead's connection as accepted (user confirmed on LinkedIn)
+        // Manually mark a lead's connection as accepted (user confirmed on LinkedIn).
+        // Also sets Next Action Date = now+2d so DM1 becomes due 2 days after acceptance
+        // (drives the chatbot manual-assist feed's "dm step 1 due" state).
         if (!baseId || !body.outreachItemIds?.length) return NextResponse.json({ error: "baseId and outreachItemIds required" }, { status: 400 });
-        const updates = body.outreachItemIds.map(id => ({ id, fields: { Status: "connected", "Connection Accepted At": new Date().toISOString() } }));
+        const acceptedAt = new Date();
+        const dm1Due = new Date(acceptedAt.getTime() + 2 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        const updates = body.outreachItemIds.map(id => ({ id, fields: {
+          Status: "connected",
+          Mode: "manual",
+          "Connection Accepted At": acceptedAt.toISOString(),
+          "Next Action Date": dm1Due,
+        } }));
         await atUpdate(baseId, "Outreach", updates);
         return NextResponse.json({ marked: updates.length });
+      }
+
+      case "record_manual_connection_sent": {
+        // MANUAL-WITH-ASSIST: the exec sent the connection request by hand on LinkedIn.
+        // NO Unipile call — this only records state in Airtable.
+        // body: { baseId, outreachItemIds[] }
+        if (!baseId || !body.outreachItemIds?.length) return NextResponse.json({ error: "baseId and outreachItemIds required" }, { status: 400 });
+        const sentAt = new Date().toISOString();
+        // Read existing Notes so we can append rather than overwrite.
+        const queue = await atList(baseId, "Outreach");
+        const byId = new Map(queue.map(r => [r.id, r]));
+        const updates = body.outreachItemIds.map(id => {
+          const prevNotes = byId.get(id)?.fields?.Notes || "";
+          return { id, fields: {
+            Status: "connection_sent",
+            Mode: "manual",
+            "Connection Sent At": sentAt,
+            Notes: `${prevNotes}\n[${sentAt}] manual connection sent`.trim(),
+          } };
+        });
+        await atUpdate(baseId, "Outreach", updates);
+        return NextResponse.json({ marked: updates.length });
+      }
+
+      case "record_manual_dm_sent": {
+        // MANUAL-WITH-ASSIST: the exec sent DM {step} by hand on LinkedIn.
+        // NO Unipile call — this only records state + schedules the next step's due date.
+        // body: { baseId, outreachItemId, step } where step ∈ {1,2,3}
+        if (!baseId || !body.outreachItemId) return NextResponse.json({ error: "baseId and outreachItemId required" }, { status: 400 });
+        const step = Number(body.step);
+        if (![1, 2, 3].includes(step)) return NextResponse.json({ error: "step must be 1, 2, or 3" }, { status: 400 });
+        const now = new Date();
+        const sentAt = now.toISOString();
+        const status = step === 3 ? "completed" : `dm_${step}`;
+        // DM1 → DM2 due in +4d; DM2 → DM3 due in +5d; DM3 = done (no next date).
+        const nextActionDate = step === 1
+          ? new Date(now.getTime() + 4 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+          : step === 2
+            ? new Date(now.getTime() + 5 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+            : "";
+        const rec = await atList(baseId, "Outreach", { filterByFormula: `RECORD_ID() = '${body.outreachItemId}'` });
+        const prevNotes = rec[0]?.fields?.Notes || "";
+        await atUpdate(baseId, "Outreach", [{ id: body.outreachItemId, fields: {
+          "DM Step": step,
+          Status: status,
+          Mode: "manual",
+          "Last DM Sent At": sentAt,
+          "Next Action Date": nextActionDate,
+          Notes: `${prevNotes}\n[${sentAt}] manual DM ${step} sent`.trim(),
+        } }]);
+        return NextResponse.json({ ok: true, status });
       }
 
       case "trigger_manual_dms": {

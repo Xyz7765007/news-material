@@ -120,8 +120,9 @@ export async function POST(request) {
         id: r.id,
         fields: {
           Status: "queued",
+          Mode: "manual",
           "Next Action Date": new Date().toISOString().slice(0, 10),
-          Notes: `${r.fields?.Notes || ""}\n[${today}] Approved via batch send_all`.trim(),
+          Notes: `${r.fields?.Notes || ""}\n[${today}] Approved (manual-assist) via batch send_all`.trim(),
         },
       }));
       const updated = await atUpdate(baseId, "Outreach", updates);
@@ -138,8 +139,9 @@ export async function POST(request) {
         id: recordId,
         fields: {
           Status: "queued",
+          Mode: "manual",
           "Next Action Date": new Date().toISOString().slice(0, 10),
-          Notes: `${rec.fields?.Notes || ""}\n[${today}] Approved via send_one`.trim(),
+          Notes: `${rec.fields?.Notes || ""}\n[${today}] Approved (manual-assist) via send_one`.trim(),
         },
       }]);
       return NextResponse.json({ ok: true, action: "send_one", recordId, count: updated.length });

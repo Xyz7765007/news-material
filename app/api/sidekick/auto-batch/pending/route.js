@@ -7,6 +7,13 @@ import { NextResponse } from "next/server";
 // Returns active batches (records in "Outreach" with Status=pending_approval),
 // grouped by Batch ID, with all pre-generated drafts inline so the chatbot
 // can render them without a second roundtrip.
+//
+// ALSO returns `outreach_queue` (added 2026-06-09, Kunal Batch-2 #18/#19): the
+// IN-FLIGHT Outreach records that need a MANUAL action by the exec on LinkedIn,
+// each annotated with a computed `nextAction` so the frontend knows what to
+// render (send connection / mark accepted / send DM N / waiting). This drives
+// the manual-with-assist outreach card. The existing `batches` shape is
+// unchanged — `outreach_queue` is purely additive.
 // ═══════════════════════════════════════════════════════════════════
 
 export const dynamic = "force-dynamic";
@@ -35,44 +42,140 @@ export async function GET(request) {
   }
 
   try {
-    const qs = new URLSearchParams({
-      filterByFormula: "{Status} = 'pending_approval'",
-      pageSize: "100",
-      "sort[0][field]": "Composite Score",
-      "sort[0][direction]": "desc",
+    // Pull pending_approval (for `batches`) AND the in-flight manual-assist
+    // statuses (for `outreach_queue`) in one paged list. We filter client-side
+    // by Status so we never depend on a sort field existing.
+    const records = await atListAll(baseId, "Outreach");
+    const pending = records.filter(r => (r.fields?.Status || "") === "pending_approval");
+    return NextResponse.json({
+      ok: true,
+      batches: groupBatches(pending),
+      outreach_queue: buildOutreachQueue(records),
     });
-    const r = await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Outreach")}?${qs}`, {
+  } catch (e) {
+    if (/INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND/.test(String(e.message))) {
+      // Outreach table doesn't exist yet in this base — degrade gracefully.
+      return NextResponse.json({ ok: true, batches: [], outreach_queue: [] });
+    }
+    return NextResponse.json({ ok: false, error: e.message }, { status: 500 });
+  }
+}
+
+// Paged list of all records in a table (no sort dependency).
+async function atListAll(baseId, table) {
+  const all = [];
+  let offset = null;
+  do {
+    const qs = new URLSearchParams({ pageSize: "100" });
+    if (offset) qs.set("offset", offset);
+    const r = await fetch(`${AT_API}/${baseId}/${encodeURIComponent(table)}?${qs}`, {
       headers: { Authorization: `Bearer ${AIRTABLE_KEY}` },
       cache: "no-store",
     });
-
     if (!r.ok) {
       const t = await r.text();
-      if (r.status === 403 && /INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND/.test(t)) {
-        return NextResponse.json({ ok: true, batches: [] });
+      throw new Error(`Airtable ${r.status}: ${t.slice(0, 200)}`);
+    }
+    const d = await r.json();
+    all.push(...(d.records || []));
+    offset = d.offset;
+  } while (offset);
+  return all;
+}
+
+// ── Manual-with-assist queue ───────────────────────────────────────
+// For each in-flight Outreach record, compute the single next manual action
+// the exec must perform on LinkedIn. NO automation — the exec sends by hand.
+//
+// nextAction.type:
+//   "connection" — send the connection request (queued / pending_approval / connection_sent-not-yet pre)
+//   "accept"     — connection request sent, mark when accepted
+//   "dm"         — a DM step is DUE (step 1/2/3)
+//   "waiting"    — a DM step is scheduled but not yet due (show countdown)
+//
+// Due check: Next Action Date empty OR <= today (YYYY-MM-DD lexical compare,
+// both ISO dates, is correct).
+function buildOutreachQueue(records) {
+  const today = new Date().toISOString().slice(0, 10);
+  const isDue = (dateVal) => {
+    const d = String(dateVal || "").slice(0, 10);
+    return !d || d <= today;
+  };
+
+  const out = [];
+  for (const rec of records) {
+    const f = rec.fields || {};
+    const status = f.Status || "";
+    const mode = f.Mode || "";
+    const linkedinUrl = f["LinkedIn URL"] || "";
+    const nextDate = f["Next Action Date"] || "";
+
+    // Manual-assist queue ONLY surfaces records the cron will NOT touch
+    // (Mode === "manual"). Auto/auto_batch records are cron-driven and must
+    // never appear as manual cards — that would double-send. pending_approval
+    // records are not approved yet and belong only in `batches` (DailyBatchCard).
+    if (mode !== "manual") continue;
+
+    let nextAction = null;
+
+    if (status === "queued") {
+      // Approved + flipped to manual — the next manual move is to send the
+      // connection request. messageToCopy comes from the GENERATED note ONLY
+      // (never summary/signal/score_reason).
+      nextAction = {
+        type: "connection",
+        label: "Send connection request",
+        messageToCopy: f["Generated Connection Note"] || "",
+        linkedinUrl,
+      };
+    } else if (status === "connection_sent") {
+      nextAction = {
+        type: "accept",
+        label: "Mark when accepted",
+        messageToCopy: null,
+        linkedinUrl,
+      };
+    } else if (status === "connected") {
+      if (isDue(nextDate)) {
+        nextAction = { type: "dm", step: 1, label: "Send DM 1", messageToCopy: f["Generated DM 1"] || "", linkedinUrl };
+      } else {
+        nextAction = { type: "waiting", step: 1, label: "DM 1 scheduled", dueDate: nextDate, linkedinUrl };
       }
-      // Sort field missing = degrade gracefully (no sort)
-      if (r.status === 422) {
-        const qs2 = new URLSearchParams({
-          filterByFormula: "{Status} = 'pending_approval'",
-          pageSize: "100",
-        });
-        const r2 = await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Outreach")}?${qs2}`, {
-          headers: { Authorization: `Bearer ${AIRTABLE_KEY}` },
-          cache: "no-store",
-        });
-        if (!r2.ok) return NextResponse.json({ ok: false, error: "Airtable error" }, { status: 502 });
-        const d2 = await r2.json();
-        return NextResponse.json({ ok: true, batches: groupBatches(d2.records || []) });
+    } else if (status === "dm_1") {
+      if (isDue(nextDate)) {
+        nextAction = { type: "dm", step: 2, label: "Send DM 2", messageToCopy: f["Generated DM 2"] || "", linkedinUrl };
+      } else {
+        nextAction = { type: "waiting", step: 2, label: "DM 2 scheduled", dueDate: nextDate, linkedinUrl };
       }
-      return NextResponse.json({ ok: false, error: `Airtable ${r.status}` }, { status: 502 });
+    } else if (status === "dm_2") {
+      if (isDue(nextDate)) {
+        nextAction = { type: "dm", step: 3, label: "Send DM 3", messageToCopy: f["Generated DM 3"] || "", linkedinUrl };
+      } else {
+        nextAction = { type: "waiting", step: 3, label: "DM 3 scheduled", dueDate: nextDate, linkedinUrl };
+      }
     }
 
-    const d = await r.json();
-    return NextResponse.json({ ok: true, batches: groupBatches(d.records || []) });
-  } catch (e) {
-    return NextResponse.json({ ok: false, error: e.message }, { status: 500 });
+    // Skip terminal/irrelevant statuses (completed, replied, skipped, error, etc.)
+    if (!nextAction) continue;
+
+    out.push({
+      id: rec.id,
+      lead_name: f["Lead Name"] || "Unknown",
+      company: f.Company || "",
+      title: f.Title || "",
+      signal: f.Signal || "",
+      message: nextAction.messageToCopy || "",
+      linkedin_url: linkedinUrl,
+      status,
+      dueDate: nextDate,
+      nextAction,
+    });
   }
+
+  // Due items first (connection / accept / dm), then waiting items.
+  const order = { connection: 0, accept: 1, dm: 2, waiting: 3 };
+  out.sort((a, b) => (order[a.nextAction.type] ?? 9) - (order[b.nextAction.type] ?? 9));
+  return out;
 }
 
 function groupBatches(records) {
