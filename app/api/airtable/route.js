@@ -159,7 +159,7 @@ async function createRecords(baseId, table, records) {
   await autoEnsureFields(baseId, table, records);
   const results = [];
   for (let i = 0; i < records.length; i += 10) {
-    const batch = records.slice(i, i + 10).map(r => ({ fields: sanitizeFields(r) }));
+    const batch = records.slice(i, i + 10).map(r => ({ fields: sanitizeFields(r.fields || r) }));
     const validBatch = batch.filter(r => Object.keys(r.fields).length > 0);
     if (!validBatch.length) continue;
 
