@@ -31,7 +31,7 @@ const SRC_OPTS = ["News","New Hires","Job Posts","Social","Exits / Promotions","
 
 // ─── All available features ──────────────────────────────────
 const ALL_FEATURES = [
-  { id: "news", label: "News Scanning", emoji: "📰", desc: "Scan RSS feeds and news sources for company signals" },
+  { id: "news", label: "News Scanning", emoji: "📰", desc: "Scan RSS feeds and news sources for company-level events" },
   { id: "job_posts", label: "Job Post Tracking", emoji: "📋", desc: "Track LinkedIn job postings at target companies" },
   { id: "top_x", label: "Top X Scoring", emoji: "🎯", desc: "Rank leads/accounts by weighted field scoring" },
   { id: "linkedin_outreach", label: "LinkedIn Outreach", emoji: "💬", desc: "Automated LinkedIn connection requests & DM sequences" },
@@ -1703,7 +1703,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       const totalDupes = exactDupes + aiRemoved;
       setScanText(`✅ ${deduped.length} tasks created${totalDupes>0?` (${totalDupes} duplicates removed${aiRemoved>0?`, ${aiRemoved} by AI`:""})`:""}${fetchWarning}`);
     } else {
-      setScanText((exactDupes > 0 ? `✅ Scan complete — ${exactDupes} duplicates skipped, no new tasks` : "✅ Scan complete — no signals found") + fetchWarning);
+      setScanText((exactDupes > 0 ? `✅ Scan complete — ${exactDupes} duplicates skipped, no new tasks` : "✅ Scan complete — no new tasks found") + fetchWarning);
     }
     // ── Flush Signal Archive (unqualified near-misses + suppressed duplicates) ──
     // Best-effort and non-blocking on failure: archiving must never sink a scan.
@@ -2017,7 +2017,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
 
       // Health checks
       const issues = [];
-      if (accounts.length === 0) issues.push({ severity: "warn", text: "No accounts uploaded — needed for signal scanning", action: () => setTab("accounts") });
+      if (accounts.length === 0) issues.push({ severity: "warn", text: "No accounts uploaded — needed for scanning", action: () => setTab("accounts") });
       if (rules.length === 0) issues.push({ severity: "warn", text: "No task rules configured", action: () => setTab("rules") });
       if (leads.length > 0 && leadsWithEmail.length / leads.length < 0.5) issues.push({ severity: "info", text: `${Math.round(leadsWithEmail.length / leads.length * 100)}% of leads have emails — enrich for higher coverage`, action: () => setTab("leads") });
       if (hasOutreach && !linkedinAccount) issues.push({ severity: "warn", text: "LinkedIn outreach enabled but Unipile not connected", action: () => setTab("linkedin_outreach") });
@@ -2763,7 +2763,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     // Type metadata for the uniform card badges + the type picker.
     const CONNECTOR_TYPES = [
       {key:"news",emoji:"📰",label:"News",badge:"cg",blurb:"Monitor Google News for company-level events at your accounts.",preset:{taskType:"news",sources:["News"]}},
-      {key:"job_post",emoji:"📋",label:"Job Posts",badge:"cb",blurb:"Track LinkedIn job postings that signal buying intent.",preset:{taskType:"job_post",sources:["Job Posts"]}},
+      {key:"job_post",emoji:"📋",label:"Job Posts",badge:"cb",blurb:"Track LinkedIn job postings that point to buying intent.",preset:{taskType:"job_post",sources:["Job Posts"]}},
       {key:"company_post",emoji:"📣",label:"Company Posts",badge:"ca",blurb:"Watch each account's own LinkedIn company-page posts.",preset:{taskType:"company_post",sources:["Social"],scanTarget:"accounts"}},
       {key:"top_x",emoji:"🎯",label:"Top X",badge:"cp",blurb:"Rank your leads or accounts by weighted + AI scoring.",preset:{taskType:"top_x"}},
       {key:"linkedin_outreach",emoji:"💬",label:"Outreach",badge:"ca",blurb:"Automated LinkedIn connection + DM sequences.",preset:{taskType:"linkedin_outreach"}},
