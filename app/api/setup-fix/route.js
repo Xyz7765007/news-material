@@ -201,6 +201,17 @@ const CAMPAIGN_TABLES = {
     { name: "Scan Target", type: "singleLineText" },
     { name: "Date", type: "date", options: { dateFormat: { name: "iso" } } },
     { name: "Created", type: "dateTime", options: TZ_ISO },
+    // ─── Post-freshness gate (linkedin_engagement) ────────────
+    // Post Date is the UNDERLYING POST's true publish date (from the scan
+    // provider), distinct from Created/Date (the scan timestamp). The feed
+    // freshness gate keys off THIS for linkedin_engagement tasks: a post is
+    // 1-6 days old when fetched but ages each day, so a task whose Post Date
+    // is >7 days old must drop out of the chatbot feed even though Created is
+    // recent (2026-06-09). Archived At is a DISTINCT archive marker — NOT
+    // Handled At (which means operator-handled) — so aged-out tasks are
+    // excluded from the feed yet stay queryable + analytics-clean.
+    { name: "Post Date", type: "date", options: { dateFormat: { name: "iso" } } },
+    { name: "Archived At", type: "dateTime", options: TZ_ISO },
     // ─── Side Kick chatbot integration ────────────────────────
     // When a user clicks a CTA in the chatbot, the action endpoint
     // stamps these fields. "Handled At" empty = pending (shows up
@@ -234,7 +245,7 @@ const CAMPAIGN_TABLES = {
   // Company is first so it becomes the Airtable primary (primary can't be select).
   "Signal Archive": [
     { name: "Company", type: "singleLineText" },
-    { name: "Signal Status", type: "singleSelect", options: { choices: [{ name: "unqualified" }, { name: "duplicate" }] } },
+    { name: "Signal Status", type: "singleSelect", options: { choices: [{ name: "unqualified" }, { name: "duplicate" }, { name: "aged_out" }] } },
     { name: "Score", type: "number", options: { precision: 0 } },
     { name: "Score Reason", type: "multilineText" },
     { name: "Signal", type: "multilineText" },

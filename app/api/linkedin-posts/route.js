@@ -1302,6 +1302,14 @@ async function runLinkedInPostScan({
       const roleCaution = roleInfo.status === "changed" ? `⚠ ROLE CHECK: ${roleInfo.reason}` : null;
       const records = taskWorthy.map(sp => {
         const postUrl = sp.post.url || "";
+        // Underlying post's TRUE publish date (ISO from the provider, or the
+        // best-guess "now" for undatable posts — see fetchPostsForUrn). Stored
+        // as Post Date so the feed freshness gate can age the task out by post
+        // age (1-6d at fetch, ages daily) rather than by scan time (2026-06-09).
+        const postDateStr = (() => {
+          const d = new Date(sp.post.date || nowISO);
+          return isNaN(d.getTime()) ? todayStr : d.toISOString().slice(0, 10);
+        })();
         // Build a transparent Signal that shows the SDR exactly why this post passed.
         // Put the post URL at the TOP so it's always visible even if a dedicated URL field
         // doesn't exist in the user's Tasks table.
@@ -1343,6 +1351,7 @@ async function runLinkedInPostScan({
             "Signal URL": postUrl,     // alt name — some schemas use this
             Source: "LinkedIn Posts (RapidAPI)",
             "Task Type": "linkedin_engagement",
+            "Post Date": postDateStr,   // underlying post publish date → feed freshness gate
             Date: todayStr,
             Created: nowISO,
           },

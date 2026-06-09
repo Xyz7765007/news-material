@@ -85,7 +85,25 @@ function formatCard(record) {
 //   Assumes Created is a dateTime field — setup-fix ensures this. Older
 //   text-type Created columns will fail DATETIME comparisons silently and
 //   tasks fall through unfiltered (acceptable degraded behaviour).
-const PENDING_FILTER = `AND({Handled At} = BLANK(), {LinkedIn URL} != BLANK(), OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
+//
+//   4. NEW (2026-06-09 post-freshness gate): a linkedin_engagement task is
+//      gated by the UNDERLYING POST's publish date ({Post Date}), not the scan
+//      time. A post is 1-6 days old when fetched and ages daily, so a task
+//      fetched at 6 days becomes 8 days two days later — it must drop out of the
+//      feed. If {Post Date} is set AND older than 7 days, the task is excluded.
+//      Tasks with a blank {Post Date} (legacy rows, undatable posts) fall back
+//      to the Created-window above so behaviour never regresses.
+//   5. {Archived At} must be BLANK. Distinct from {Handled At} (operator-
+//      handled) — aged-out post tasks get an Archived At stamp + a Signal
+//      Archive copy (surfaced in the in-app Signal Review tab) so they leave the
+//      feed but stay queryable and analytics-clean.
+const POST_DATE_GATE = `NOT(AND(FIND("linkedin_engagement", {Task Type}), {Post Date} != BLANK(), NOT(IS_AFTER({Post Date}, DATEADD(NOW(), -7, 'days')))))`;
+const PENDING_FILTER = `AND({Handled At} = BLANK(), {Archived At} = BLANK(), {LinkedIn URL} != BLANK(), ${POST_DATE_GATE}, OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
+// Legacy filter (pre-2026-06-09): used as a graceful fallback for campaign bases
+// that haven't run setup-fix yet, so the new {Post Date}/{Archived At} fields
+// don't exist. Without this fallback, the new formula would 422 and take the
+// feed down for un-migrated campaigns. Once setup-fix runs, PENDING_FILTER wins.
+const LEGACY_PENDING_FILTER = `AND({Handled At} = BLANK(), {LinkedIn URL} != BLANK(), OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
 
 export async function GET(request) {
   if (!authOk(request)) {
@@ -102,33 +120,47 @@ export async function GET(request) {
   }
   const limit = Math.min(parseInt(url.searchParams.get("limit") || "20", 10) || 20, 100);
 
-  // Filter (PENDING_FILTER above): pending tasks, excluding stale GA-engagement (>7d).
-  // Sort: highest Score first, then most recent Created.
-  const params = new URLSearchParams({
-    filterByFormula: PENDING_FILTER,
+  // Filter (PENDING_FILTER above): pending tasks, excluding stale GA-engagement (>7d)
+  // and post-date-aged linkedin_engagement (>7d). Sort: Score desc, then Created desc.
+  const buildParams = (filter) => new URLSearchParams({
+    filterByFormula: filter,
     "sort[0][field]": "Score",
     "sort[0][direction]": "desc",
     "sort[1][field]": "Created",
     "sort[1][direction]": "desc",
     pageSize: String(Math.min(limit, 100)),
   });
+  const fetchTasks = (filter) => fetch(
+    `${AT_API}/${baseId}/${encodeURIComponent("Tasks")}?${buildParams(filter).toString()}`,
+    { headers: { Authorization: `Bearer ${AIRTABLE_KEY}` }, cache: "no-store" }
+  );
 
   try {
-    const r = await fetch(`${AT_API}/${baseId}/${encodeURIComponent("Tasks")}?${params.toString()}`, {
-      headers: { Authorization: `Bearer ${AIRTABLE_KEY}` },
-      cache: "no-store",
-    });
+    let r = await fetchTasks(PENDING_FILTER);
     if (!r.ok) {
       const errText = await r.text();
       // 403 INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND when the Tasks table doesn't exist yet
       if (r.status === 403 && errText.includes("INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND")) {
         return NextResponse.json({ ok: true, count: 0, cards: [], note: "Tasks table not found in this base" });
       }
-      // 422 UNKNOWN_FIELD when Handled At doesn't exist yet (campaign hasn't run setup-fix)
-      if (r.status === 422 && errText.includes("UNKNOWN_FIELD_NAME")) {
+      // 422 UNKNOWN_FIELD when a referenced field doesn't exist yet (campaign hasn't
+      // run setup-fix). If it's one of the NEW post-freshness fields, gracefully
+      // retry with the legacy filter so the feed keeps working until setup-fix runs.
+      if (r.status === 422 && errText.includes("UNKNOWN_FIELD_NAME") &&
+          (errText.includes("Post Date") || errText.includes("Archived At"))) {
+        r = await fetchTasks(LEGACY_PENDING_FILTER);
+        if (!r.ok) {
+          const e2 = await r.text();
+          if (r.status === 422 && e2.includes("UNKNOWN_FIELD_NAME")) {
+            return NextResponse.json({ ok: false, error: "Handled At field missing in Tasks table. Run POST /api/setup-fix to add it.", needsSetup: true }, { status: 412 });
+          }
+          return NextResponse.json({ ok: false, error: `Airtable returned ${r.status}`, detail: e2.slice(0, 500) }, { status: 502 });
+        }
+      } else if (r.status === 422 && errText.includes("UNKNOWN_FIELD_NAME")) {
         return NextResponse.json({ ok: false, error: "Handled At field missing in Tasks table. Run POST /api/setup-fix to add it.", needsSetup: true }, { status: 412 });
+      } else {
+        return NextResponse.json({ ok: false, error: `Airtable returned ${r.status}`, detail: errText.slice(0, 500) }, { status: 502 });
       }
-      return NextResponse.json({ ok: false, error: `Airtable returned ${r.status}`, detail: errText.slice(0, 500) }, { status: 502 });
     }
     const data = await r.json();
     const records = (data.records || []).slice(0, limit);

@@ -41,15 +41,21 @@ export async function GET(request) {
 
   // Same filter as /feed (see comments there) — keeps badge consistent.
   // Time-sensitive types (engagement, linkedin_engagement, lead_movement) age
-  // out after 7 days; all other types remain regardless of age.
-  const PENDING_FILTER = `AND({Handled At} = BLANK(), {LinkedIn URL} != BLANK(), OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
+  // out after 7 days; all other types remain regardless of age. linkedin_engagement
+  // ALSO ages out by the underlying post's publish date ({Post Date}); archived
+  // tasks ({Archived At} set) are excluded. (2026-06-09 post-freshness gate.)
+  const POST_DATE_GATE = `NOT(AND(FIND("linkedin_engagement", {Task Type}), {Post Date} != BLANK(), NOT(IS_AFTER({Post Date}, DATEADD(NOW(), -7, 'days')))))`;
+  const PENDING_FILTER = `AND({Handled At} = BLANK(), {Archived At} = BLANK(), {LinkedIn URL} != BLANK(), ${POST_DATE_GATE}, OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
+  // Legacy fallback for bases that haven't run setup-fix (no Post Date/Archived At).
+  const LEGACY_PENDING_FILTER = `AND({Handled At} = BLANK(), {LinkedIn URL} != BLANK(), OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
+  let activeFilter = PENDING_FILTER;
   let total = 0;
   let offset = "";
   let pages = 0;
   try {
     while (pages < 10) { // safety cap; 10 pages × 100 = 1000 tasks
       const params = new URLSearchParams({
-        filterByFormula: PENDING_FILTER,
+        filterByFormula: activeFilter,
         "fields[]": "Name",
         pageSize: "100",
       });
@@ -63,6 +69,15 @@ export async function GET(request) {
         const errText = await r.text();
         if (r.status === 403 && errText.includes("INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND")) {
           return NextResponse.json({ ok: true, count: 0, note: "Tasks table not found" });
+        }
+        // New post-freshness fields missing → retry once with the legacy filter so
+        // the badge keeps working until setup-fix runs.
+        if (r.status === 422 && errText.includes("UNKNOWN_FIELD_NAME") &&
+            activeFilter === PENDING_FILTER &&
+            (errText.includes("Post Date") || errText.includes("Archived At"))) {
+          activeFilter = LEGACY_PENDING_FILTER;
+          total = 0; offset = ""; pages = 0;
+          continue;
         }
         if (r.status === 422 && errText.includes("UNKNOWN_FIELD_NAME")) {
           return NextResponse.json({ ok: false, error: "Handled At field missing. Run POST /api/setup-fix.", needsSetup: true }, { status: 412 });
