@@ -1426,6 +1426,11 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     } else {
       fields = { Name: rule.name, Description: rule.description || "", "Task Type": rule.taskType || "news", "Scan Target": rule.scanTarget || "accounts", Ease: rule.ease || "Medium", Strength: rule.strength || "Medium", Sources: (rule.sources || []).join(", "), Keywords: (rule.keywords || []).join(", "), "Job Title Keywords": (rule.jobTitleKeywords || []).join(", "), "Scoring Prompt": rule.scoringPrompt || "" };
     }
+    // Per-connector Delivery config (all connector types). singleLineText values —
+    // written via the existing typecast save path, no schema mutation. Defaults
+    // applied when absent. CONFIG ONLY; destination routing is a follow-on.
+    fields["Delivery Destination"] = rule.deliveryDestination || "Sidekick app";
+    fields["Delivery Frequency"] = rule.deliveryFrequency || "Real-time";
     try {
       if (rule.airtableId) { await at("update", "Task Rules", { records: [{ id: rule.airtableId, fields }] }, bid); setRules(p => p.map(r => r.id === rule.airtableId ? { ...r, fields } : r)); }
       else { const res = await at("create", "Task Rules", { records: [fields] }, bid); setRules(p => [...p, ...(res.records || [])]); }
@@ -1867,13 +1872,12 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const companyPostRuleCount = signalRules.filter(r => ((r.fields||{})["Task Type"]||"news")==="company_post").length;
   const topXRules = rules.filter(r => (r.fields||{})["Task Type"] === "top_x");
 
-  // Admin-only tabs hidden from clientMode. These either expose master-base data
-  // (Triggers shows ALL Account Routing across campaigns), integration credentials
-  // (HubSpot, GA), or admin functions. Clients see only their campaign's
-  // operational data + read-only LinkedIn outreach/posts views.
+  // Admin-only tabs hidden from clientMode. These either expose master-base data,
+  // integration credentials (HubSpot, GA), or admin functions. Clients see only
+  // their campaign's operational data + read-only LinkedIn outreach/posts views.
   const ADMIN_ONLY_TABS = new Set([
     // Originally admin-only (back-office integrations + speculative features)
-    "triggers", "email_campaign", "google_analytics", "hubspot", "post_demo",
+    "email_campaign", "google_analytics", "hubspot", "post_demo",
     // Added 2026-05-22 per operator request — client portal should not expose
     // the rule-building / scoring-tuning surface or the LinkedIn automation
     // control plane. Client sees results (Dashboard, Accounts, Leads, Tasks)
@@ -1898,7 +1902,6 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     null,
     {id:"outreach",label:"💬 LinkedIn Automation",count:null},
     {id:"linkedin_posts",label:"📝 LinkedIn Posts",count:null},
-    {id:"triggers",label:"🔥 Triggers",count:null},
     {id:"email_campaign",label:"📧 Email Campaign",count:null},
     {id:"google_analytics",label:"📊 Google Analytics",count:null},
     {id:"hubspot",label:"🔗 HubSpot",count:null},
@@ -2585,9 +2588,6 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   {/* ════ EMAIL CAMPAIGN — admin only ════ */}
   {tab==="email_campaign"&&!loading&&!clientMode&&(<EmailCampaignTab baseId={bid} campaign={camp} leads={leads} prefilledLeadId={emailPrefilledLeadId} />)}
 
-  {/* ════ TRIGGERS — admin only (exposes master-base routing across all campaigns) ════ */}
-  {tab==="triggers"&&!loading&&!clientMode&&(<TriggersTab baseId={bid} campaign={camp} />)}
-
   {/* ════ COMING SOON ════ */}
   {tab==="coming_soon"&&(<div>
     <div className="ph"><div><div className="pt">🚀 Coming Soon</div><div className="pd">Features in development & planned</div></div></div>
@@ -2770,6 +2770,15 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     ];
     const typeMeta = (tt) => CONNECTOR_TYPES.find(t=>t.key===tt) || {emoji:"⚙️",label:(tt||"news"),badge:"cg"};
     const taskCountFor = (name) => tasks.filter(t=>(t.fields||{})["Task Rule"]===name).length;
+    // Delivery badge — destination + cadence captured per connector (config only).
+    // Shortens the stored singleLineText values for the chip; defaults match the editor.
+    const deliveryBadge = (f) => {
+      const destMap = {"Sidekick app":"Sidekick","Slack":"Slack","Email":"Email","Teams":"Teams","Google Sheet":"Sheet","Salesforce task":"Salesforce"};
+      const freqMap = {"Real-time":"real-time","Daily digest":"daily","Weekly digest":"weekly"};
+      const dest = destMap[f["Delivery Destination"]] || "Sidekick";
+      const freq = freqMap[f["Delivery Frequency"]] || "real-time";
+      return `📬 ${dest} · ${freq}`;
+    };
     return (<div><div className="ph"><div><div className="pt">Connectors</div><div className="pd">{configured?`${rules.length} configured`:"None configured yet"}</div></div>{configured&&<button className="btn btn-s btn-p" onClick={()=>setShowConnectorPicker(true)}><I.Plus/> Add Connector</button>}</div>
 
     {/* Blank empty-state — single prominent CTA, no upfront dump of every option */}
@@ -2805,13 +2814,14 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
             <div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}>
               <span className={"chip "+m.badge}>{tt==="both"?"news + jobs":m.label.toLowerCase()}</span>
               <span className={"chip "+(f["Scan Target"]==="leads"?"cp":f["Scan Target"]==="both"?"ca":"cg")}>{f["Scan Target"]||"accounts"}</span>
+              <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>{deliveryBadge(f)}</span>
               <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>{taskCountFor(f.Name)} tasks</span>
             </div>
           </div>
           {f.Description&&<div style={{fontSize:11,color:"var(--t3)",marginBottom:8}}>{f.Description}</div>}
           {kw&&<div style={{fontSize:10,color:"var(--t3)",marginBottom:10}}>Keywords: {kw}</div>}
           <div style={{display:"flex",gap:6}}>
-            <button className="btn btn-s btn-p" onClick={()=>setEditRule({airtableId:r.id,name:f.Name,description:f.Description,taskType:tt,scanTarget:f["Scan Target"]||"accounts",ease:f.Ease,strength:f.Strength,sources:(f.Sources||"").split(",").map(s=>s.trim()).filter(Boolean),keywords:(f.Keywords||"").split(",").map(k=>k.trim()).filter(Boolean),jobTitleKeywords:(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()).filter(Boolean),scoringPrompt:f["Scoring Prompt"]||""})}>Configure</button>
+            <button className="btn btn-s btn-p" onClick={()=>setEditRule({airtableId:r.id,name:f.Name,description:f.Description,taskType:tt,scanTarget:f["Scan Target"]||"accounts",ease:f.Ease,strength:f.Strength,sources:(f.Sources||"").split(",").map(s=>s.trim()).filter(Boolean),keywords:(f.Keywords||"").split(",").map(k=>k.trim()).filter(Boolean),jobTitleKeywords:(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()).filter(Boolean),scoringPrompt:f["Scoring Prompt"]||"",deliveryDestination:f["Delivery Destination"]||"Sidekick app",deliveryFrequency:f["Delivery Frequency"]||"Real-time"})}>Configure</button>
             <button className="btn btn-s" onClick={()=>{setTab("tasks");setFilter(ff=>({...ff,connector:f.Name}));}}>View tasks</button>
             <button className="btn btn-s" onClick={()=>duplicateRule(r)} title="Duplicate"><I.Copy/></button>
             <button className="btn btn-d btn-s" onClick={()=>del("Task Rules",[r.id],setRules)}><I.Trash/></button>
@@ -2827,6 +2837,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
               <span className="chip cp">top x</span>
               <span className={"chip "+(f["Scan Target"]==="accounts"?"cg":"cp")}>{f["Scan Target"]||"leads"}</span>
               <span className="chip ca">TOP {f["Top N"]||10}</span>
+              <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>{deliveryBadge(f)}</span>
               <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>{taskCountFor(f.Name)} tasks</span>
             </div>
           </div>
@@ -2841,6 +2852,8 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
                 smartCompile: f["Smart Compile"]==="true"||f["Smart Compile"]===true,
                 compiledRules,
                 compiledAt: f["Compiled At"] || null,
+                deliveryDestination: f["Delivery Destination"] || "Sidekick app",
+                deliveryFrequency: f["Delivery Frequency"] || "Real-time",
                 baseId: bid,
               });
             }}>Configure</button>
@@ -3324,7 +3337,7 @@ Output format (strict JSON, no markdown):
                 <div style={{display:"flex",gap:6}}>
                   <button className="btn btn-ai btn-s" disabled={outreachLoading} onClick={async()=>{const res=await enqueueLeads({...config,name:f.Name});if(res?.enqueued>0)alert("Enqueued "+res.enqueued+" leads!")}}>{outreachLoading?"…":"⚡ Enqueue Leads"}</button>
                   <button className="btn btn-p btn-s" disabled={outreachLoading||!linkedinAccount} onClick={()=>runOutreachNow(r)}>{outreachLoading?"…":"▶ Run Now"}</button>
-                  <button className="btn btn-s" onClick={()=>setEditRule({airtableId:r.id,taskType:"linkedin_outreach",name:f.Name,description:f.Description||"",outreachConfig:config})}>Edit</button>
+                  <button className="btn btn-s" onClick={()=>setEditRule({airtableId:r.id,taskType:"linkedin_outreach",name:f.Name,description:f.Description||"",outreachConfig:config,deliveryDestination:f["Delivery Destination"]||"Sidekick app",deliveryFrequency:f["Delivery Frequency"]||"Real-time"})}>Edit</button>
                   <button className="btn btn-d btn-s" onClick={()=>del("Task Rules",[r.id],setRules)}><I.Trash/></button>
                 </div>
               </div>
@@ -6181,513 +6194,6 @@ ${Object.entries(promptReference.requiredOutputSchema).map(([k,v])=>`  "${k}": $
 
 // ═══════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════
-// TRIGGERS TAB — Unified view of GA + Unipile + LinkedIn Posts triggers
-// ═══════════════════════════════════════════════════════════════
-function TriggersTab({ baseId, campaign }) {
-  const [loading, setLoading] = useState(true);
-  const [status, setStatus] = useState(null);
-  const [triggers, setTriggers] = useState([]);
-  const [sourceFilter, setSourceFilter] = useState("all"); // all | Unipile | GA | LinkedIn Posts (RapidAPI)
-  const [accountFilter, setAccountFilter] = useState("all"); // all | <account_id> — narrows feed to a single account
-  const [windowDays, setWindowDays] = useState(7);
-  const [refreshing, setRefreshing] = useState(false);
-  const [refreshResult, setRefreshResult] = useState(null);
-  const [lastRefreshed, setLastRefreshed] = useState(null);
-  const [err, setErr] = useState("");
-
-  // Routing state — for the per-account "which campaign does this LinkedIn account belong to" UI
-  const [routingExpanded, setRoutingExpanded] = useState(false);
-  const [routingData, setRoutingData] = useState(null); // { accounts, campaigns }
-  const [routingLoading, setRoutingLoading] = useState(false);
-  const [routingSavingAcct, setRoutingSavingAcct] = useState(null); // account_id being saved
-  const [unroutedExpanded, setUnroutedExpanded] = useState(false);
-  const [unroutedData, setUnroutedData] = useState(null);
-
-  const upiAPI = async (action, body = {}) => {
-    const r = await fetch(`/api/unipile-triggers?action=${action}&base=${baseId}`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...body }),
-    });
-    return r.json();
-  };
-
-  const loadStatus = async () => {
-    try {
-      const r = await fetch(`/api/unipile-triggers?action=status&base=${baseId}`);
-      const d = await r.json();
-      setStatus(d);
-    } catch (e) { setErr(e.message); }
-  };
-
-  const loadTriggers = async () => {
-    setLoading(true);
-    setErr("");
-    try {
-      const since = new Date(Date.now() - windowDays * 86400000).toISOString();
-      const r = await fetch(`/api/unipile-triggers?action=list_triggers&base=${baseId}&since=${encodeURIComponent(since)}`);
-      const d = await r.json();
-      if (d.ok) setTriggers(d.triggers || []);
-      else setErr(d.error || "Failed to load triggers");
-    } catch (e) { setErr(e.message); }
-    setLoading(false);
-  };
-
-  useEffect(() => {
-    loadStatus();
-    loadTriggers();
-    // Also load routing data (silently) so we have account_id → name lookup
-    // for the breakdown widget. Doesn't depend on user expanding the routing panel.
-    loadRouting().catch(() => {});
-  }, [baseId, windowDays]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Manual refresh — pulls fresh data from Unipile (profile views, reactions),
-  // creates tasks for any new events, then reloads the triggers list.
-  // No cron polling — this only runs when user clicks the button.
-  const refreshFromUnipile = async () => {
-    setRefreshing(true); setRefreshResult(null); setErr("");
-    try {
-      const r = await upiAPI("manual_poll");
-      setRefreshResult(r);
-      setLastRefreshed(new Date());
-      await loadTriggers();
-    } catch (e) { setErr(e.message); }
-    setRefreshing(false);
-  };
-
-  // ─── Account Routing helpers ───
-  // Load list of LinkedIn accounts + their current routing + available campaigns
-  const loadRouting = async () => {
-    setRoutingLoading(true);
-    try {
-      // First-time setup — auto-create the master tables if they don't exist yet.
-      // Idempotent — does nothing if tables already exist.
-      await upiAPI("ensure_routing_tables").catch(() => null);
-      const r = await upiAPI("list_routing");
-      if (r.ok) setRoutingData(r);
-      else setErr(r.error || "Failed to load routing");
-    } catch (e) { setErr(e.message); }
-    setRoutingLoading(false);
-  };
-
-  // Save a single account's routing — called from the per-account dropdown
-  const saveRouting = async (account_id, account_name, campaign) => {
-    setRoutingSavingAcct(account_id);
-    try {
-      const r = await upiAPI("set_routing", {
-        account_id,
-        account_name,
-        campaign_base_id: campaign.baseId,
-        client_name: campaign.name,
-      });
-      if (r.ok) await loadRouting(); // refresh display
-      else setErr(r.error || "Failed to save routing");
-    } catch (e) { setErr(e.message); }
-    setRoutingSavingAcct(null);
-  };
-
-  // Remove a routing entry — events from this account will go to Unrouted Triggers
-  const deleteRouting = async (recordId) => {
-    if (!confirm("Remove routing for this account? Future events will be logged to Unrouted Triggers instead of creating tasks.")) return;
-    try {
-      const r = await upiAPI("delete_routing", { record_id: recordId });
-      if (r.ok) await loadRouting();
-      else setErr(r.error || "Failed to delete routing");
-    } catch (e) { setErr(e.message); }
-  };
-
-  // Load unrouted events (events that came in for accounts without a routing entry)
-  const loadUnrouted = async () => {
-    try {
-      const r = await upiAPI("list_unrouted");
-      if (r.ok) setUnroutedData(r);
-      else setErr(r.error || "Failed to load unrouted");
-    } catch (e) { setErr(e.message); }
-  };
-
-  // Auto-load routing when section is expanded
-  useEffect(() => {
-    if (routingExpanded && !routingData) loadRouting();
-  }, [routingExpanded]);
-  useEffect(() => {
-    if (unroutedExpanded && !unroutedData) loadUnrouted();
-  }, [unroutedExpanded]);
-
-  // Group triggers by source for the dashboard cards
-  // Step 1: apply source filter
-  const sourceFiltered = sourceFilter === "all"
-    ? triggers
-    : triggers.filter(t => t.task_type?.startsWith(sourceFilter.toLowerCase()));
-  // Step 2: apply account filter
-  const filteredTriggers = accountFilter === "all"
-    ? sourceFiltered
-    : sourceFiltered.filter(t => (t.account_id || "(none)") === accountFilter);
-
-  const counts = {
-    all: triggers.length,
-    unipile: triggers.filter(t => t.task_type?.startsWith("unipile_")).length,
-    ga: triggers.filter(t => t.task_type?.startsWith("ga_") || t.task_type?.includes("page_view")).length,
-    posts: triggers.filter(t => t.task_type === "linkedin_engagement").length,
-  };
-
-  // ─── Per-account breakdown ────────────────────────────────────
-  // Build a lookup: account_id → human-readable name (from routing data we
-  // silently loaded). Falls back to a truncated account_id if not mapped yet.
-  const accountNameById = {};
-  if (routingData?.accounts) {
-    for (const a of routingData.accounts) {
-      if (a.account_id) accountNameById[a.account_id] = a.name || a.account_id;
-    }
-  }
-  const labelForAccountId = (id) => {
-    if (!id) return "(no account_id)";
-    if (accountNameById[id]) return accountNameById[id];
-    // Unmapped — show truncated ID so user can still distinguish accounts
-    return `Unmapped · ${id.slice(0, 8)}…`;
-  };
-
-  // Group sourceFiltered (NOT filteredTriggers — we want full per-account view,
-  // not narrowed-by-current-account) by account_id, then by event type.
-  // Result: [{ accountId, name, total, byType: {dm:N, conn:N, react:N, ...} }, ...]
-  const accountBreakdown = (() => {
-    const m = {};
-    for (const t of sourceFiltered) {
-      const id = t.account_id || "(none)";
-      if (!m[id]) m[id] = { accountId: id, name: labelForAccountId(id), total: 0, byType: {} };
-      m[id].total++;
-      const tt = t.task_type || "unknown";
-      m[id].byType[tt] = (m[id].byType[tt] || 0) + 1;
-    }
-    return Object.values(m).sort((a, b) => b.total - a.total);
-  })();
-
-  const triggerTypeLabels = {
-    unipile_message_reply: "📬 DM Reply",
-    unipile_connection_accepted: "🤝 Connection Accepted",
-    unipile_message_reaction: "😊 DM Reaction",
-    unipile_post_comment_on_yours: "💬 Comment on your Post",
-    unipile_post_reaction_on_yours: "👍 Reaction on your Post",
-    unipile_profile_view: "👀 Profile View",
-    linkedin_engagement: "📝 LinkedIn Post Score",
-  };
-
-  // Format "X min ago" for the last refresh timestamp
-  const formatAgo = (date) => {
-    if (!date) return null;
-    const sec = Math.floor((Date.now() - date.getTime()) / 1000);
-    if (sec < 10) return "just now";
-    if (sec < 60) return `${sec}s ago`;
-    if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
-    return `${Math.floor(sec / 3600)}h ago`;
-  };
-
-  return (<div>
-    <div className="ph">
-      <div>
-        <div className="pt">🔥 Triggers</div>
-        <div className="pd">Buying signals from Unipile, GA, and LinkedIn Posts. Webhooks fire automatically — refresh manually for profile views & reactions.</div>
-      </div>
-      <div style={{display:"flex",gap:8,alignItems:"center"}}>
-        {lastRefreshed && <span style={{fontSize:10,color:"var(--t3)"}}>Refreshed {formatAgo(lastRefreshed)}</span>}
-        <button className="btn btn-s" onClick={loadTriggers} disabled={loading}>{loading ? "..." : "↻ Reload feed"}</button>
-        <button className="btn btn-p" onClick={refreshFromUnipile} disabled={refreshing}>{refreshing ? "⏳ Pulling from Unipile..." : "🔄 Refresh from Unipile"}</button>
-      </div>
-    </div>
-
-    {err && <div style={{padding:12,background:"rgba(239,68,68,.08)",border:"1px solid var(--red)",borderRadius:6,color:"var(--red)",marginBottom:12,fontSize:11}}>❌ {err}</div>}
-
-    {/* Status row: account count, lead index size, webhook URL */}
-    {status && (
-      <div style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,marginBottom:14}}>
-        <div style={{display:"flex",gap:24,flexWrap:"wrap",alignItems:"center",fontSize:11,color:"var(--t2)"}}>
-          <div><span style={{color:"var(--t3)"}}>Unipile:</span> <strong style={{color:status.unipile_connected?"var(--grn)":"var(--red)"}}>{status.unipile_connected ? "✓ Connected" : "✗ Not connected"}</strong></div>
-          <div><span style={{color:"var(--t3)"}}>LinkedIn accounts:</span> <strong style={{color:"var(--t1)"}}>{status.accounts_count || 0}</strong></div>
-          <div><span style={{color:"var(--t3)"}}>Leads indexed:</span> <strong style={{color:"var(--t1)"}}>{status.leads_indexed || 0}</strong></div>
-        </div>
-        {status.webhook_url && (
-          <details style={{marginTop:10,fontSize:10,color:"var(--t3)"}}>
-            <summary style={{cursor:"pointer",fontWeight:600,color:"var(--t2)"}}>📡 Unipile webhook setup (do this once per webhook type)</summary>
-            <div style={{marginTop:10,padding:12,background:"var(--hover)",borderRadius:6,lineHeight:1.6}}>
-              <div style={{marginBottom:8,color:"var(--t1)",fontWeight:600,fontSize:11}}>One URL handles everything:</div>
-              <div style={{padding:8,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:4,fontFamily:"'JetBrains Mono',monospace",wordBreak:"break-all",color:"var(--t1)",fontSize:10,marginBottom:10}}>
-                {(status.webhook_url || "").replace(/&base=[^&]+/, "")}
-              </div>
-              <div style={{marginBottom:10,color:"var(--t2)"}}>
-                Replace <code style={{background:"var(--card)",padding:"1px 4px",borderRadius:2}}>YOUR_CRON_SECRET</code> with your <code style={{background:"var(--card)",padding:"1px 4px",borderRadius:2}}>CRON_SECRET</code> env var value (set in Vercel).
-              </div>
-
-              <div style={{marginTop:14,marginBottom:6,color:"var(--t1)",fontWeight:600,fontSize:11}}>Step-by-step in Unipile dashboard:</div>
-              <ol style={{paddingLeft:16,margin:0,color:"var(--t2)"}}>
-                <li style={{marginBottom:6}}>Go to <a href="https://dashboard.unipile.com/webhooks" target="_blank" rel="noopener noreferrer" style={{color:"var(--blu)"}}>Unipile Dashboard → Webhooks</a> → <strong>Create a webhook</strong></li>
-                <li style={{marginBottom:6}}>For <strong>name</strong>, use something like "SignalScope Messaging" so you can identify it later</li>
-                <li style={{marginBottom:6}}>Pick category <strong style={{color:"var(--t1)"}}>Messaging</strong> → Continue</li>
-                <li style={{marginBottom:6}}>Paste the URL above into the webhook URL field</li>
-                <li style={{marginBottom:6}}>Enable event: <code style={{background:"var(--card)",padding:"1px 4px",borderRadius:2}}>message_received</code> (and <code style={{background:"var(--card)",padding:"1px 4px",borderRadius:2}}>message_reaction</code> if shown)</li>
-                <li style={{marginBottom:6}}>Save</li>
-                <li style={{marginBottom:6}}>Repeat: <strong>Create a webhook</strong> → name "SignalScope Connections" → category <strong style={{color:"var(--t1)"}}>Users</strong> → same URL → enable <code style={{background:"var(--card)",padding:"1px 4px",borderRadius:2}}>new_relation</code> (or <code style={{background:"var(--card)",padding:"1px 4px",borderRadius:2}}>users.relations.created</code>)</li>
-                <li style={{marginBottom:6}}>Optional: 3rd webhook for post comments — IF Unipile lists <code style={{background:"var(--card)",padding:"1px 4px",borderRadius:2}}>post_comment</code> as an event. As of writing, this isn't visible in Unipile's UI categories. Skip if not available — manual <strong>🔄 Refresh from Unipile</strong> still pulls reactions and views.</li>
-              </ol>
-
-              <div style={{marginTop:12,padding:8,background:"rgba(91,143,212,.08)",border:"1px solid rgba(91,143,212,.3)",borderRadius:4,color:"var(--t2)",fontSize:10}}>
-                <strong style={{color:"var(--blu)"}}>One URL, all clients.</strong> Routing happens internally based on which LinkedIn account fired the event — set up <strong>🔀 Account Routing</strong> below. Don't add a <code>&base=</code> parameter unless you want to override routing for a specific webhook (legacy mode).
-              </div>
-
-              <div style={{marginTop:10,padding:8,background:"rgba(191,163,90,.08)",border:"1px solid rgba(191,163,90,.3)",borderRadius:4,color:"var(--t2)",fontSize:10}}>
-                <strong style={{color:"var(--amb)"}}>Test it:</strong> after saving, send yourself a LinkedIn DM from another account → check the 🔥 Triggers feed → a task should appear within ~5 seconds. If nothing shows, check 🚧 Unrouted Triggers below — the LinkedIn account_id may not be mapped yet.
-              </div>
-            </div>
-          </details>
-        )}
-      </div>
-    )}
-
-    {/* ─── ACCOUNT ROUTING SECTION ─── */}
-    {status?.accounts_count > 0 && (
-      <div style={{marginBottom:14,border:"1px solid var(--bdr)",borderRadius:8,background:"var(--card)"}}>
-        <button onClick={()=>setRoutingExpanded(e=>!e)} style={{width:"100%",padding:14,background:"transparent",border:"none",textAlign:"left",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",color:"var(--t1)"}}>
-          <span style={{fontSize:12,fontWeight:600}}>🔀 Account Routing <span style={{color:"var(--t3)",fontWeight:400,marginLeft:6}}>— map each LinkedIn account to a client campaign</span></span>
-          <span style={{color:"var(--t3)",fontSize:11}}>{routingExpanded ? "▾" : "▸"}</span>
-        </button>
-        {routingExpanded && (
-          <div style={{padding:"0 14px 14px",borderTop:"1px solid var(--bdr)"}}>
-            {routingLoading && !routingData && <div style={{padding:20,textAlign:"center",color:"var(--t3)",fontSize:11}}>Loading...</div>}
-            {routingData && (
-              <div>
-                <div style={{fontSize:10,color:"var(--t3)",marginBottom:10,marginTop:10,lineHeight:1.5}}>
-                  Each LinkedIn account connected to Unipile needs to be mapped to a campaign. Webhook events from that account will create tasks in the mapped campaign's base.
-                  {routingData.campaigns.length === 0 && <div style={{color:"var(--amb)",marginTop:6}}>⚠️ No campaigns found in master base. Create campaigns first via SignalScope's main page.</div>}
-                </div>
-                <div style={{display:"flex",flexDirection:"column",gap:8}}>
-                  {routingData.accounts.map(a => {
-                    const isCurrent = !!a.routed_to_base_id;
-                    const isSaving = routingSavingAcct === a.account_id;
-                    return (
-                      <div key={a.account_id} style={{padding:10,background:"var(--hover)",borderRadius:4,display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,flexWrap:"wrap"}}>
-                        <div style={{flex:1,minWidth:200}}>
-                          <div style={{fontSize:11,fontWeight:600,color:"var(--t1)"}}>{a.name}</div>
-                          <div style={{fontSize:9,color:"var(--t3)",fontFamily:"'JetBrains Mono',monospace"}}>
-                            {a.provider} · {a.account_id?.slice(0, 16)}{a.account_id?.length > 16 ? "..." : ""} · {a.status === "OK" || a.status === "active" ? <span style={{color:"var(--grn)"}}>active</span> : <span style={{color:"var(--amb)"}}>{a.status || "unknown"}</span>}
-                          </div>
-                        </div>
-                        <div style={{display:"flex",gap:6,alignItems:"center"}}>
-                          <select
-                            value={a.routed_to_base_id || ""}
-                            onChange={e => {
-                              const v = e.target.value;
-                              if (!v) return;
-                              const camp = routingData.campaigns.find(c => c.baseId === v);
-                              if (camp) saveRouting(a.account_id, a.name, camp);
-                            }}
-                            disabled={isSaving || routingData.campaigns.length === 0}
-                            style={{padding:"5px 8px",background:"var(--card)",border:"1px solid var(--bdr)",color:"var(--t1)",borderRadius:4,fontSize:11,minWidth:160}}>
-                            <option value="">{isSaving ? "Saving..." : isCurrent ? `→ ${a.routed_to_client || a.routed_to_base_id.slice(0,12)}` : "(unmapped — select campaign)"}</option>
-                            {routingData.campaigns.map(c => (
-                              <option key={c.baseId} value={c.baseId}>→ {c.name}</option>
-                            ))}
-                          </select>
-                          {isCurrent && a.routing_record_id && (
-                            <button className="btn btn-s btn-d" onClick={()=>deleteRouting(a.routing_record_id)} title="Remove routing">✕</button>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-                <div style={{marginTop:10,fontSize:10,color:"var(--t3)"}}>
-                  💡 Edit <code>Account Routing</code> table directly in your master Airtable base ({routingData.accounts.length} accounts, {routingData.total_routed} mapped). Changes propagate within 2 minutes (cache TTL).
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-    )}
-
-    {/* ─── UNROUTED EVENTS SECTION ─── */}
-    <div style={{marginBottom:14,border:"1px solid var(--bdr)",borderRadius:8,background:"var(--card)"}}>
-      <button onClick={()=>setUnroutedExpanded(e=>!e)} style={{width:"100%",padding:14,background:"transparent",border:"none",textAlign:"left",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",color:"var(--t1)"}}>
-        <span style={{fontSize:12,fontWeight:600}}>🚧 Unrouted Triggers <span style={{color:"var(--t3)",fontWeight:400,marginLeft:6}}>— events from accounts not yet mapped</span></span>
-        <span style={{color:"var(--t3)",fontSize:11}}>{unroutedExpanded ? "▾" : "▸"}</span>
-      </button>
-      {unroutedExpanded && (
-        <div style={{padding:"0 14px 14px",borderTop:"1px solid var(--bdr)"}}>
-          {!unroutedData && <div style={{padding:20,textAlign:"center",color:"var(--t3)",fontSize:11}}>Loading...</div>}
-          {unroutedData && unroutedData.unrouted?.length === 0 && (
-            <div style={{padding:20,textAlign:"center",color:"var(--t3)",fontSize:11,marginTop:10}}>
-              <div style={{fontSize:24,marginBottom:6}}>✓</div>
-              No unrouted events. Either all your accounts are mapped, or no events have come in yet.
-            </div>
-          )}
-          {unroutedData && unroutedData.unrouted?.length > 0 && (
-            <div style={{marginTop:10}}>
-              <div style={{fontSize:10,color:"var(--amb)",marginBottom:10}}>
-                ⚠️ {unroutedData.unrouted.length} event{unroutedData.unrouted.length===1?"":"s"} dropped because the LinkedIn account_id wasn't found in your routing table. Add routing above to capture future events.
-              </div>
-              {unroutedData.by_account?.length > 0 && (
-                <div style={{marginBottom:10,padding:10,background:"var(--hover)",borderRadius:4}}>
-                  <div style={{fontSize:10,fontWeight:600,color:"var(--t2)",marginBottom:4}}>By account:</div>
-                  {unroutedData.by_account.slice(0, 5).map(b => (
-                    <div key={b.account_id} style={{fontSize:10,color:"var(--t3)",fontFamily:"'JetBrains Mono',monospace",marginBottom:2}}>
-                      {b.account_id?.slice(0, 24) || "(no id)"}: <strong style={{color:"var(--t2)"}}>{b.count} events</strong>
-                    </div>
-                  ))}
-                </div>
-              )}
-              <div style={{display:"flex",flexDirection:"column",gap:6,maxHeight:240,overflowY:"auto"}}>
-                {unroutedData.unrouted.slice(0, 30).map(u => (
-                  <div key={u.id} style={{padding:8,background:"var(--hover)",borderRadius:4,fontSize:10}}>
-                    <div style={{display:"flex",justifyContent:"space-between",color:"var(--t2)"}}>
-                      <span><strong>{u.event_type}</strong> · {u.lead_name || "(no lead name)"}</span>
-                      <span style={{color:"var(--t3)"}}>{u.received ? new Date(u.received).toLocaleString() : ""}</span>
-                    </div>
-                    {u.signal_text && <div style={{color:"var(--t3)",marginTop:2,fontStyle:"italic"}}>"{u.signal_text.slice(0, 120)}"</div>}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-
-    {refreshResult && (
-      <div style={{padding:12,background:refreshResult.ok?"rgba(93,168,122,.08)":"rgba(239,68,68,.08)",border:"1px solid "+(refreshResult.ok?"var(--grn)":"var(--red)"),borderRadius:6,marginBottom:14,fontSize:11,color:"var(--t2)"}}>
-        {refreshResult.ok ? (
-          <div>
-            ✅ Refreshed — {refreshResult.accounts_checked} accounts checked, {refreshResult.profile_views_processed} profile views and {refreshResult.reactions_processed} reactions seen, {refreshResult.tasks_created} new triggers ({refreshResult.skipped_dupes} dupes skipped).
-            {refreshResult.errors?.length > 0 && <div style={{marginTop:6,color:"var(--amb)"}}>⚠ {refreshResult.errors.length} errors during refresh — check Vercel logs</div>}
-          </div>
-        ) : (
-          <div>❌ {refreshResult.error || "Refresh failed"}</div>
-        )}
-      </div>
-    )}
-
-    {/* Source filter pills + window selector */}
-    <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap",alignItems:"center"}}>
-      {[
-        {id:"all",label:"All",count:counts.all},
-        {id:"unipile",label:"🔗 Unipile",count:counts.unipile},
-        {id:"ga",label:"📊 GA",count:counts.ga},
-        {id:"posts",label:"📝 Posts",count:counts.posts},
-      ].map(p => (
-        <button key={p.id} onClick={()=>setSourceFilter(p.id)} className="btn btn-s" style={sourceFilter===p.id ? {background:"var(--amb)",color:"var(--bg)",borderColor:"var(--amb)"} : {}}>
-          {p.label} <span style={{opacity:0.6,marginLeft:4}}>({p.count})</span>
-        </button>
-      ))}
-      <div style={{marginLeft:"auto",fontSize:11,color:"var(--t3)"}}>
-        Window: 
-        <select value={windowDays} onChange={e=>setWindowDays(Number(e.target.value))} style={{marginLeft:6,padding:"4px 8px",background:"var(--card)",border:"1px solid var(--bdr)",color:"var(--t1)",borderRadius:4,fontSize:11}}>
-          <option value={1}>Last 24h</option>
-          <option value={7}>Last 7 days</option>
-          <option value={30}>Last 30 days</option>
-        </select>
-      </div>
-    </div>
-
-    {/* ─── PER-ACCOUNT BREAKDOWN ───────────────────────────────
-        Shows event volume by LinkedIn account so you can see at a glance
-        which account is generating engagement. Click an account to filter
-        the feed below to just that account's events. */}
-    {accountBreakdown.length > 0 && (
-      <div style={{marginBottom:14,padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
-          <div style={{fontSize:12,fontWeight:600,color:"var(--t1)"}}>👥 Activity by Account <span style={{color:"var(--t3)",fontWeight:400,marginLeft:6,fontSize:10}}>— click to filter feed</span></div>
-          {accountFilter !== "all" && (
-            <button className="btn btn-s" onClick={()=>setAccountFilter("all")} style={{fontSize:10}}>✕ Clear filter</button>
-          )}
-        </div>
-        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))",gap:8}}>
-          {accountBreakdown.map(a => {
-            const isSelected = accountFilter === a.accountId;
-            const unmapped = a.name.startsWith("Unmapped ·");
-            return (
-              <button
-                key={a.accountId}
-                onClick={()=>setAccountFilter(isSelected ? "all" : a.accountId)}
-                style={{
-                  textAlign:"left",
-                  padding:"10px 12px",
-                  background: isSelected ? "var(--amb)" : "var(--hover)",
-                  color: isSelected ? "var(--bg)" : "var(--t1)",
-                  border: `1px solid ${isSelected ? "var(--amb)" : "var(--bdr)"}`,
-                  borderRadius:6,
-                  cursor:"pointer",
-                  display:"flex",
-                  flexDirection:"column",
-                  gap:4,
-                }}
-                title={`account_id: ${a.accountId}`}
-              >
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",gap:8}}>
-                  <strong style={{fontSize:12,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                    {unmapped ? "⚠ " : ""}{a.name}
-                  </strong>
-                  <span style={{fontSize:16,fontWeight:700}}>{a.total}</span>
-                </div>
-                <div style={{fontSize:10,color:isSelected?"var(--bg)":"var(--t3)",display:"flex",flexWrap:"wrap",gap:6}}>
-                  {Object.entries(a.byType)
-                    .sort((x,y)=>y[1]-x[1])
-                    .slice(0,4)
-                    .map(([type, count]) => {
-                      const lbl = triggerTypeLabels[type] || type.replace(/^unipile_/, "").replace(/_/g, " ");
-                      return <span key={type} style={{opacity:0.85}}>{lbl}: <strong>{count}</strong></span>;
-                    })}
-                </div>
-              </button>
-            );
-          })}
-        </div>
-        {accountBreakdown.some(a => a.name.startsWith("Unmapped ·")) && (
-          <div style={{marginTop:10,fontSize:10,color:"var(--amb)"}}>
-            ⚠ Some accounts aren't mapped to campaigns yet — open the 🔀 Account Routing panel above to assign them.
-          </div>
-        )}
-      </div>
-    )}
-
-    {/* Triggers feed */}
-    {loading ? (
-      <div style={{padding:40,textAlign:"center",color:"var(--t3)"}}>Loading triggers...</div>
-    ) : filteredTriggers.length === 0 ? (
-      <div style={{padding:40,textAlign:"center",color:"var(--t3)",border:"1px dashed var(--bdr)",borderRadius:8}}>
-        <div style={{fontSize:24,marginBottom:8}}>🤷</div>
-        <div>No triggers in this window.</div>
-        <div style={{fontSize:10,marginTop:6}}>Try clicking <strong>Poll Unipile Now</strong> or extend the time window above.</div>
-      </div>
-    ) : (
-      <div style={{display:"flex",flexDirection:"column",gap:10}}>
-        {filteredTriggers.map(t => (
-          <div key={t.id} style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8}}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,marginBottom:8}}>
-              <div>
-                <div style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>{t.name || "Unknown lead"}</div>
-                <div style={{fontSize:11,color:"var(--t3)"}}>
-                  {t.company || ""}{t.created ? ` · ${new Date(t.created).toLocaleString()}` : ""}
-                  {t.account_id && <> · via <strong style={{color:"var(--t2)"}}>{labelForAccountId(t.account_id)}</strong></>}
-                </div>
-              </div>
-              <div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}>
-                <span style={{padding:"3px 8px",background:"var(--hover)",borderRadius:4,fontSize:10,color:"var(--t2)"}}>{triggerTypeLabels[t.task_type] || t.task_type}</span>
-                <span style={{padding:"3px 8px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:4,fontSize:11,fontWeight:600,color:t.score >= 80 ? "var(--grn)" : t.score >= 50 ? "var(--amb)" : "var(--t2)",fontFamily:"'JetBrains Mono',monospace"}}>{t.score || 0}</span>
-              </div>
-            </div>
-            {t.signal && (
-              <div style={{padding:10,background:"var(--hover)",borderRadius:4,fontSize:10,color:"var(--t2)",whiteSpace:"pre-wrap",lineHeight:1.5,maxHeight:140,overflow:"auto"}}>{t.signal.slice(0, 600)}{t.signal.length > 600 ? "..." : ""}</div>
-            )}
-            {t.url && (
-              <div style={{marginTop:8,fontSize:10}}>
-                <a href={t.url} target="_blank" rel="noreferrer" style={{color:"var(--blu)"}}>🔗 view source →</a>
-              </div>
-            )}
-          </div>
-        ))}
-      </div>
-    )}
-  </div>);
-}
-
-// ═══════════════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════════
 // EMAIL CAMPAIGN TAB — Sender Profile + Offers Library + AI Generation
 // ═══════════════════════════════════════════════════════════════
 function EmailCampaignTab({ baseId, campaign, leads, prefilledLeadId }) {
@@ -8335,6 +7841,9 @@ function RuleEditor({rule,onSave,onClose,availableFields,baseId}){
 
   // Signal + Top X fields
   const [f,sF]=useState({airtableId:rule.airtableId||null,name:rule.name||"",description:rule.description||"",taskType:rule.taskType||"news",scanTarget:rule.scanTarget||(isTopX?"leads":"accounts"),ease:rule.ease||"Medium",strength:rule.strength||"Medium",sources:rule.sources||["News"],keywords:rule.keywords||[],jobTitleKeywords:rule.jobTitleKeywords||[],scoringPrompt:rule.scoringPrompt||"",
+    // Per-connector Delivery (Connectors → events → Delivery → Tasks). CONFIG ONLY —
+    // captures destination + cadence; actual routing/sending is a deliberate follow-on.
+    deliveryDestination:rule.deliveryDestination||"Sidekick app",deliveryFrequency:rule.deliveryFrequency||"Real-time",
     topN:rule.topN||10,scoringFields:rule.scoringFields||[],
     smartCompile:rule.smartCompile||false,compiledRules:rule.compiledRules||null,compiledAt:rule.compiledAt||null,compileStatus:rule.compileStatus||"missing"});
 
@@ -8704,6 +8213,29 @@ function RuleEditor({rule,onSave,onClose,availableFields,baseId}){
     </div>
   </div>
   </>)}
+
+  {/* ──── DELIVERY (shared, all connector types) ────
+      Destination + frequency for where this connector's events are delivered.
+      CONFIG CAPTURE ONLY — stored on the Task Rule as "Delivery Destination" /
+      "Delivery Frequency" (singleLineText). Actual routing to Slack/Email/Teams/
+      Sheet/Salesforce is a deliberate follow-on; today everything still lands as
+      Tasks in the Sidekick app regardless of what's selected here. */}
+  <div className="ig" style={{marginTop:14,padding:14,border:"1px solid rgba(120,180,255,.25)",borderRadius:8,background:"rgba(120,180,255,.04)"}}>
+    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}><span>📬</span><span style={{fontSize:11,fontWeight:600,color:"var(--t2)"}}>DELIVERY</span><span style={{fontSize:9,color:"var(--t3)",fontWeight:400}}>· where these events go</span></div>
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+      <div className="ig" style={{marginBottom:0}}><div className="il">Destination</div>
+        <select className="inp" value={f.deliveryDestination} onChange={e=>sF(p=>({...p,deliveryDestination:e.target.value}))}>
+          {["Sidekick app","Slack","Email","Teams","Google Sheet","Salesforce task"].map(o=>(<option key={o} value={o}>{o}</option>))}
+        </select>
+      </div>
+      <div className="ig" style={{marginBottom:0}}><div className="il">Frequency</div>
+        <select className="inp" value={f.deliveryFrequency} onChange={e=>sF(p=>({...p,deliveryFrequency:e.target.value}))}>
+          {["Real-time","Daily digest","Weekly digest"].map(o=>(<option key={o} value={o}>{o}</option>))}
+        </select>
+      </div>
+    </div>
+    {f.deliveryDestination!=="Sidekick app"&&<div style={{fontSize:10,color:"var(--t3)",marginTop:8,lineHeight:1.5}}>Saved on the connector. Routing to {f.deliveryDestination} is not wired yet — events still land as Tasks in the Sidekick app for now.</div>}
+  </div>
 
   </div>
   <div className="modal-f"><button className="btn" onClick={onClose}>Cancel</button><button className="btn btn-p" disabled={!canSave} onClick={handleSave}><I.Check/> {f.airtableId?"Save":"Add Connector"}</button></div>
