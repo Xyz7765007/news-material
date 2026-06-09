@@ -294,6 +294,35 @@ const CAMPAIGN_TABLES = {
     { name: "Lead Company", type: "singleLineText" },
     { name: "Created At", type: "dateTime", options: TZ_ISO },
   ],
+  // ─── Sidekick Relevance Rules — universal relevance feedback ────
+  // Operator-set suppression / score-override rules ("don't show me X",
+  // "this title isn't worth 90"). Read by the chatbot feed + count to
+  // EXCLUDE matching tasks (retroactive + forward), and to override the
+  // served score for role_fit. INTERNAL only — rule Values/scores never
+  // surface in lead-facing copy. Rules are REVERSIBLE: toggle Active off.
+  // Kind whitelist: title_irrelevant | company_irrelevant |
+  //   signal_irrelevant | role_fit.
+  //   - title_irrelevant: suppress tasks whose title field CONTAINS Value.
+  //   - company_irrelevant: suppress tasks whose Company CONTAINS Value.
+  //   - signal_irrelevant: suppress tasks whose Task Type OR Movement Type
+  //       CONTAINS Value (e.g. "Exited", "linkedin_engagement").
+  //   - role_fit: does NOT suppress; overrides the SERVED score to
+  //       Target Score when the title matches Value (sort/priority only;
+  //       stored Airtable Score untouched).
+  // Name MUST be first (primary, singleLineText).
+  "Sidekick Relevance Rules": [
+    { name: "Name", type: "singleLineText" },  // primary — "kind: value"
+    { name: "Kind", type: "singleSelect", options: { choices: [
+      { name: "title_irrelevant" }, { name: "company_irrelevant" },
+      { name: "signal_irrelevant" }, { name: "role_fit" },
+    ] } },
+    { name: "Value", type: "singleLineText" },          // title / company / signal-or-movement type
+    { name: "Target Score", type: "number", options: { precision: 0 } }, // role_fit override
+    { name: "Active", type: "checkbox", options: { icon: "check", color: "greenBright" } },
+    { name: "Note", type: "multilineText" },
+    { name: "Created", type: "dateTime", options: TZ_ISO },
+    { name: "Created By", type: "singleLineText" },
+  ],
   "Sent Messages Review": [
     { name: "Lead Name", type: "singleLineText" },
     { name: "LinkedIn URL", type: "singleLineText" },

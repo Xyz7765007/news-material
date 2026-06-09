@@ -3,6 +3,7 @@ import OpenAI from "openai";
 import { trackOpenAIUsage } from "@/lib/ai-usage";
 import { pickLeadField } from "@/lib/lead-fields";
 import { checkRoleFreshness } from "@/lib/role-freshness";
+import { fetchActiveRelevanceRules } from "@/lib/relevance-rules";
 
 // Role-freshness gate: confirm a lead still belongs to the company before we
 // create an engagement task (Kunal, 2026-06-04 — never surface "engage with
@@ -978,6 +979,34 @@ async function runLinkedInPostScan({
 
   // Filter to those with LinkedIn URL
   leads = leads.filter(l => (l.fields?.["LinkedIn URL"] || l.fields?.["Linkedin URL"] || "").trim());
+
+  // ─── Best-effort relevance pre-skip (token / RapidAPI saver) ──────
+  // Secondary to the feed read-filter (which is the correctness guarantee).
+  // If the operator already suppressed the whole linkedin_engagement signal,
+  // or a lead's title/company matches an active suppression rule, skip the
+  // expensive provider call up front. NEVER throws → [] on missing table, so
+  // un-migrated bases / any failure = no change in behaviour.
+  try {
+    const relRules = await fetchActiveRelevanceRules(baseId);
+    if (relRules.length) {
+      const titleNeedles = relRules.filter(r => r.kind === "title_irrelevant").map(r => String(r.value || "").toLowerCase()).filter(Boolean);
+      const companyNeedles = relRules.filter(r => r.kind === "company_irrelevant").map(r => String(r.value || "").toLowerCase()).filter(Boolean);
+      const signalSuppressed = relRules.some(r => r.kind === "signal_irrelevant" &&
+        String(r.value || "").toLowerCase().includes("linkedin_engagement"));
+      if (signalSuppressed) {
+        leads = [];
+      } else if (titleNeedles.length || companyNeedles.length) {
+        leads = leads.filter(l => {
+          const f = l.fields || {};
+          const title = String(pickLeadField(f, "title") || "").toLowerCase();
+          const company = String(f.Company || "").toLowerCase();
+          if (titleNeedles.some(n => title.includes(n))) return false;
+          if (companyNeedles.some(n => company.includes(n))) return false;
+          return true;
+        });
+      }
+    }
+  } catch { /* best-effort only — read-side suppression still guards the feed */ }
 
   // Resume mode: skip leads already processed in the saved progress record
   const completedLeadIds = new Set(resume ? (prior?.completed_lead_ids || []) : []);

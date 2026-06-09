@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { fetchActiveRelevanceRules, withSuppression, roleFitScoreFor } from "@/lib/relevance-rules.js";
 
 // ═══════════════════════════════════════════════════════════════════
 // SIDEKICK FEED ENDPOINT
@@ -120,6 +121,17 @@ export async function GET(request) {
   }
   const limit = Math.min(parseInt(url.searchParams.get("limit") || "20", 10) || 20, 100);
 
+  // ─── Universal relevance feedback (2026-06-09) ────────────────────
+  // Load active operator relevance rules and fold their suppression clause
+  // into BOTH filters so they stay byte-identical to the count endpoint.
+  // RETROACTIVE + forward + REVERSIBLE: the read filter is the source of
+  // truth. fetchActiveRelevanceRules NEVER throws → [] on missing table, so
+  // un-migrated bases behave EXACTLY as before (zero suppression). role_fit
+  // rules don't suppress; they override the served score below.
+  const relevanceRules = await fetchActiveRelevanceRules(baseId);
+  const FILTER = withSuppression(PENDING_FILTER, relevanceRules);
+  const LEGACY_FILTER = withSuppression(LEGACY_PENDING_FILTER, relevanceRules);
+
   // Filter (PENDING_FILTER above): pending tasks, excluding stale GA-engagement (>7d)
   // and post-date-aged linkedin_engagement (>7d). Sort: Score desc, then Created desc.
   const buildParams = (filter) => new URLSearchParams({
@@ -136,7 +148,7 @@ export async function GET(request) {
   );
 
   try {
-    let r = await fetchTasks(PENDING_FILTER);
+    let r = await fetchTasks(FILTER);
     if (!r.ok) {
       const errText = await r.text();
       // 403 INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND when the Tasks table doesn't exist yet
@@ -146,9 +158,10 @@ export async function GET(request) {
       // 422 UNKNOWN_FIELD when a referenced field doesn't exist yet (campaign hasn't
       // run setup-fix). If it's one of the NEW post-freshness fields, gracefully
       // retry with the legacy filter so the feed keeps working until setup-fix runs.
+      // (Suppression clause is folded into both filters, so retry preserves it.)
       if (r.status === 422 && errText.includes("UNKNOWN_FIELD_NAME") &&
           (errText.includes("Post Date") || errText.includes("Archived At"))) {
-        r = await fetchTasks(LEGACY_PENDING_FILTER);
+        r = await fetchTasks(LEGACY_FILTER);
         if (!r.ok) {
           const e2 = await r.text();
           if (r.status === 422 && e2.includes("UNKNOWN_FIELD_NAME")) {
@@ -163,8 +176,25 @@ export async function GET(request) {
       }
     }
     const data = await r.json();
-    const records = (data.records || []).slice(0, limit);
-    const cards = records.map(formatCard);
+    // role_fit override (read-side only): Airtable sorted by the STORED Score, so
+    // re-rank in JS after overriding. Apply the override BEFORE slicing to limit so
+    // a downgraded card can't bump out a legitimately higher one. Stored Score is
+    // never mutated — this only changes the served `score` + ordering.
+    let records = data.records || [];
+    const hasRoleFit = relevanceRules.some(rl => rl.kind === "role_fit");
+    let cards = records.map(formatCard);
+    if (hasRoleFit) {
+      cards = cards.map(c => ({ ...c, score: roleFitScoreFor(c.lead_title, c.score, relevanceRules) }));
+      // Re-sort to match the original Airtable order (Score desc, then Created desc)
+      // now that some served scores changed.
+      cards.sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        const ta = new Date(a.created_at || 0).getTime();
+        const tb = new Date(b.created_at || 0).getTime();
+        return (isNaN(tb) ? 0 : tb) - (isNaN(ta) ? 0 : ta);
+      });
+    }
+    cards = cards.slice(0, limit);
 
     return NextResponse.json({
       ok: true,

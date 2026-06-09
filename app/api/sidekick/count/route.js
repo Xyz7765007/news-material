@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { fetchActiveRelevanceRules, withSuppression } from "@/lib/relevance-rules.js";
 
 // ═══════════════════════════════════════════════════════════════════
 // SIDEKICK COUNT ENDPOINT
@@ -48,7 +49,17 @@ export async function GET(request) {
   const PENDING_FILTER = `AND({Handled At} = BLANK(), {Archived At} = BLANK(), {LinkedIn URL} != BLANK(), ${POST_DATE_GATE}, OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
   // Legacy fallback for bases that haven't run setup-fix (no Post Date/Archived At).
   const LEGACY_PENDING_FILTER = `AND({Handled At} = BLANK(), {LinkedIn URL} != BLANK(), OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
-  let activeFilter = PENDING_FILTER;
+
+  // ─── Universal relevance feedback (2026-06-09) ────────────────────
+  // Fold the SAME suppression clause the feed uses into both filters so the
+  // badge stays byte-identical to the feed (drift would desync). role_fit
+  // rules are score-only → they do NOT affect the count, so only the
+  // suppression clause is applied here. Never throws → [] on missing table.
+  const relevanceRules = await fetchActiveRelevanceRules(baseId);
+  const SUPPRESSED_FILTER = withSuppression(PENDING_FILTER, relevanceRules);
+  const SUPPRESSED_LEGACY_FILTER = withSuppression(LEGACY_PENDING_FILTER, relevanceRules);
+
+  let activeFilter = SUPPRESSED_FILTER;
   let total = 0;
   let offset = "";
   let pages = 0;
@@ -73,9 +84,9 @@ export async function GET(request) {
         // New post-freshness fields missing → retry once with the legacy filter so
         // the badge keeps working until setup-fix runs.
         if (r.status === 422 && errText.includes("UNKNOWN_FIELD_NAME") &&
-            activeFilter === PENDING_FILTER &&
+            activeFilter === SUPPRESSED_FILTER &&
             (errText.includes("Post Date") || errText.includes("Archived At"))) {
-          activeFilter = LEGACY_PENDING_FILTER;
+          activeFilter = SUPPRESSED_LEGACY_FILTER;
           total = 0; offset = ""; pages = 0;
           continue;
         }
