@@ -42,3 +42,13 @@ feed of "what's the next manual move per in-flight lead".
   Airtable `{Date} != BLANK()` quirk (see 2026-06-09-airtable-date-blank-quirk).
 - DEFERRED (Kunal #20/#22): NO Unipile webhook auto-accept, NO auto-send cron.
 - Build: `npm install` then `./node_modules/.bin/next build` → exit 0.
+
+## Update (later 2026-06-09) — AUTO vs MANUAL send toggle
+- `auto-batch/action` `send_all`/`send_one` now accept `body.sendMode ∈
+  {"manual","auto"}`. **DEFAULT = "manual"** (absent/anything-but-"auto" →
+  manual) because the team sends by hand.
+  - `"manual"` → `Mode:"manual"` → manual-assist queue; cron SKIPS.
+  - `"auto"`   → `Mode:"auto_batch"` → existing cron auto-sends via Unipile.
+  - `Status:"queued"` unchanged; Notes append now reads "Approved (auto-send)"
+    vs "Approved (manual-assist)". NO Unipile calls added in this route — the
+    auto path stays entirely in `process_queue`.

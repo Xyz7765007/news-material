@@ -11,7 +11,11 @@ import {
 // ═══════════════════════════════════════════════════════════════════
 // SIDEKICK AUTO-BATCH ACTION
 // POST /api/sidekick/auto-batch/action
-//   body: { baseId, batchId, action, recordId?, field?, newText? }
+//   body: { baseId, batchId, action, recordId?, field?, newText?, sendMode? }
+//
+// sendMode ∈ {"manual","auto"} (DEFAULT "manual" — used by send_all/send_one):
+//   "manual" → Mode="manual"     → manual-assist queue; cron SKIPS (exec sends by hand)
+//   "auto"   → Mode="auto_batch" → cron auto-sends via Unipile (existing behavior)
 //
 // Actions:
 //   "send_all"     → flip ALL pending_approval records in batch to queued
@@ -101,6 +105,15 @@ export async function POST(request) {
     return NextResponse.json({ ok: false, error: "baseId and action required" }, { status: 400 });
   }
 
+  // sendMode controls whether the approved lead enters the manual-assist queue
+  // (exec sends by hand — cron skips Mode==="manual") or the auto-send queue
+  // (cron auto-sends via Unipile on Mode==="auto_batch"). DEFAULT is "manual"
+  // because the team sends by hand. No Unipile calls happen here either way —
+  // the auto path is handled entirely by the existing process_queue cron.
+  const sendMode = body.sendMode === "auto" ? "auto" : "manual";
+  const outreachMode = sendMode === "auto" ? "auto_batch" : "manual";
+  const approvalNote = sendMode === "auto" ? "Approved (auto-send)" : "Approved (manual-assist)";
+
   const today = new Date().toISOString();
 
   try {
@@ -120,9 +133,9 @@ export async function POST(request) {
         id: r.id,
         fields: {
           Status: "queued",
-          Mode: "manual",
+          Mode: outreachMode,
           "Next Action Date": new Date().toISOString().slice(0, 10),
-          Notes: `${r.fields?.Notes || ""}\n[${today}] Approved (manual-assist) via batch send_all`.trim(),
+          Notes: `${r.fields?.Notes || ""}\n[${today}] ${approvalNote} via batch send_all`.trim(),
         },
       }));
       const updated = await atUpdate(baseId, "Outreach", updates);
@@ -139,9 +152,9 @@ export async function POST(request) {
         id: recordId,
         fields: {
           Status: "queued",
-          Mode: "manual",
+          Mode: outreachMode,
           "Next Action Date": new Date().toISOString().slice(0, 10),
-          Notes: `${rec.fields?.Notes || ""}\n[${today}] Approved (manual-assist) via send_one`.trim(),
+          Notes: `${rec.fields?.Notes || ""}\n[${today}] ${approvalNote} via send_one`.trim(),
         },
       }]);
       return NextResponse.json({ ok: true, action: "send_one", recordId, count: updated.length });
