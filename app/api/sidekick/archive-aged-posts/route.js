@@ -51,7 +51,7 @@ function authOk(request, url) {
 
 // linkedin_engagement, not yet handled, not yet archived, with a Post Date that
 // is >7 days old. Mirrors the negated POST_DATE_GATE used in the feed filter.
-const AGED_FILTER = `AND(FIND("linkedin_engagement", {Task Type}), {Handled At} = BLANK(), {Archived At} = BLANK(), {Post Date} != BLANK(), NOT(IS_AFTER({Post Date}, DATEADD(NOW(), -7, 'days'))))`;
+const AGED_FILTER = `AND(FIND("linkedin_engagement", {Task Type}), {Handled At} = BLANK(), {Archived At} = BLANK(), NOT({Post Date} = BLANK()), NOT(IS_AFTER({Post Date}, DATEADD(NOW(), -7, 'days'))))`;
 
 async function atCreateArchive(baseId, records) {
   // Airtable caps creates at 10/request. typecast lets the new "aged_out"

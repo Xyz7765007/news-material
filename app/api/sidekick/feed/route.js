@@ -97,7 +97,7 @@ function formatCard(record) {
 //      handled) — aged-out post tasks get an Archived At stamp + a Signal
 //      Archive copy (surfaced in the in-app Signal Review tab) so they leave the
 //      feed but stay queryable and analytics-clean.
-const POST_DATE_GATE = `NOT(AND(FIND("linkedin_engagement", {Task Type}), {Post Date} != BLANK(), NOT(IS_AFTER({Post Date}, DATEADD(NOW(), -7, 'days')))))`;
+const POST_DATE_GATE = `NOT(AND(FIND("linkedin_engagement", {Task Type}), NOT({Post Date} = BLANK()), NOT(IS_AFTER({Post Date}, DATEADD(NOW(), -7, 'days')))))`;
 const PENDING_FILTER = `AND({Handled At} = BLANK(), {Archived At} = BLANK(), {LinkedIn URL} != BLANK(), ${POST_DATE_GATE}, OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
 // Legacy filter (pre-2026-06-09): used as a graceful fallback for campaign bases
 // that haven't run setup-fix yet, so the new {Post Date}/{Archived At} fields
