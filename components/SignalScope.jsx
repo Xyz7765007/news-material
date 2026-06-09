@@ -137,7 +137,8 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const scanRef = useRef(false);
   const taskSeenRef = useRef(new Set()); // tracks task fingerprints during scan to prevent dupes
   const [editRule, setEditRule] = useState(null); // unified rule editor — signal or top_x
-  const [filter, setFilter] = useState({src:"all",target:"all",q:"",from:"",to:"",datePreset:"all"});
+  const [showConnectorPicker, setShowConnectorPicker] = useState(false); // connector-type picker on the Connectors home
+  const [filter, setFilter] = useState({src:"all",target:"all",connector:"all",q:"",from:"",to:"",datePreset:"all"});
   const [csvModal, setCsvModal] = useState(null);
   const [csvUploadResult, setCsvUploadResult] = useState(null); // { msg, isError } — shows for ~8s after upload
   const [csvPrepping, setCsvPrepping] = useState(false); // shows toast "Preparing CSV upload..." while we fetch fresh records
@@ -275,7 +276,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     if (camp) {
       // Reset state for new campaign
       setAccounts([]); setLeads([]); setRules([]); setTasks([]);
-      setFilter({src:"all",target:"all",q:"",from:"",to:"",datePreset:"all"});
+      setFilter({src:"all",target:"all",connector:"all",q:"",from:"",to:"",datePreset:"all"});
       setSetupStatus(null); setAvailableFields({ Accounts: [], Leads: [] });
       setEditingBase(false); setBaseInput(""); setBaseError("");
       setSelectedTasks(new Set()); setShowExportModal(false);
@@ -1272,7 +1273,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   };
 
   // ─── Filtered tasks (used by export + task tab) ─────────────
-  const fTasks=tasks.filter(t=>{const f=t.fields||{};if(filter.src!=="all"&&f["Task Type"]!==filter.src)return false;if(filter.target!=="all"&&f["Scan Target"]!==filter.target)return false;if(filter.q&&!(f.Company||"").toLowerCase().includes(filter.q.toLowerCase())&&!(f["Task Rule"]||"").toLowerCase().includes(filter.q.toLowerCase()))return false;if(filter.from&&(f.Date||"")<filter.from)return false;if(filter.to&&(f.Date||"")>filter.to)return false;return true});
+  const fTasks=tasks.filter(t=>{const f=t.fields||{};if(filter.src!=="all"&&f["Task Type"]!==filter.src)return false;if(filter.target!=="all"&&f["Scan Target"]!==filter.target)return false;if(filter.connector&&filter.connector!=="all"&&(f["Task Rule"]||"")!==filter.connector)return false;if(filter.q&&!(f.Company||"").toLowerCase().includes(filter.q.toLowerCase())&&!(f["Task Rule"]||"").toLowerCase().includes(filter.q.toLowerCase()))return false;if(filter.from&&(f.Date||"")<filter.from)return false;if(filter.to&&(f.Date||"")>filter.to)return false;return true});
 
   // ─── Date presets ───────────────────────────────────────────
   const setDatePreset = (preset) => {
@@ -1888,11 +1889,12 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     {id:"accounts",label:"Accounts",count:accounts.length},
     {id:"leads",label:"Leads",count:leads.length},
     null,
-    {id:"rules",label:"Task Rules",count:rules.length},
+    {id:"rules",label:"Connectors",count:rules.length},
     {id:"prompts",label:"Prompts",count:rules.length},
     {id:"threshold",label:"Scoring",count:null},
+    null,
     {id:"tasks",label:"Tasks",count:tasks.length},
-    {id:"signal_review",label:"🔎 Signal Review",count:null},
+    {id:"signal_review",label:"🔎 Connector Review",count:null},
     null,
     {id:"outreach",label:"💬 LinkedIn Automation",count:null},
     {id:"linkedin_posts",label:"📝 LinkedIn Posts",count:null},
@@ -1968,8 +1970,8 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     <div className="ph"><div><div className="pt">{clientMode ? `${camp.emoji||"📊"} ${camp.name}` : "Dashboard"}</div><div className="pd">{clientMode ? "Your campaign workspace — everything in one view" : `${camp.name} — Real-time overview`}</div></div>
       <div style={{display:"flex",gap:6}}>
         {hasSignals&&!clientMode&&<>
-          <button className="btn btn-s btn-p" onClick={()=>startScan("news")} disabled={scanning||!accounts.length||!newsRuleCount} title={!newsRuleCount?"No news or both-type rules":`Scan ${newsRuleCount} news rule${newsRuleCount===1?"":"s"}`}>{scanning?"⏳ "+Math.round(scanProg)+"%":<>📰 News</>}</button>
-          <button className="btn btn-s btn-p" onClick={()=>startScan("jobs")} disabled={scanning||!accounts.length||!jobsRuleCount} title={!jobsRuleCount?"No job_post or both-type rules":`Scan ${jobsRuleCount} jobs rule${jobsRuleCount===1?"":"s"}`}>{scanning?"⏳ "+Math.round(scanProg)+"%":<>📋 Jobs</>}</button>
+          <button className="btn btn-s btn-p" onClick={()=>startScan("news")} disabled={scanning||!accounts.length||!newsRuleCount} title={!newsRuleCount?"No news or both-type connectors":`Scan ${newsRuleCount} news connector${newsRuleCount===1?"":"s"}`}>{scanning?"⏳ "+Math.round(scanProg)+"%":<>📰 News</>}</button>
+          <button className="btn btn-s btn-p" onClick={()=>startScan("jobs")} disabled={scanning||!accounts.length||!jobsRuleCount} title={!jobsRuleCount?"No job_post or both-type connectors":`Scan ${jobsRuleCount} jobs connector${jobsRuleCount===1?"":"s"}`}>{scanning?"⏳ "+Math.round(scanProg)+"%":<>📋 Jobs</>}</button>
         </>}
       </div>
     </div>
@@ -2075,7 +2077,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(160px,1fr))",gap:10}}>
           <StatTile label="Accounts" value={accounts.length} sub="Target companies" emoji="🏢" onClick={()=>setTab("accounts")} />
           <StatTile label="Leads" value={leads.length} sub={`${leadsWithEmail.length} with email · ${leadsWithLinkedIn.length} with LinkedIn`} emoji="👤" onClick={()=>setTab("leads")} />
-          <StatTile label="Task Rules" value={rules.length} sub={hasNews||hasJobs||hasTopX?"Active":"—"} emoji="⚙️" onClick={()=>setTab("rules")} />
+          <StatTile label="Connectors" value={rules.length} sub={hasNews||hasJobs||hasTopX?"Active":"—"} emoji="⚙️" onClick={()=>setTab("rules")} />
           <StatTile label="Tasks" value={tasks.length} sub={`Avg score ${tasksAvgScore} · ${tasksMonth.length} this month`} emoji="📋" color={tasksAvgScore>=70?"var(--grn)":"var(--t1)"} onClick={()=>setTab("tasks")} />
         </div>
 
@@ -2219,7 +2221,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))",gap:10}}>
             {Object.entries(tasksByType).sort((a,b)=>b[1]-a[1]).map(([type, count]) => {
               const emojiMap = { news: "📰", job_post: "💼", top_x: "🎯", linkedin_engagement: "🔗", linkedin_outreach: "🔗", engagement: "📈", website_engagement: "📈", post_demo: "🤖", other: "📋" };
-              const labelMap = { news: "News signals", job_post: "Job posts", top_x: "Top X scoring", linkedin_engagement: "LinkedIn", linkedin_outreach: "LinkedIn outreach", engagement: "Website (GA)", website_engagement: "Website (GA)", post_demo: "Post-demo", other: "Other" };
+              const labelMap = { news: "News", job_post: "Job posts", top_x: "Top X scoring", linkedin_engagement: "LinkedIn", linkedin_outreach: "LinkedIn outreach", engagement: "Website (GA)", website_engagement: "Website (GA)", post_demo: "Post-demo", other: "Other" };
               const pct = tasks.length > 0 ? Math.round(count / tasks.length * 100) : 0;
               return (
                 <div key={type} onClick={()=>setTab("tasks")} style={{padding:"12px 14px",background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,cursor:"pointer"}}>
@@ -2407,10 +2409,10 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       <div style={{fontSize:11,color:"var(--t3)",marginBottom:16}}>Follow these steps to set up your campaign. Each step unlocks the next.</div>
       <div style={{display:"flex",flexDirection:"column",gap:10}}>
         {[
-          {n:"Upload Accounts",d:"Upload your target company list (CSV). These are the companies you want to track signals for.",done:accounts.length>0,act:()=>setTab("accounts"),btn:"Upload Accounts"},
+          {n:"Upload Accounts",d:"Upload your target company list (CSV). These are the companies you want to track events for.",done:accounts.length>0,act:()=>setTab("accounts"),btn:"Upload Accounts"},
           {n:"Upload Leads",d:"Upload your contact list (CSV). Leads are the people at those companies you'll reach out to.",done:leads.length>0,act:()=>setTab("leads"),btn:"Upload Leads"},
-          {n:"Create Task Rules",d:"Define what signals to watch for — news mentions, job posts, or score your leads with Top X.",done:rules.length>0,act:()=>setTab("rules"),btn:"Create Rule"},
-          {n:"Run a Scan",d:"Execute your task rules. The AI scans RSS feeds, job boards, and scores leads to create actionable tasks.",done:tasks.length>0,act:()=>setTab("tasks"),btn:"Go to Tasks"},
+          {n:"Add Connectors",d:"Define what to watch for — news mentions, job posts, or score your leads with Top X.",done:rules.length>0,act:()=>setTab("rules"),btn:"Add Connector"},
+          {n:"Run a Scan",d:"Run your connectors. The AI scans RSS feeds, job boards, and scores leads to create actionable tasks.",done:tasks.length>0,act:()=>setTab("tasks"),btn:"Go to Tasks"},
           {n:"Connect HubSpot",d:"Push tasks and leads directly to your CRM. Run Post-Demo automation from your deal pipeline.",done:hsConnected,act:()=>setTab("hubspot"),btn:"Connect HubSpot"},
         ].map((step,i)=>(
           <div key={i} onClick={step.act} style={{padding:"16px 20px",background:"var(--card)",border:"1px solid "+(step.done?"rgba(93,168,122,.3)":"var(--bdr)"),borderRadius:10,cursor:"pointer",display:"flex",alignItems:"center",gap:14,transition:"all .15s"}} onMouseOver={e=>e.currentTarget.style.borderColor="var(--acc)"} onMouseOut={e=>e.currentTarget.style.borderColor=step.done?"rgba(93,168,122,.3)":"var(--bdr)"}>
@@ -2751,121 +2753,121 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     <div className="tw"><table><thead><tr>{cols.map(k=><th key={k}>{k}</th>)}{!clientMode&&<th></th>}</tr></thead><tbody>{filteredLeads.map(l=>{const f=l.fields||{};return(<tr key={l.id}>{cols.map(k=><td key={k} style={k==="Name"?{color:"var(--t1)",fontWeight:500}:k==="Email"?{fontSize:10}:k==="Campaign Tag"?{fontSize:10,color:"var(--acc)"}:k==="Custom Code"?{fontSize:10,fontFamily:"'JetBrains Mono',monospace",color:"var(--t3)"}:k==="GA Engagement Score"?{fontWeight:600,color:f[k]>50?"var(--grn)":f[k]>20?"var(--amb)":f[k]>0?"var(--blu)":"var(--t3)",fontSize:11}:k==="GA Last Visit"?{fontSize:10,color:f[k]?"var(--blu)":"var(--t3)"}:k==="GA Engagement Time"||k==="GA Avg Session Duration"?{fontSize:10,color:Number(f[k])>0?"var(--t1)":"var(--t3)"}:k==="GA Sessions"||k==="GA Engaged Sessions"||k==="GA Views"||k==="GA Views Per Session"?{fontSize:10,color:Number(f[k])>0?"var(--t1)":"var(--t3)",textAlign:"center"}:{}}>{fmt(f[k],k)}</td>)}{!clientMode&&<td><button className="btn btn-d btn-s" onClick={()=>del("Leads",[l.id],setLeads)}><I.Trash/></button></td>}</tr>)})}</tbody></table></div>}</div>);
   })()}
 
-  {/* TASK RULES (unified — signal + top_x) */}
-  {tab==="rules"&&!loading&&!clientMode&&(<div><div className="ph"><div><div className="pt">Task Rules</div><div className="pd">{rules.length} rules</div></div>{!clientMode&&<button className="btn btn-s btn-p" onClick={()=>setEditRule({})}><I.Plus/> Add Rule</button>}</div>
-
-  {/* Task type guides — show relevant ones based on campaign features */}
-  {rules.length===0&&(<div style={{display:"flex",flexDirection:"column",gap:12,marginBottom:20}}>
-    <div style={{fontSize:12,color:"var(--t2)",marginBottom:4}}>Choose a task type to get started. Each type detects different signals from your data.</div>
-  </div>)}
-  <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:12,marginBottom:rules.length?0:20}}>
-    {(hasNews||rules.length===0||configFeatures.includes("news"))&&(
-    <div style={{padding:16,border:"1px solid var(--bdr)",borderRadius:10,background:"var(--card)"}}>
-      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}><span style={{fontSize:20}}>📰</span><span style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>News Scanning</span><span className="chip cg">news</span></div>
-      <div style={{fontSize:11,color:"var(--t3)",lineHeight:1.6,marginBottom:10}}>Monitors Google News RSS feeds for company-level signals. Detects events like leadership changes, funding rounds, rebrands, regulatory shifts, and market moves at your target accounts.</div>
-      <div style={{fontSize:10,color:"var(--t3)"}}>
-        <div style={{marginBottom:4}}><strong style={{color:"var(--t2)"}}>Needs:</strong> Accounts with company names + domains</div>
-        <div style={{marginBottom:4}}><strong style={{color:"var(--t2)"}}>You define:</strong> Keywords to match, scoring prompt for AI classification</div>
-        <div><strong style={{color:"var(--t2)"}}>Creates:</strong> Tasks with headline, source URL, relevance score</div>
-      </div>
-      {!clientMode&&signalRules.filter(r=>{const tt=(r.fields||{})["Task Type"];return tt==="news"||tt==="both"}).length===0&&(
-        <button className="btn btn-s btn-ai" style={{marginTop:10}} onClick={()=>setEditRule({taskType:"news",sources:["News"]})}><I.Plus/> Create News Rule</button>
-      )}
-    </div>)}
-
-    {(hasJobs||rules.length===0||configFeatures.includes("job_posts"))&&(
-    <div style={{padding:16,border:"1px solid var(--bdr)",borderRadius:10,background:"var(--card)"}}>
-      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}><span style={{fontSize:20}}>📋</span><span style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>Job Post Tracking</span><span className="chip cb">job posts</span></div>
-      <div style={{fontSize:11,color:"var(--t3)",lineHeight:1.6,marginBottom:10}}>Scrapes LinkedIn job postings at target companies via Apify. Detects when companies are hiring specific roles that signal buying intent, like CMO, VP Marketing, or Marketing Ops roles.</div>
-      <div style={{fontSize:10,color:"var(--t3)"}}>
-        <div style={{marginBottom:4}}><strong style={{color:"var(--t2)"}}>Needs:</strong> Accounts with LinkedIn company URLs</div>
-        <div style={{marginBottom:4}}><strong style={{color:"var(--t2)"}}>You define:</strong> Job title keywords to search for</div>
-        <div><strong style={{color:"var(--t2)"}}>Creates:</strong> Tasks with job title, posting URL, relevance score</div>
-      </div>
-      {!clientMode&&signalRules.filter(r=>{const tt=(r.fields||{})["Task Type"];return tt==="job_post"||tt==="both"}).length===0&&(
-        <button className="btn btn-s btn-ai" style={{marginTop:10}} onClick={()=>setEditRule({taskType:"job_post",sources:["Job Posts"]})}><I.Plus/> Create Job Post Rule</button>
-      )}
-      {!clientMode&&(
-        <button className="btn btn-s btn-ai" style={{marginTop:10,marginLeft:8}} title="Watch each account's own LinkedIn company-page posts (product launches, exec announcements, campaigns) — runs via the 📣 Company Posts scan button on the Tasks tab" onClick={()=>setEditRule({taskType:"company_post",sources:["Social"],scanTarget:"accounts"})}><I.Plus/> Create Company Post Rule</button>
-      )}
-    </div>)}
-
-    {(hasTopX||rules.length===0||configFeatures.includes("top_x"))&&(
-    <div style={{padding:16,border:"1px solid var(--bdr)",borderRadius:10,background:"var(--card)"}}>
-      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}><span style={{fontSize:20}}>🎯</span><span style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>Top X Scoring</span><span className="chip cp">top x</span></div>
-      <div style={{fontSize:11,color:"var(--t3)",lineHeight:1.6,marginBottom:10}}>Ranks your existing leads or accounts by weighted field scoring. Reads numeric data from your Airtable (engagement scores, email clicks, revenue, etc.), computes a composite score, and surfaces the top N for action.</div>
-      <div style={{fontSize:10,color:"var(--t3)"}}>
-        <div style={{marginBottom:4}}><strong style={{color:"var(--t2)"}}>Needs:</strong> Leads or Accounts with numeric/scoring fields in Airtable</div>
-        <div style={{marginBottom:4}}><strong style={{color:"var(--t2)"}}>You define:</strong> Which fields to score on, weight per field, how many top results</div>
-        <div><strong style={{color:"var(--t2)"}}>Creates:</strong> Tasks for top N leads/accounts with composite score</div>
-      </div>
-      {!clientMode&&topXRules.length===0&&(
-        <button className="btn btn-s btn-ai" style={{marginTop:10}} onClick={()=>setEditRule({taskType:"top_x"})}><I.Plus/> Create Top X Rule</button>
-      )}
-    </div>)}
-  </div>
-
-  {rules.length===0?null:<>
-
-  {/* Signal rules table */}
-  {signalRules.length>0&&(<div style={{marginBottom:topXRules.length?20:0}}>
-  <div style={{fontSize:11,fontWeight:600,color:"var(--t2)",marginBottom:8}}>📰 Signal Rules</div>
-  <div className="tw"><table><thead><tr><th>Name</th><th>Task Type</th><th>Scan Target</th><th>Ease</th><th>Strength</th><th>Keywords</th><th></th></tr></thead><tbody>{signalRules.map(r=>{const f=r.fields||{};const isJobOnly=f["Task Type"]==="job_post";return(<tr key={r.id}><td style={{color:"var(--t1)",fontWeight:500}}>{f.Name}</td><td><span className={"chip "+(f["Task Type"]==="job_post"?"cb":f["Task Type"]==="both"?"ca":"cg")}>{f["Task Type"]||"news"}</span></td><td><span className={"chip "+(f["Scan Target"]==="leads"?"cp":f["Scan Target"]==="both"?"ca":"cg")}>{f["Scan Target"]||"accounts"}</span></td><td>{f.Ease}</td><td>{f.Strength}</td><td style={{fontSize:10,color:"var(--t3)"}}>{(isJobOnly?(f["Job Title Keywords"]||""):(f.Keywords||"")).slice(0,40)}</td><td>{!clientMode&&<div style={{display:"flex",gap:4}}><button className="btn btn-s" onClick={()=>setEditRule({airtableId:r.id,name:f.Name,description:f.Description,taskType:f["Task Type"]||"news",scanTarget:f["Scan Target"]||"accounts",ease:f.Ease,strength:f.Strength,sources:(f.Sources||"").split(",").map(s=>s.trim()).filter(Boolean),keywords:(f.Keywords||"").split(",").map(k=>k.trim()).filter(Boolean),jobTitleKeywords:(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()).filter(Boolean),scoringPrompt:f["Scoring Prompt"]||""})}>Edit</button><button className="btn btn-s" onClick={()=>duplicateRule(r)} title="Duplicate"><I.Copy/></button><button className="btn btn-d btn-s" onClick={()=>del("Task Rules",[r.id],setRules)}><I.Trash/></button></div>}</td></tr>)})}</tbody></table></div>
-  </div>)}
-
-  {/* Top X rules cards */}
-  {topXRules.length>0&&(<div>
-  <div style={{fontSize:11,fontWeight:600,color:"var(--t2)",marginBottom:8}}>🎯 Top X Rules</div>
-  <div style={{display:"flex",flexDirection:"column",gap:12}}>{topXRules.map(r=>{const f=r.fields||{};const sf=JSON.parse(f["Scoring Fields"]||"[]");return(
-    <div key={r.id} style={{padding:16,border:"1px solid var(--bdr)",borderRadius:8,background:"var(--card)"}}>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}><div><div style={{fontSize:14,fontWeight:600}}>{f.Name}</div>{f.Description&&<div style={{fontSize:11,color:"var(--t3)",marginTop:2}}>{f.Description}</div>}</div><div style={{display:"flex",gap:6}}><span className={"chip "+(f["Scan Target"]==="accounts"?"cg":"cp")}>{f["Scan Target"]||"leads"}</span><span className="chip ca">TOP {f["Top N"]||10}</span></div></div>
-      <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}}>{sf.map((s,i)=>(<div key={i} style={{padding:"4px 10px",background:"var(--hover)",borderRadius:4,fontSize:10}}><span style={{color:"var(--t1)"}}>{s.field}</span><span style={{color:"var(--acc)",marginLeft:6}}>{s.weight}%</span></div>))}</div>
-      <div style={{display:"flex",gap:6}}><button className="btn btn-p btn-s" onClick={()=>runTopX(r)} disabled={scanning}>{scanning?"Running…":"▶ Run"}</button><button className="btn btn-s" onClick={()=>{
-        // Parse compiled rules JSON if present
-        let compiledRules = null;
-        try { if (f["Compiled Rules JSON"]) compiledRules = JSON.parse(f["Compiled Rules JSON"]); } catch {}
-        setEditRule({airtableId:r.id,taskType:"top_x",name:f.Name,description:f.Description||"",scanTarget:f["Scan Target"]||"leads",topN:f["Top N"]||10,scoringFields:sf,ease:f.Ease||"Medium",strength:f.Strength||"Strong",scoringPrompt:f["Scoring Prompt"]||"",
-          smartCompile: f["Smart Compile"]==="true"||f["Smart Compile"]===true,
-          compiledRules,
-          compiledAt: f["Compiled At"] || null,
-          baseId: bid,
-        });
-      }}>Edit</button><button className="btn btn-s" onClick={()=>duplicateRule(r)} title="Duplicate"><I.Copy/></button><button className="btn btn-d btn-s" onClick={()=>del("Task Rules",[r.id],setRules)}><I.Trash/></button></div>
-    </div>)})}</div>
-  </div>)}
-
-  {/* Outreach Rules summary on Task Rules tab (the actual editor lives on LinkedIn Automation tab) */}
-  {(() => {
+  {/* CONNECTORS (unified — signal + top_x + outreach). Starts blank when none
+      are configured: a single prominent "+ Add Connector" CTA opens a type
+      picker that routes into the existing RuleEditor. Configured connectors
+      render as uniform cards. (Internally these are still Task Rules.) */}
+  {tab==="rules"&&!loading&&!clientMode&&(()=>{
     const outRules = rules.filter(r => (r.fields || {})["Task Type"] === "linkedin_outreach");
-    if (outRules.length === 0) return null;
-    return (
-      <div style={{marginTop:20}}>
-        <div style={{fontSize:11,fontWeight:600,color:"var(--t2)",marginBottom:8}}>🔗 LinkedIn Outreach Rules</div>
-        <div style={{display:"flex",flexDirection:"column",gap:8}}>
-          {outRules.map(r => {
-            const f = r.fields || {};
-            let config; try { config = JSON.parse(f["Outreach Config"] || "{}"); } catch { config = {}; }
-            const seq = config.dmSequence || [];
-            return (
-              <div key={r.id} style={{padding:14,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                <div>
-                  <div style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>{f.Name}</div>
-                  <div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>
-                    {config.leadsPerBatch || 10} leads/batch · {seq.length} DM steps · {config.connectionsPerDay || 5}/day · {config.active ? <span style={{color:"var(--grn)"}}>● active</span> : <span style={{color:"var(--amb)"}}>○ inactive</span>}
-                  </div>
-                </div>
-                <div style={{display:"flex",gap:6,alignItems:"center"}}>
-                  <span style={{fontSize:10,color:"var(--t3)"}}>Edit on the</span>
-                  <button className="btn btn-s btn-p" onClick={()=>setTab("outreach")}>💬 LinkedIn Automation tab →</button>
-                </div>
-              </div>
-            );
-          })}
+    const configured = rules.length > 0;
+    // Type metadata for the uniform card badges + the type picker.
+    const CONNECTOR_TYPES = [
+      {key:"news",emoji:"📰",label:"News",badge:"cg",blurb:"Monitor Google News for company-level events at your accounts.",preset:{taskType:"news",sources:["News"]}},
+      {key:"job_post",emoji:"📋",label:"Job Posts",badge:"cb",blurb:"Track LinkedIn job postings that signal buying intent.",preset:{taskType:"job_post",sources:["Job Posts"]}},
+      {key:"company_post",emoji:"📣",label:"Company Posts",badge:"ca",blurb:"Watch each account's own LinkedIn company-page posts.",preset:{taskType:"company_post",sources:["Social"],scanTarget:"accounts"}},
+      {key:"top_x",emoji:"🎯",label:"Top X",badge:"cp",blurb:"Rank your leads or accounts by weighted + AI scoring.",preset:{taskType:"top_x"}},
+      {key:"linkedin_outreach",emoji:"💬",label:"Outreach",badge:"ca",blurb:"Automated LinkedIn connection + DM sequences.",preset:{taskType:"linkedin_outreach"}},
+    ];
+    const typeMeta = (tt) => CONNECTOR_TYPES.find(t=>t.key===tt) || {emoji:"⚙️",label:(tt||"news"),badge:"cg"};
+    const taskCountFor = (name) => tasks.filter(t=>(t.fields||{})["Task Rule"]===name).length;
+    return (<div><div className="ph"><div><div className="pt">Connectors</div><div className="pd">{configured?`${rules.length} configured`:"None configured yet"}</div></div>{configured&&<button className="btn btn-s btn-p" onClick={()=>setShowConnectorPicker(true)}><I.Plus/> Add Connector</button>}</div>
+
+    {/* Blank empty-state — single prominent CTA, no upfront dump of every option */}
+    {!configured&&(<div className="empty" style={{padding:"48px 20px"}}>
+      <div className="em">🔌</div>
+      <p style={{marginBottom:16}}>No connectors yet. Add one to start detecting events at your accounts.</p>
+      <button className="btn btn-p" onClick={()=>setShowConnectorPicker(true)}><I.Plus/> Add Connector</button>
+    </div>)}
+
+    {/* Connector-type picker — routes the chosen type into the existing RuleEditor */}
+    {showConnectorPicker&&(<div className="modal-o" onClick={e=>e.target===e.currentTarget&&setShowConnectorPicker(false)}><div className="modal" style={{maxWidth:560}}>
+      <div className="modal-h"><span style={{fontWeight:600}}>Add a connector</span><button className="btn btn-s" onClick={()=>setShowConnectorPicker(false)}>✕</button></div>
+      <div className="modal-b">
+        <div style={{fontSize:12,color:"var(--t2)",marginBottom:12}}>Choose a connector type. Each detects a different kind of event from your data.</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(240px,1fr))",gap:12}}>
+          {CONNECTOR_TYPES.map(t=>(
+            <button key={t.key} className="btn" style={{display:"block",textAlign:"left",padding:14,border:"1px solid var(--bdr)",borderRadius:10,background:"var(--card)",height:"auto"}} onClick={()=>{setShowConnectorPicker(false);setEditRule(t.preset);}}>
+              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}><span style={{fontSize:20}}>{t.emoji}</span><span style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>{t.label}</span><span className={"chip "+t.badge}>{t.label.toLowerCase()}</span></div>
+              <div style={{fontSize:11,color:"var(--t3)",lineHeight:1.6}}>{t.blurb}</div>
+            </button>
+          ))}
         </div>
       </div>
-    );
+    </div></div>)}
+
+    {/* Configured connectors — uniform cards, ONLY what's actually set up */}
+    {configured&&<div style={{display:"flex",flexDirection:"column",gap:12}}>
+      {/* Signal connectors (news / job_post / company_post / both) */}
+      {signalRules.map(r=>{const f=r.fields||{};const tt=f["Task Type"]||"news";const m=typeMeta(tt);const isJobOnly=tt==="job_post";const kw=(isJobOnly?(f["Job Title Keywords"]||""):(f.Keywords||"")).slice(0,60);return(
+        <div key={r.id} style={{padding:16,border:"1px solid var(--bdr)",borderRadius:10,background:"var(--card)"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,marginBottom:8}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,minWidth:0}}><span style={{fontSize:18}}>{m.emoji}</span><span style={{fontSize:14,fontWeight:600,color:"var(--t1)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{f.Name}</span></div>
+            <div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}>
+              <span className={"chip "+m.badge}>{tt==="both"?"news + jobs":m.label.toLowerCase()}</span>
+              <span className={"chip "+(f["Scan Target"]==="leads"?"cp":f["Scan Target"]==="both"?"ca":"cg")}>{f["Scan Target"]||"accounts"}</span>
+              <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>{taskCountFor(f.Name)} tasks</span>
+            </div>
+          </div>
+          {f.Description&&<div style={{fontSize:11,color:"var(--t3)",marginBottom:8}}>{f.Description}</div>}
+          {kw&&<div style={{fontSize:10,color:"var(--t3)",marginBottom:10}}>Keywords: {kw}</div>}
+          <div style={{display:"flex",gap:6}}>
+            <button className="btn btn-s btn-p" onClick={()=>setEditRule({airtableId:r.id,name:f.Name,description:f.Description,taskType:tt,scanTarget:f["Scan Target"]||"accounts",ease:f.Ease,strength:f.Strength,sources:(f.Sources||"").split(",").map(s=>s.trim()).filter(Boolean),keywords:(f.Keywords||"").split(",").map(k=>k.trim()).filter(Boolean),jobTitleKeywords:(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()).filter(Boolean),scoringPrompt:f["Scoring Prompt"]||""})}>Configure</button>
+            <button className="btn btn-s" onClick={()=>{setTab("tasks");setFilter(ff=>({...ff,connector:f.Name}));}}>View tasks</button>
+            <button className="btn btn-s" onClick={()=>duplicateRule(r)} title="Duplicate"><I.Copy/></button>
+            <button className="btn btn-d btn-s" onClick={()=>del("Task Rules",[r.id],setRules)}><I.Trash/></button>
+          </div>
+        </div>);})}
+
+      {/* Top X connectors */}
+      {topXRules.map(r=>{const f=r.fields||{};const sf=JSON.parse(f["Scoring Fields"]||"[]");return(
+        <div key={r.id} style={{padding:16,border:"1px solid var(--bdr)",borderRadius:10,background:"var(--card)"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,marginBottom:8}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,minWidth:0}}><span style={{fontSize:18}}>🎯</span><span style={{fontSize:14,fontWeight:600,color:"var(--t1)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{f.Name}</span></div>
+            <div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}>
+              <span className="chip cp">top x</span>
+              <span className={"chip "+(f["Scan Target"]==="accounts"?"cg":"cp")}>{f["Scan Target"]||"leads"}</span>
+              <span className="chip ca">TOP {f["Top N"]||10}</span>
+              <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>{taskCountFor(f.Name)} tasks</span>
+            </div>
+          </div>
+          {f.Description&&<div style={{fontSize:11,color:"var(--t3)",marginBottom:8}}>{f.Description}</div>}
+          {sf.length>0&&<div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}}>{sf.map((s,i)=>(<div key={i} style={{padding:"4px 10px",background:"var(--hover)",borderRadius:4,fontSize:10}}><span style={{color:"var(--t1)"}}>{s.field}</span><span style={{color:"var(--acc)",marginLeft:6}}>{s.weight}%</span></div>))}</div>}
+          <div style={{display:"flex",gap:6}}>
+            <button className="btn btn-p btn-s" onClick={()=>runTopX(r)} disabled={scanning}>{scanning?"Running…":"▶ Run"}</button>
+            <button className="btn btn-s" onClick={()=>{
+              let compiledRules = null;
+              try { if (f["Compiled Rules JSON"]) compiledRules = JSON.parse(f["Compiled Rules JSON"]); } catch {}
+              setEditRule({airtableId:r.id,taskType:"top_x",name:f.Name,description:f.Description||"",scanTarget:f["Scan Target"]||"leads",topN:f["Top N"]||10,scoringFields:sf,ease:f.Ease||"Medium",strength:f.Strength||"Strong",scoringPrompt:f["Scoring Prompt"]||"",
+                smartCompile: f["Smart Compile"]==="true"||f["Smart Compile"]===true,
+                compiledRules,
+                compiledAt: f["Compiled At"] || null,
+                baseId: bid,
+              });
+            }}>Configure</button>
+            <button className="btn btn-s" onClick={()=>{setTab("tasks");setFilter(ff=>({...ff,connector:f.Name}));}}>View tasks</button>
+            <button className="btn btn-s" onClick={()=>duplicateRule(r)} title="Duplicate"><I.Copy/></button>
+            <button className="btn btn-d btn-s" onClick={()=>del("Task Rules",[r.id],setRules)}><I.Trash/></button>
+          </div>
+        </div>);})}
+
+      {/* Outreach connectors — config lives on the LinkedIn Automation tab */}
+      {outRules.map(r=>{const f=r.fields||{};let config;try{config=JSON.parse(f["Outreach Config"]||"{}");}catch{config={};}const seq=config.dmSequence||[];return(
+        <div key={r.id} style={{padding:16,border:"1px solid var(--bdr)",borderRadius:10,background:"var(--card)"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,marginBottom:8}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,minWidth:0}}><span style={{fontSize:18}}>💬</span><span style={{fontSize:14,fontWeight:600,color:"var(--t1)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{f.Name}</span></div>
+            <div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}>
+              <span className="chip ca">outreach</span>
+              <span className="chip" style={{background:"var(--hover)",color:config.active?"var(--grn)":"var(--amb)"}}>{config.active?"● active":"○ inactive"}</span>
+            </div>
+          </div>
+          <div style={{fontSize:10,color:"var(--t3)",marginBottom:10}}>{config.leadsPerBatch||10} leads/batch · {seq.length} DM steps · {config.connectionsPerDay||5}/day</div>
+          <div style={{display:"flex",gap:6}}>
+            <button className="btn btn-s btn-p" onClick={()=>setTab("outreach")}>💬 Configure on LinkedIn Automation →</button>
+          </div>
+        </div>);})}
+    </div>}
+    </div>);
   })()}
-  </>}</div>)}
 
   {/* PROMPTS */}
   {tab==="prompts"&&!loading&&!clientMode&&(<div>
@@ -2967,7 +2969,7 @@ Output format (strict JSON, no markdown):
   </div>)})}</div></div>)}
 
   {/* THRESHOLD */}
-  {tab==="threshold"&&!loading&&!clientMode&&(<div><div className="ph"><div><div className="pt">Scoring Threshold</div><div className="pd">Minimum score for signals to become tasks</div></div></div>
+  {tab==="threshold"&&!loading&&!clientMode&&(<div><div className="ph"><div><div className="pt">Scoring Threshold</div><div className="pd">Minimum score for an event to become a task</div></div></div>
   <div style={{padding:24,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:12,maxWidth:500}}>
   <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:16}}><span style={{fontSize:12,color:"var(--t2)"}}>Threshold</span><input type="range" className="sld" min="0" max="100" value={threshold} onChange={e=>setThreshold(+e.target.value)}/><span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:14,fontWeight:600,color:"var(--acc)",minWidth:30,textAlign:"center"}}>{threshold}</span></div>
   <div style={{display:"flex",gap:16,fontSize:10,color:"var(--t3)"}}><span>0-49: Weak</span><span>50-69: Partial</span><span style={{color:"var(--acc)"}}>70-89: Strong</span><span style={{color:"var(--grn)"}}>90-100: Exact</span></div></div></div>)}
@@ -2980,9 +2982,9 @@ Output format (strict JSON, no markdown):
       {!clientMode&&<button className="btn btn-s" style={{color:"var(--pur)",borderColor:"rgba(155,126,216,.3)"}} disabled={!tasks.length} onClick={()=>setEnrichModal({mode:"select"})}><I.Sparkle/> Enrich Phones</button>}
       {!clientMode&&hsConnected && <button className="btn btn-s" style={{color:"var(--grn)",borderColor:"rgba(93,168,122,.3)"}} disabled={!tasks.length} onClick={()=>setEnrichModal({mode:"push"})}><I.Upload/> Push to HubSpot{selCount>0?` (${selCount})`:""}</button>}
       {hasSignals&&!clientMode&&<>
-        <button className="btn btn-p btn-s" onClick={()=>startScan("news")} disabled={scanning||!accounts.length||!newsRuleCount} title={!newsRuleCount?"No news or both-type rules":`Scan ${newsRuleCount} news rule${newsRuleCount===1?"":"s"}`}>{scanning?"Scanning "+Math.round(scanProg)+"%":<>📰 News</>}</button>
-        <button className="btn btn-p btn-s" onClick={()=>startScan("jobs")} disabled={scanning||!accounts.length||!jobsRuleCount} title={!jobsRuleCount?"No job_post or both-type rules":`Scan ${jobsRuleCount} jobs rule${jobsRuleCount===1?"":"s"}`}>{scanning?"Scanning "+Math.round(scanProg)+"%":<>📋 Jobs</>}</button>
-        {companyPostRuleCount>0&&<button className="btn btn-p btn-s" onClick={()=>startScan("company_posts")} disabled={scanning||!accounts.length} title={`Scan ${companyPostRuleCount} company-post rule${companyPostRuleCount===1?"":"s"} across all accounts' LinkedIn pages`}>{scanning?"Scanning "+Math.round(scanProg)+"%":<>📣 Company Posts</>}</button>}
+        <button className="btn btn-p btn-s" onClick={()=>startScan("news")} disabled={scanning||!accounts.length||!newsRuleCount} title={!newsRuleCount?"No news or both-type connectors":`Scan ${newsRuleCount} news connector${newsRuleCount===1?"":"s"}`}>{scanning?"Scanning "+Math.round(scanProg)+"%":<>📰 News</>}</button>
+        <button className="btn btn-p btn-s" onClick={()=>startScan("jobs")} disabled={scanning||!accounts.length||!jobsRuleCount} title={!jobsRuleCount?"No job_post or both-type connectors":`Scan ${jobsRuleCount} jobs connector${jobsRuleCount===1?"":"s"}`}>{scanning?"Scanning "+Math.round(scanProg)+"%":<>📋 Jobs</>}</button>
+        {companyPostRuleCount>0&&<button className="btn btn-p btn-s" onClick={()=>startScan("company_posts")} disabled={scanning||!accounts.length} title={`Scan ${companyPostRuleCount} company-post connector${companyPostRuleCount===1?"":"s"} across all accounts' LinkedIn pages`}>{scanning?"Scanning "+Math.round(scanProg)+"%":<>📣 Company Posts</>}</button>}
       </>}
     </div></div>
     {scanning&&<div className="scan-s"><div className="scan-d"/><span style={{fontSize:12,flex:1}}>{scanText}</span><span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:11,color:"var(--acc)"}}>{Math.round(scanProg)}%</span>{hasSignals&&<button className="btn btn-d btn-s" onClick={()=>{scanRef.current=false;setScanning(false)}}>Stop</button>}</div>}
@@ -2990,6 +2992,7 @@ Output format (strict JSON, no markdown):
     {/* Filters + date presets */}
     <div className="fb">
       <input className="inp" placeholder="Search…" value={filter.q} onChange={e=>setFilter(f=>({...f,q:e.target.value}))} style={{maxWidth:220}}/>
+      <select className="inp" style={{width:170}} value={filter.connector} onChange={e=>setFilter(f=>({...f,connector:e.target.value}))}><option value="all">All Connectors</option>{[...new Set(tasks.map(t=>(t.fields||{})["Task Rule"]).filter(Boolean))].sort().map(c=><option key={c} value={c}>{c}</option>)}</select>
       <select className="inp" style={{width:140}} value={filter.src} onChange={e=>setFilter(f=>({...f,src:e.target.value}))}><option value="all">All Types</option><option value="news">News</option><option value="job_post">Job Posts</option><option value="top_x">Top X</option>{[...new Set(tasks.map(t=>(t.fields||{})["Task Type"]).filter(Boolean))].filter(t=>!["news","job_post","top_x"].includes(t)).map(t=><option key={t} value={t}>{t}</option>)}</select>
       <select className="inp" style={{width:130}} value={filter.target} onChange={e=>setFilter(f=>({...f,target:e.target.value}))}><option value="all">All Targets</option><option value="accounts">Accounts</option><option value="leads">Leads</option></select>
     </div>
@@ -3009,22 +3012,38 @@ Output format (strict JSON, no markdown):
       <button className="btn btn-s" style={{fontSize:10}} onClick={()=>setSelectedTasks(new Set())}>Clear</button>
     </div>)}
 
-    {fTasks.length===0?<div className="empty"><div className="em">📡</div><p>{tasks.length===0?"No tasks yet.":"No matches."}</p></div>:
-    <div className="tw"><table><thead><tr>
-      <th style={{width:32,padding:"10px 8px"}}><input type="checkbox" checked={fTasks.length>0&&fTasks.every(t=>selectedTasks.has(t.id))} onChange={toggleAllVisible} style={{cursor:"pointer",accentColor:"var(--acc)"}}/></th>
-      <th>Company</th><th>Task Rule</th><th>Score</th><th>Target</th><th>Signal</th><th>Type</th><th>Date</th><th>Link</th>{!clientMode&&<th></th>}
-    </tr></thead><tbody>{fTasks.map(t=>{const f=t.fields||{};const sc=f.Score||0;const sel=selectedTasks.has(t.id);return(<tr key={t.id} style={{background:sel?"rgba(191,163,90,.06)":"transparent"}}>
-      <td style={{padding:"10px 8px"}}><input type="checkbox" checked={sel} onChange={()=>toggleTask(t.id)} style={{cursor:"pointer",accentColor:"var(--acc)"}}/></td>
-      <td style={{color:"var(--t1)",fontWeight:500}}>{f.Company}</td>
-      <td>{f["Task Rule"]}</td>
-      <td><div className="sb" style={{width:80}} title={f["Score Reason"]?`AI reason: ${f["Score Reason"]}`:""}><div className="st"><div className="sf" style={{width:sc+"%",background:sc>=80?"var(--grn)":sc>=60?"var(--amb)":"var(--red)"}}/></div><span className="sv" style={{color:sc>=80?"var(--grn)":sc>=60?"var(--amb)":"var(--red)"}}>{sc}</span></div></td>
-      <td><span className={"chip "+(f["Scan Target"]==="leads"?"cp":"cg")}>{f["Scan Target"]||"accounts"}</span></td>
-      <td style={{maxWidth:200,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={f.Signal+(f["Score Reason"]?"\n\n💡 Why this matched: "+f["Score Reason"]:"")}>{f.Signal}</td>
-      <td><span className={"chip "+(f["Task Type"]==="job_post"?"cb":f["Task Type"]==="top_x"?"cp":"cg")}>{(f["Task Type"]||"news").replace(/_/g," ").toUpperCase()}</span></td>
-      <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10}}>{f.Date}</td>
-      <td>{f.URL?<a href={f.URL} target="_blank" rel="noopener" style={{color:"var(--blu)",fontSize:10}}>↗</a>:"—"}</td>
-      {!clientMode&&<td><button className="btn btn-d btn-s" onClick={()=>del("Tasks",[t.id],setTasks)}><I.Trash/></button></td>}
-    </tr>)})}</tbody></table></div>}
+    {fTasks.length===0?<div className="empty"><div className="em">📡</div><p>{tasks.length===0?"No tasks yet.":"No matches."}</p></div>:(()=>{
+      // Render one task row. The task copy (Company + Signal) carries the
+      // instruction — there is no separate "action today" block.
+      const colCount = clientMode?8:9;
+      const taskRow=t=>{const f=t.fields||{};const sc=f.Score||0;const sel=selectedTasks.has(t.id);return(<tr key={t.id} style={{background:sel?"rgba(191,163,90,.06)":"transparent"}}>
+        <td style={{padding:"10px 8px"}}><input type="checkbox" checked={sel} onChange={()=>toggleTask(t.id)} style={{cursor:"pointer",accentColor:"var(--acc)"}}/></td>
+        <td style={{color:"var(--t1)",fontWeight:500}}>{f.Company}</td>
+        <td>{f["Task Rule"]}</td>
+        <td><div className="sb" style={{width:80}} title={f["Score Reason"]?`AI reason: ${f["Score Reason"]}`:""}><div className="st"><div className="sf" style={{width:sc+"%",background:sc>=80?"var(--grn)":sc>=60?"var(--amb)":"var(--red)"}}/></div><span className="sv" style={{color:sc>=80?"var(--grn)":sc>=60?"var(--amb)":"var(--red)"}}>{sc}</span></div></td>
+        <td><span className={"chip "+(f["Scan Target"]==="leads"?"cp":"cg")}>{f["Scan Target"]||"accounts"}</span></td>
+        <td style={{maxWidth:200,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={f.Signal+(f["Score Reason"]?"\n\n💡 Why this matched: "+f["Score Reason"]:"")}>{f.Signal}</td>
+        <td><span className={"chip "+(f["Task Type"]==="job_post"?"cb":f["Task Type"]==="top_x"?"cp":"cg")}>{(f["Task Type"]||"news").replace(/_/g," ").toUpperCase()}</span></td>
+        <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10}}>{f.Date}</td>
+        <td>{f.URL?<a href={f.URL} target="_blank" rel="noopener" style={{color:"var(--blu)",fontSize:10}}>↗</a>:"—"}</td>
+        {!clientMode&&<td><button className="btn btn-d btn-s" onClick={()=>del("Tasks",[t.id],setTasks)}><I.Trash/></button></td>}
+      </tr>);};
+      const head=(<thead><tr>
+        <th style={{width:32,padding:"10px 8px"}}><input type="checkbox" checked={fTasks.length>0&&fTasks.every(t=>selectedTasks.has(t.id))} onChange={toggleAllVisible} style={{cursor:"pointer",accentColor:"var(--acc)"}}/></th>
+        <th>Company</th><th>Connector</th><th>Score</th><th>Target</th><th>Event</th><th>Type</th><th>Date</th><th>Link</th>{!clientMode&&<th></th>}
+      </tr></thead>);
+      // When no single connector is selected, group rows by connector with a
+      // divider header per group so each connector's tasks stay visually separate.
+      if(filter.connector==="all"){
+        const groups={};for(const t of fTasks){const k=(t.fields||{})["Task Rule"]||"(no connector)";(groups[k]=groups[k]||[]).push(t);}
+        const ordered=Object.keys(groups).sort();
+        return(<div className="tw"><table>{head}{ordered.map(k=>(<tbody key={k}>
+          <tr><td colSpan={colCount+1} style={{padding:"10px 12px",background:"var(--hover)",borderTop:"2px solid var(--bdr)",fontSize:11,fontWeight:600,color:"var(--t2)"}}>{k} <span style={{color:"var(--t3)",fontWeight:400}}>· {groups[k].length}</span></td></tr>
+          {groups[k].map(taskRow)}
+        </tbody>))}</table></div>);
+      }
+      return(<div className="tw"><table>{head}<tbody>{fTasks.map(taskRow)}</tbody></table></div>);
+    })()}
   </div>)}
 
   {/* ════ SIGNAL REVIEW — qualified vs unqualified vs duplicate, cross-mapped ════ */}
@@ -3051,7 +3070,7 @@ Output format (strict JSON, no markdown):
     // Role-freshness badge map: status stamped by /api/role-check.
     const ROLE={verified:{t:"✅ in role",c:"var(--grn)"},changed:{t:"⚠ title changed",c:"var(--amb)"},stale:{t:"⛔ left role",c:"var(--red)"},unverified:{t:"❔ unverified",c:"var(--t3)"},unknown:{t:"— no URL",c:"var(--t3)"}};
     const staleCount=scoped.filter(r=>r.roleStatus==="stale"||r.roleStatus==="changed").length;
-    const promote=async r=>{if(!confirm(`Promote this unqualified signal (score ${r.score}) to a live Task?\n\n${r.signal}`))return;const nt={Company:r.company,"Task Rule":r.rule,Score:r.score,"Score Reason":r.reason,"Scan Target":r.target,Signal:r.signal,Source:r.source,URL:r.url,"Task Type":r.type,Date:r.date,Created:new Date().toISOString()};try{const res=await at("create","Tasks",{records:[nt]},bid);setTasks(p=>[...(res.records||[]),...p]);await at("delete","Signal Archive",{recordIds:[r.id]},bid);setArchiveRecs(p=>(p||[]).filter(x=>x.id!==r.id));}catch(e){alert("Promote failed: "+e.message);}};
+    const promote=async r=>{if(!confirm(`Promote this unqualified result (score ${r.score}) to a live Task?\n\n${r.signal}`))return;const nt={Company:r.company,"Task Rule":r.rule,Score:r.score,"Score Reason":r.reason,"Scan Target":r.target,Signal:r.signal,Source:r.source,URL:r.url,"Task Type":r.type,Date:r.date,Created:new Date().toISOString()};try{const res=await at("create","Tasks",{records:[nt]},bid);setTasks(p=>[...(res.records||[]),...p]);await at("delete","Signal Archive",{recordIds:[r.id]},bid);setArchiveRecs(p=>(p||[]).filter(x=>x.id!==r.id));}catch(e){alert("Promote failed: "+e.message);}};
     const assign=async r=>{const who=prompt(`Route "${(r.name||r.signal||"").slice(0,48)}" to which person? (e.g. Jonathan, Chris — blank to unassign)`,r.assignedTo||"");if(who===null)return;const v=who.trim();try{await at("update","Tasks",{records:[{id:r.id,fields:{"Assigned To":v}}]},bid);setTasks(p=>p.map(t=>t.id===r.id?{...t,fields:{...t.fields,"Assigned To":v}}:t));}catch(e){alert("Assign failed: "+e.message);}};
     // Role-freshness verification — runs only on the lead-level LinkedIn signals
     // currently in view (Kunal: few signals go out, cheap to check). Isolated
@@ -3077,11 +3096,11 @@ Output format (strict JSON, no markdown):
     const groups=gk==="none"?null:Object.entries(scoped.reduce((m,r)=>{const k=groupOf(r);const g=m[k]||(m[k]={q:0,u:0,d:0,t:0});if(r.status==="qualified")g.q++;else if(r.status==="unqualified")g.u++;else if(r.status==="duplicate")g.d++;g.t++;return m;},{})).sort((a,b)=>b[1].t-a[1].t);
     const archiveAbsent=archiveRecs!==null&&archiveRecs.length===0;
     return(<div>
-      <div className="ph"><div><div className="pt">🔎 Signal Review</div><div className="pd">Everything the scan caught — qualified, disqualified, de-duplicated, role-checked, and routed — in one place. Clients never see this surface.</div></div>
+      <div className="ph"><div><div className="pt">🔎 Connector Review</div><div className="pd">Everything the connectors caught — qualified, disqualified, de-duplicated, role-checked, and routed — in one place. Clients never see this surface.</div></div>
       <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-        <button className="btn btn-s btn-p" onClick={verifyRoles} disabled={srVerifying} title="Check that lead-level LinkedIn signals in view are still in the role we think — flags 'no longer CMO' before an SDR engages">{srVerifying?"⏳ Verifying…":"🛡 Verify roles"}</button>
+        <button className="btn btn-s btn-p" onClick={verifyRoles} disabled={srVerifying} title="Check that lead-level LinkedIn results in view are still in the role we think — flags 'no longer CMO' before an SDR engages">{srVerifying?"⏳ Verifying…":"🛡 Verify roles"}</button>
         <button className="btn btn-s" onClick={loadSignalArchive} disabled={archiveLoading}>{archiveLoading?"⏳ Loading…":"↻ Refresh"}</button>
-        <button className="btn btn-s btn-d" onClick={purgeOldArchive} disabled={srPurging||!archiveRecs?.length} title={`Delete archived signals older than ${ARCHIVE_RETAIN_DAYS} days`}>{srPurging?"⏳":`🧹 Clear >${ARCHIVE_RETAIN_DAYS}d`}</button>
+        <button className="btn btn-s btn-d" onClick={purgeOldArchive} disabled={srPurging||!archiveRecs?.length} title={`Delete archived results older than ${ARCHIVE_RETAIN_DAYS} days`}>{srPurging?"⏳":`🧹 Clear >${ARCHIVE_RETAIN_DAYS}d`}</button>
       </div></div>
 
       {/* Cross-map summary — answers "what are we tracking, what came in" at a glance */}
@@ -3120,9 +3139,9 @@ Output format (strict JSON, no markdown):
           <td style={{color:"var(--t3)",fontFamily:"'JetBrains Mono',monospace"}}>{g.d||""}</td>
           <td style={{color:"var(--t1)",fontWeight:600,fontFamily:"'JetBrains Mono',monospace"}}>{g.t}</td>
         </tr>))}</tbody></table><div style={{fontSize:10,color:"var(--t3)",padding:"8px 4px"}}>{groups.length} group{groups.length===1?"":"s"} · click a row to drill in</div></div>):
-       rows.length===0?<div className="empty"><div className="em">🔎</div><p>{srAll.length===0?"No signals yet — run a scan from the Tasks tab.":"No signals match these filters."}</p>{archiveAbsent&&<div style={{fontSize:10,color:"var(--t3)",marginTop:8,maxWidth:440,textAlign:"center",lineHeight:1.5}}>Unqualified + duplicate retention turns on after the Signal Archive table is provisioned and the next scan runs. Qualified Tasks show here regardless.</div>}</div>:
+       rows.length===0?<div className="empty"><div className="em">🔎</div><p>{srAll.length===0?"Nothing caught yet — run a scan from the Tasks tab.":"Nothing matches these filters."}</p>{archiveAbsent&&<div style={{fontSize:10,color:"var(--t3)",marginTop:8,maxWidth:440,textAlign:"center",lineHeight:1.5}}>Unqualified + duplicate retention turns on after the archive table is provisioned and the next scan runs. Qualified Tasks show here regardless.</div>}</div>:
       <div className="tw"><table><thead><tr>
-        <th>Status</th><th>Company</th><th>Person / Rule</th><th>Role</th><th>Score</th><th>Type</th><th>Signal</th><th>Owner</th><th>Date</th><th>Link</th><th></th>
+        <th>Status</th><th>Company</th><th>Person / Connector</th><th>Role</th><th>Score</th><th>Type</th><th>Event</th><th>Owner</th><th>Date</th><th>Link</th><th></th>
       </tr></thead><tbody>{rows.slice(0,400).map((r,i)=>{const st=STA[r.status]||STA.unqualified;const rl=r.roleStatus&&ROLE[r.roleStatus];return(<tr key={r.id+i}>
         <td><span className="chip" style={{background:st.bg,color:st.fg}}>{st.lbl}</span></td>
         <td style={{color:"var(--t1)",fontWeight:500}}>{r.company}</td>
@@ -3131,7 +3150,7 @@ Output format (strict JSON, no markdown):
         <td><div className="sb" style={{width:68}} title={r.reason?`AI reason: ${r.reason}`:""}><div className="st"><div className="sf" style={{width:r.score+"%",background:r.score>=80?"var(--grn)":r.score>=60?"var(--amb)":"var(--red)"}}/></div><span className="sv" style={{color:r.score>=80?"var(--grn)":r.score>=60?"var(--amb)":"var(--red)"}}>{r.score}</span></div></td>
         <td><span className={"chip "+(r.type==="job_post"?"cb":r.type==="top_x"?"cp":"cg")}>{(r.type||"news").replace(/_/g," ").toUpperCase()}</span></td>
         <td style={{maxWidth:230,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={r.signal+(r.reason?"\n\n💡 "+r.reason:"")+(r.dupOf?"\n\n↔ Dup of: "+r.dupOf:"")+(r.roleNote?"\n\n🛡 "+r.roleNote:"")}>{r.signal}</td>
-        <td style={{whiteSpace:"nowrap"}}>{r.status==="qualified"?<button className="btn btn-s" style={{fontSize:9,padding:"3px 7px"}} title="Route this signal to a person" onClick={()=>assign(r)}>{r.assignedTo?`👤 ${r.assignedTo}`:"＋ assign"}</button>:r.assignedTo?<span style={{fontSize:9,color:"var(--t3)"}}>{r.assignedTo}</span>:"—"}</td>
+        <td style={{whiteSpace:"nowrap"}}>{r.status==="qualified"?<button className="btn btn-s" style={{fontSize:9,padding:"3px 7px"}} title="Route this to a person" onClick={()=>assign(r)}>{r.assignedTo?`👤 ${r.assignedTo}`:"＋ assign"}</button>:r.assignedTo?<span style={{fontSize:9,color:"var(--t3)"}}>{r.assignedTo}</span>:"—"}</td>
         <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10}}>{(r.date||r.created||"").slice(0,10)}</td>
         <td>{r.url?<a href={r.url} target="_blank" rel="noopener" style={{color:"var(--blu)",fontSize:10}}>↗</a>:"—"}</td>
         <td style={{whiteSpace:"nowrap"}}>{r.status==="unqualified"&&<button className="btn btn-s" style={{fontSize:9,padding:"3px 7px",color:"var(--grn)",borderColor:"rgba(93,168,122,.3)"}} title="Promote to a live Task" onClick={()=>promote(r)}>▲ Promote</button>}{r.status!=="qualified"&&<button className="btn btn-d btn-s" style={{marginLeft:4}} title="Delete from archive" onClick={()=>del("Signal Archive",[r.id],setArchiveRecs)}><I.Trash/></button>}</td>
@@ -8286,7 +8305,7 @@ function AddCampaignModal({ onSave, onClose }) {
         <div className="ig"><div className="il">Icon</div><div style={{ display: "flex", gap: 4 }}>{["📊","📡","🎯","🚀","💼","🔍","📈","⚡","🏢","🎪"].map(em => (
             <button key={em} style={{ fontSize: 18, padding: "4px 6px", background: emoji === em ? "var(--acc-d)" : "transparent", border: "1px solid " + (emoji === em ? "var(--acc)" : "var(--bdr)"), borderRadius: 6, cursor: "pointer" }} onClick={() => setEmoji(em)}>{em}</button>
           ))}</div></div>
-        <div className="ig"><div className="il">Starting Task Types (optional)</div><div style={{ fontSize: 10, color: "var(--t3)", marginBottom: 8 }}>Select which task types you plan to use first. This personalizes your Task Rules page with relevant guides. You can always add any task type later.</div>
+        <div className="ig"><div className="il">Starting Connectors (optional)</div><div style={{ fontSize: 10, color: "var(--t3)", marginBottom: 8 }}>Select which connectors you plan to use first. This personalizes your Connectors page with relevant guides. You can always add any connector later.</div>
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>{ALL_FEATURES.map(f => (
             <div key={f.id} onClick={() => toggleFeat(f.id)} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", border: "1px solid " + (feats.includes(f.id) ? "var(--acc)" : "var(--bdr)"), borderRadius: 8, background: feats.includes(f.id) ? "var(--acc-d)" : "var(--card)", cursor: "pointer", transition: "all .15s" }}>
               <span style={{ fontSize: 20 }}>{f.emoji}</span>
@@ -8374,14 +8393,14 @@ function RuleEditor({rule,onSave,onClose,availableFields,baseId}){
     }
   };
 
-  return(<div className="modal-o" onClick={e=>e.target===e.currentTarget&&onClose()}><div className="modal" style={{maxWidth:mode==="outreach"?700:mode==="top_x"?620:560}}><div className="modal-h"><span style={{fontWeight:600}}>{f.airtableId?"Edit Rule":"New Rule"}</span><button className="btn btn-s" onClick={onClose}>✕</button></div>
+  return(<div className="modal-o" onClick={e=>e.target===e.currentTarget&&onClose()}><div className="modal" style={{maxWidth:mode==="outreach"?700:mode==="top_x"?620:560}}><div className="modal-h"><span style={{fontWeight:600}}>{f.airtableId?"Configure Connector":"New Connector"}</span><button className="btn btn-s" onClick={onClose}>✕</button></div>
   <div className="modal-b">
 
-  {/* Task Type Picker */}
+  {/* Connector Type Picker */}
   <div className="ig">
-    <div className="il">Task Type</div>
+    <div className="il">Connector Type</div>
     <div style={{display:"flex",gap:6}}>
-      <button className={"btn btn-s"+(mode==="signal"?" btn-p":"")} onClick={()=>setMode("signal")} style={{flex:1,justifyContent:"center",fontSize:10}}>📰 Signal</button>
+      <button className={"btn btn-s"+(mode==="signal"?" btn-p":"")} onClick={()=>setMode("signal")} style={{flex:1,justifyContent:"center",fontSize:10}}>📰 News / Jobs</button>
       <button className={"btn btn-s"+(mode==="top_x"?" btn-p":"")} onClick={()=>setMode("top_x")} style={{flex:1,justifyContent:"center",fontSize:10}}>🎯 Top X</button>
       <button className={"btn btn-s"+(mode==="outreach"?" btn-p":"")} onClick={()=>setMode("outreach")} style={{flex:1,justifyContent:"center",fontSize:10}}>💬 Outreach</button>
     </div>
@@ -8391,13 +8410,14 @@ function RuleEditor({rule,onSave,onClose,availableFields,baseId}){
   <div className="ig"><div className="il">Name</div><input className="inp" value={f.name} onChange={e=>sF(p=>({...p,name:e.target.value}))} placeholder={mode==="outreach"?"e.g. Q1 LinkedIn outreach":mode==="top_x"?"e.g. Top 50 most engaged leads":"e.g. CMO / CGO opening"}/></div>
   <div className="ig"><div className="il">Description</div><textarea className="inp ta" value={f.description} onChange={e=>sF(p=>({...p,description:e.target.value}))} style={{minHeight:40}}/></div>
 
-  {/* ──── SIGNAL MODE ──── */}
+  {/* ──── NEWS / JOBS MODE ──── */}
   {mode==="signal"&&(<>
-  <div className="ig"><div className="il">Scan Target</div><div style={{display:"flex",gap:6}}>{[{v:"accounts",l:"🏢 Accounts"},{v:"leads",l:"👤 Leads"},{v:"both",l:"🏢👤 Both"}].map(o=>(<button key={o.v} className={"btn btn-s"+(f.scanTarget===o.v?" btn-p":"")} onClick={()=>sF(p=>({...p,scanTarget:o.v}))}>{o.l}</button>))}</div></div>
-  <div className="ig"><div className="il">Signal Sources</div><div style={{display:"flex",gap:6,flexWrap:"wrap"}}>{SRC_OPTS.map(s=>(<button key={s} className={"stag"+(f.sources.includes(s)?" sel":"")} onClick={()=>sF(p=>({...p,sources:p.sources.includes(s)?p.sources.filter(x=>x!==s):[...p.sources,s]}))}>{s}</button>))}</div></div>
-  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
-  <div className="ig"><div className="il">Ease</div><div style={{display:"flex",gap:6}}>{["Easy","Medium","Hard"].map(v=>(<button key={v} className={"btn btn-s"+(f.ease===v?" btn-p":"")} onClick={()=>sF(p=>({...p,ease:v}))}>{v}</button>))}</div></div>
-  <div className="ig"><div className="il">Strength</div><div style={{display:"flex",gap:6}}>{["Strong","Medium","Weak"].map(v=>(<button key={v} className={"btn btn-s"+(f.strength===v?" btn-p":"")} onClick={()=>sF(p=>({...p,strength:v}))}>{v}</button>))}</div></div></div>
+  {/* Scan Target — 4th "Agnostic / neither" option for events tied to no known
+      account or lead. Stored as a plain string on the Task Rule's "Scan Target"
+      field (singleLineText), so it never 422s. The scan still iterates accounts;
+      "agnostic" is purely a routing/label value carried through to the Task. */}
+  <div className="ig"><div className="il">Scan Target</div><div style={{display:"flex",gap:6,flexWrap:"wrap"}}>{[{v:"accounts",l:"🏢 Accounts"},{v:"leads",l:"👤 Leads"},{v:"both",l:"🏢👤 Both"},{v:"agnostic",l:"🌐 Agnostic / neither"}].map(o=>(<button key={o.v} className={"btn btn-s"+(f.scanTarget===o.v?" btn-p":"")} onClick={()=>sF(p=>({...p,scanTarget:o.v}))}>{o.l}</button>))}</div>{f.scanTarget==="agnostic"&&<div style={{fontSize:10,color:"var(--t3)",marginTop:6}}>Events not tied to a specific account or lead. The scan still runs across your accounts; tasks are tagged as agnostic.</div>}</div>
+  <div className="ig"><div className="il">Connector Sources</div><div style={{display:"flex",gap:6,flexWrap:"wrap"}}>{SRC_OPTS.map(s=>(<button key={s} className={"stag"+(f.sources.includes(s)?" sel":"")} onClick={()=>sF(p=>({...p,sources:p.sources.includes(s)?p.sources.filter(x=>x!==s):[...p.sources,s]}))}>{s}</button>))}</div></div>
   {f.sources.some(s=>["News","New Hires","Social","Exits / Promotions","Custom","Earnings","SEC Filings"].includes(s))&&<div className="ig"><div className="il">Keywords</div><div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:6}}>{f.keywords.map((k,i)=>(<span key={i} className="kt" onClick={()=>sF(p=>({...p,keywords:p.keywords.filter(x=>x!==k)}))}>{k} ×</span>))}</div>
   <div style={{display:"flex",gap:6}}><input className="inp" placeholder="Add keywords (comma separated)…" value={ki} onChange={e=>sKi(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&ki.trim()){e.preventDefault();const nk=ki.split(",").map(k=>k.trim()).filter(Boolean);sF(p=>({...p,keywords:[...p.keywords,...nk.filter(k=>!p.keywords.includes(k))]}));sKi("")}}} style={{flex:1}}/><button className="btn btn-s" onClick={()=>{if(ki.trim()){const nk=ki.split(",").map(k=>k.trim()).filter(Boolean);sF(p=>({...p,keywords:[...p.keywords,...nk.filter(k=>!p.keywords.includes(k))]}));sKi("")}}}><I.Plus/></button></div></div>}
   {f.sources.includes("Job Posts")&&<div className="ig"><div className="il">Job Title Keywords</div><div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:6}}>{f.jobTitleKeywords.map((k,i)=>(<span key={i} className="kt" style={{background:"var(--blu-d)",color:"var(--blu)"}} onClick={()=>sF(p=>({...p,jobTitleKeywords:p.jobTitleKeywords.filter(x=>x!==k)}))}>{k} ×</span>))}</div>
@@ -8414,6 +8434,15 @@ function RuleEditor({rule,onSave,onClose,availableFields,baseId}){
   </div>
   <textarea className="inp ta" value={f.scoringPrompt} onChange={e=>sF(p=>({...p,scoringPrompt:e.target.value}))} placeholder={"Rate this signal on how directly it [describes the event].\n\nAssign 90-100 if [exact match criteria with example].\nScore 70-89 if [strong but incomplete match].\nAssign 50-69 if [tangential mention].\nScore below 50 if [rejection criteria — be specific].\n\nFalse positives to reject: [list what does NOT count].\nExamples: \"[example A]\" scores 95, \"[example B]\" scores 40."} style={{minHeight:120,fontSize:11,background:"var(--card)"}}/>
   <button className="btn btn-ai btn-s" style={{marginTop:6}} disabled={aiL||!f.name} onClick={async()=>{sAiL(true);try{const res=await fetch("/api/classify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"generate_scoring_prompt",taskName:f.name,taskDescription:f.description,taskKeywords:f.keywords,taskJobTitleKeywords:f.jobTitleKeywords,taskSources:f.sources})});if(res.ok){const d=await res.json();if(d.scoringPrompt)sF(p=>({...p,scoringPrompt:d.scoringPrompt}))}}catch(e){console.error(e)}sAiL(false)}}>{aiL?"Generating…":<><I.Sparkle/> Auto-Generate</>}</button></div>
+
+  {/* Optional / non-essential config tucked into Settings so the main flow stays clean */}
+  <details style={{marginTop:14,border:"1px solid var(--bdr)",borderRadius:8,background:"var(--card)"}}>
+    <summary style={{cursor:"pointer",padding:"10px 14px",fontSize:11,fontWeight:600,color:"var(--t2)",userSelect:"none"}}>⚙️ Settings <span style={{fontWeight:400,color:"var(--t3)"}}>· Ease, Strength</span></summary>
+    <div style={{padding:"0 14px 14px",display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+      <div className="ig" style={{marginBottom:0}}><div className="il">Ease</div><div style={{display:"flex",gap:6}}>{["Easy","Medium","Hard"].map(v=>(<button key={v} className={"btn btn-s"+(f.ease===v?" btn-p":"")} onClick={()=>sF(p=>({...p,ease:v}))}>{v}</button>))}</div></div>
+      <div className="ig" style={{marginBottom:0}}><div className="il">Strength</div><div style={{display:"flex",gap:6}}>{["Strong","Medium","Weak"].map(v=>(<button key={v} className={"btn btn-s"+(f.strength===v?" btn-p":"")} onClick={()=>sF(p=>({...p,strength:v}))}>{v}</button>))}</div></div>
+    </div>
+  </details>
   </>)}
 
   {/* ──── TOP X MODE ──── */}
@@ -8677,7 +8706,7 @@ function RuleEditor({rule,onSave,onClose,availableFields,baseId}){
   </>)}
 
   </div>
-  <div className="modal-f"><button className="btn" onClick={onClose}>Cancel</button><button className="btn btn-p" disabled={!canSave} onClick={handleSave}><I.Check/> {f.airtableId?"Save":"Add Rule"}</button></div>
+  <div className="modal-f"><button className="btn" onClick={onClose}>Cancel</button><button className="btn btn-p" disabled={!canSave} onClick={handleSave}><I.Check/> {f.airtableId?"Save":"Add Connector"}</button></div>
   </div></div>);
 }
 
