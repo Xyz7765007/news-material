@@ -26,8 +26,11 @@ jobs:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
         run: |
           if [ -z "$CRON_SECRET" ]; then echo "::error::CRON_SECRET secret not set"; exit 1; fi
-          resp=$(curl -sS -X POST -m 350 \
-            "https://news-material-two.vercel.app/api/linkedin-posts?mode=resume&key=$CRON_SECRET" || echo '{"curl":"failed"}')
+          # Resume is a GET with key/base/campaign query params (the route's
+          # POST switch has NO resume mode — a POST "?mode=resume" bounces.
+          # That doc error cost a 6h silent stall on 2026-06-10).
+          resp=$(curl -sS -m 350 \
+            "https://news-material-two.vercel.app/api/linkedin-posts?key=$CRON_SECRET&base=appIaff6DEzgkpVJb&campaign=recnRZO0HTX8Pvksy" || echo '{"curl":"failed"}')
           echo "$resp" | head -c 2000
           case "$resp" in
             *'"curl":"failed"'*) echo "::warning::tick request failed";;
