@@ -1898,19 +1898,30 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const CONNECTOR_TYPE_META = {
     news:{e:"📰",l:"News"},job_post:{e:"📋",l:"Job Posts"},both:{e:"🛰️",l:"News + Jobs"},
     company_post:{e:"📣",l:"Company Posts"},top_x:{e:"🎯",l:"Top X"},linkedin_outreach:{e:"💬",l:"Outreach"},
+    // Scanner-driven connectors — produce tasks via a scanner/modal, not a Task Rule.
+    linkedin_engagement:{e:"📝",l:"LinkedIn Posts"},lead_movement:{e:"🔁",l:"Lead Movement"},
   };
   const connectorTypeMeta = (tt) => CONNECTOR_TYPE_META[tt] || {e:"⚙️",l:tt||"Other"};
+  // These connector types have no editable Task Rule — they're driven by a scanner
+  // (LinkedIn Posts page) or a modal (Lead Movement). They surface in the sidebar
+  // once they've produced tasks, with a per-type page that runs the scanner + lists results.
+  const SCANNER_TYPES = ["linkedin_engagement","lead_movement"];
   // Group configured rules by Task TYPE → one nav item per type present (NOT one
   // per rule — Material has 20 rules, that's the clutter). Clicking a type opens
   // a page with that type's rules + their combined tasks.
   const connectorNavItems = clientMode ? [] : (()=>{
-    const order = ["news","job_post","both","company_post","top_x","linkedin_outreach"];
-    const present = [...new Set(rules.map(r=>(r.fields||{})["Task Type"]||"news"))];
+    const order = ["news","job_post","both","company_post","top_x","linkedin_outreach","linkedin_engagement","lead_movement"];
+    const ruleTypes = rules.map(r=>(r.fields||{})["Task Type"]||"news");
+    // scanner connectors appear once they've produced ≥1 task of that type
+    const scannerPresent = SCANNER_TYPES.filter(st=>tasks.some(t=>(t.fields||{})["Task Type"]===st));
+    const present = [...new Set([...ruleTypes, ...scannerPresent])];
     present.sort((a,b)=>{const ia=order.indexOf(a),ib=order.indexOf(b);return (ia<0?99:ia)-(ib<0?99:ib);});
     return present.map(tt=>{
       const m=connectorTypeMeta(tt);
-      const ruleNames=new Set(rules.filter(r=>((r.fields||{})["Task Type"]||"news")===tt).map(r=>(r.fields||{}).Name));
-      return {connectorType:tt,label:`${m.e} ${m.l}`,count:tasks.filter(t=>ruleNames.has((t.fields||{})["Task Rule"])).length};
+      let count;
+      if(SCANNER_TYPES.includes(tt)) count=tasks.filter(t=>(t.fields||{})["Task Type"]===tt).length;
+      else { const ruleNames=new Set(rules.filter(r=>((r.fields||{})["Task Type"]||"news")===tt).map(r=>(r.fields||{}).Name)); count=tasks.filter(t=>ruleNames.has((t.fields||{})["Task Rule"])).length; }
+      return {connectorType:tt,label:`${m.e} ${m.l}`,count};
     });
   })();
   const navSections = [
@@ -1930,7 +1941,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     // All delivery channels + connected systems live in ONE place now (was split
     // between the Connectors page and the sidebar — that split was the confusion).
     {title:"INTEGRATIONS", items:[
-      {id:"linkedin_posts",label:"📝 LinkedIn Posts",count:null},
+      {id:"linkedin_posts",label:"📝 LinkedIn Posts Scanner",count:null},
       {id:"outreach",label:"💬 LinkedIn Automation",count:null},
       {id:"email_campaign",label:"📧 Email Campaign",count:null},
       {id:"hubspot",label:"🔗 HubSpot",count:null},
@@ -2945,12 +2956,15 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       combined tasks with date/score/search filters. Same layout for every type. */}
   {tab==="connector_detail"&&!loading&&!clientMode&&(()=>{
     const tt = selectedConnectorType;
-    const BLURB = {news:"Monitors Google News for company-level events at your accounts.",job_post:"Tracks LinkedIn job postings that point to buying intent.",both:"News and job-post events from one connector.",company_post:"Watches each account's own LinkedIn company-page posts.",top_x:"Ranks your leads or accounts by weighted + AI scoring.",linkedin_outreach:"Automated LinkedIn connection + DM sequences."};
+    const BLURB = {news:"Monitors Google News for company-level events at your accounts.",job_post:"Tracks LinkedIn job postings that point to buying intent.",both:"News and job-post events from one connector.",company_post:"Watches each account's own LinkedIn company-page posts.",top_x:"Ranks your leads or accounts by weighted + AI scoring.",linkedin_outreach:"Automated LinkedIn connection + DM sequences.",linkedin_engagement:"Scores each lead's recent LinkedIn posts for engagement-worthiness.",lead_movement:"Detects hires, promotions and exits across your leads."};
     const m = connectorTypeMeta(tt);
     const blurb = BLURB[tt]||"Custom connector.";
+    const isScanner = SCANNER_TYPES.includes(tt);
     const typeRules = rules.filter(r=>((r.fields||{})["Task Type"]||"news")===tt);
-    if(!typeRules.length) return (<div className="empty" style={{padding:48}}><div className="em">{m.e}</div><p style={{marginBottom:16}}>No {m.l} connectors configured.</p><button className="btn btn-p" onClick={()=>{setTab("rules");setShowConnectorPicker(true)}}><I.Plus/> Add a connector</button></div>);
+    if(!isScanner && !typeRules.length) return (<div className="empty" style={{padding:48}}><div className="em">{m.e}</div><p style={{marginBottom:16}}>No {m.l} connectors configured.</p><button className="btn btn-p" onClick={()=>{setTab("rules");setShowConnectorPicker(true)}}><I.Plus/> Add a connector</button></div>);
     const ruleNames = new Set(typeRules.map(r=>(r.fields||{}).Name));
+    // Scanner connectors run a scanner page (LinkedIn Posts) or a modal (Lead Movement)
+    const openScanner = ()=>{ if(tt==="linkedin_engagement") setTab("linkedin_posts"); else if(tt==="lead_movement") setShowLeadMovementModal(true); };
     const openConfigure = (r)=>{
       const f=r.fields||{}; const dest=f["Delivery Destination"]||"Sidekick app"; const freq=f["Delivery Frequency"]||"Real-time";
       if(tt==="top_x"){
@@ -2960,26 +2974,37 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       } else if(tt==="linkedin_outreach"){ setTab("outreach"); }
       else { setEditRule({airtableId:r.id,name:f.Name,description:f.Description,taskType:tt,scanTarget:f["Scan Target"]||"accounts",ease:f.Ease,strength:f.Strength,sources:(f.Sources||"").split(",").map(s=>s.trim()).filter(Boolean),keywords:(f.Keywords||"").split(",").map(k=>k.trim()).filter(Boolean),jobTitleKeywords:(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()).filter(Boolean),scoringPrompt:f["Scoring Prompt"]||"",deliveryDestination:dest,deliveryFrequency:freq}); }
     };
-    const scanAll = ()=>{ if(tt==="job_post")startScan("jobs"); else if(tt==="company_post")startScan("company_posts"); else if(tt==="news"||tt==="both")startScan("news"); };
-    const scannable = ["news","both","job_post","company_post"].includes(tt);
+    const scanAll = ()=>{ if(isScanner){openScanner();return;} if(tt==="job_post")startScan("jobs"); else if(tt==="company_post")startScan("company_posts"); else if(tt==="news"||tt==="both")startScan("news"); };
+    const scannable = isScanner || ["news","both","job_post","company_post"].includes(tt);
     const cf = connDetailFilter;
-    const myTasks = tasks.filter(t=>{const tf=t.fields||{};if(!ruleNames.has(tf["Task Rule"]))return false;if(cf.q&&!(tf.Company||"").toLowerCase().includes(cf.q.toLowerCase())&&!(tf.Name||"").toLowerCase().includes(cf.q.toLowerCase()))return false;if(cf.minScore&&(tf.Score||0)<cf.minScore)return false;if(cf.from&&(tf.Date||"")<cf.from)return false;if(cf.to&&(tf.Date||"")>cf.to)return false;return true}).sort((a,b)=>((b.fields||{}).Score||0)-((a.fields||{}).Score||0));
+    const myTasks = tasks.filter(t=>{const tf=t.fields||{};const match=isScanner?((tf["Task Type"]||"")===tt):ruleNames.has(tf["Task Rule"]);if(!match)return false;if(cf.q&&!(tf.Company||"").toLowerCase().includes(cf.q.toLowerCase())&&!(tf.Name||"").toLowerCase().includes(cf.q.toLowerCase()))return false;if(cf.minScore&&(tf.Score||0)<cf.minScore)return false;if(cf.from&&(tf.Date||"")<cf.from)return false;if(cf.to&&(tf.Date||"")>cf.to)return false;return true}).sort((a,b)=>((b.fields||{}).Score||0)-((a.fields||{}).Score||0));
     return (<div>
       <div className="ph"><div><div className="pt"><span style={{cursor:"pointer",color:"var(--t3)",marginRight:8}} onClick={()=>setTab("rules")} title="All connectors">←</span>{m.e} {m.l}</div><div className="pd">{blurb}</div></div>
         <div style={{display:"flex",gap:6}}>
-          {scannable&&<button className="btn btn-s btn-p" onClick={scanAll} disabled={scanning||!accounts.length}>{scanning?"Running…":"▶ Run scan"}</button>}
-          <button className="btn btn-s" onClick={()=>{setTab("rules");setShowConnectorPicker(true)}}><I.Plus/> Add</button>
+          {scannable&&<button className="btn btn-s btn-p" onClick={scanAll} disabled={isScanner?false:(scanning||!accounts.length)}>{isScanner?(tt==="lead_movement"?"▶ Run movement scan":"📝 Open scanner"):(scanning?"Running…":"▶ Run scan")}</button>}
+          {!isScanner&&<button className="btn btn-s" onClick={()=>{setTab("rules");setShowConnectorPicker(true)}}><I.Plus/> Add</button>}
         </div>
       </div>
       <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:14}}>
         <span className="chip cg">{m.l.toLowerCase()}</span>
-        <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>{typeRules.length} connector{typeRules.length===1?"":"s"}</span>
+        {isScanner
+          ? <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>scanner-driven</span>
+          : <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>{typeRules.length} connector{typeRules.length===1?"":"s"}</span>}
         <span className="chip" style={{background:"var(--hover)",color:"var(--t2)",cursor:"pointer"}} onClick={()=>setTab("threshold")}>scoring threshold: {threshold}</span>
         <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>{myTasks.length} tasks</span>
       </div>
 
-      {/* This type's connectors */}
-      <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:20}}>{typeRules.map(r=>{const f=r.fields||{};const dest=f["Delivery Destination"]||"Sidekick app";const freq=f["Delivery Frequency"]||"Real-time";const tc=tasks.filter(t=>(t.fields||{})["Task Rule"]===f.Name).length;return(
+      {/* Scanner connectors have no editable rule — show a run/info card instead */}
+      {isScanner
+        ? <div style={{padding:"14px 16px",border:"1px solid var(--bdr)",borderRadius:8,background:"var(--card)",marginBottom:20,display:"flex",alignItems:"center",gap:12}}>
+            <span style={{fontSize:22}}>{m.e}</span>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>{tt==="lead_movement"?"Lead Movement scan":"LinkedIn Posts scanner"}</div>
+              <div style={{fontSize:11,color:"var(--t3)"}}>{tt==="lead_movement"?"Detects hires, promotions and exits across your leads. No rule to configure — just run it.":"Scores each lead's recent LinkedIn posts for engagement-worthiness. No rule to configure — run it from the scanner."}</div>
+            </div>
+            <button className="btn btn-s btn-p" style={{flexShrink:0}} onClick={scanAll}>{tt==="lead_movement"?"▶ Run movement scan":"📝 Open scanner"}</button>
+          </div>
+        : <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:20}}>{typeRules.map(r=>{const f=r.fields||{};const dest=f["Delivery Destination"]||"Sidekick app";const freq=f["Delivery Frequency"]||"Real-time";const tc=tasks.filter(t=>(t.fields||{})["Task Rule"]===f.Name).length;return(
         <div key={r.id} style={{padding:"12px 14px",border:"1px solid var(--bdr)",borderRadius:8,background:"var(--card)"}}>
           <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:f.Description?6:0}}>
             <span style={{fontSize:14,fontWeight:600,color:"var(--t1)",flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{f.Name}</span>
@@ -2992,11 +3017,11 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
             <button className="btn btn-d btn-s" onClick={()=>del("Task Rules",[r.id],setRules)}><I.Trash/></button>
           </div>
           {f.Description&&<div style={{fontSize:11,color:"var(--t3)"}}>{f.Description}</div>}
-        </div>);})}</div>
+        </div>);})}</div>}
 
       {/* This type's tasks — capped preview (rendering 600+ cards made the page
           50k px tall). Filters narrow in place; full list lives in Tasks. */}
-      {(()=>{ const TASK_PREVIEW=60; const srcFor={news:"news",both:"all",job_post:"job_post",company_post:"company_post",top_x:"top_x",linkedin_outreach:"all"}[tt]||"all";
+      {(()=>{ const TASK_PREVIEW=60; const srcFor={news:"news",both:"all",job_post:"job_post",company_post:"company_post",top_x:"top_x",linkedin_outreach:"all",linkedin_engagement:"linkedin_engagement",lead_movement:"lead_movement"}[tt]||"all";
         return (<>
       <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
         <span style={{fontSize:12,fontWeight:600,color:"var(--t2)"}}>Tasks from {m.l}</span>
