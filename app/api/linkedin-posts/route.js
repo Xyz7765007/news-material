@@ -813,7 +813,9 @@ async function scorePost({ post, lead, campaignContext, systemPromptOverride, ca
 
   try {
     const c = await openai.chat.completions.create({
-      model: "gpt-5.4-mini",
+      // Upgraded from gpt-5.4-mini 2026-06-10 (Samarth): full gpt-5.4 for
+      // post engagement scoring — fewer mis-bucketed/fluff-scored posts.
+      model: "gpt-5.4",
       temperature: 0.1, // very low — we want consistency, not creativity
       max_completion_tokens: 500,
       response_format: { type: "json_object" },

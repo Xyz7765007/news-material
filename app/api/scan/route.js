@@ -542,9 +542,21 @@ async function scanNews(company, taskDefs, threshold = 50, campaignId = null) {
   // on Google and contributed to 429 rate-limiting cascades.
   const DECODE_CONCURRENCY = 4;
   const DECODE_LIMIT = 50;
+  // Time budget: with adaptive pacing in the decoder, a throttled run can slow
+  // to ~2s/call. 50 URLs × 2 calls at that rate would eat the whole 300s POST
+  // budget. Past the budget we stop decoding — undecoded articles still get
+  // scored on headline + excerpt (never dropped), just without a body.
+  const DECODE_TIME_BUDGET_MS = 75 * 1000;
+  const decodeStartedAt = Date.now();
   const toDecode = dedupedRecent.slice(0, DECODE_LIMIT);
-  let decodeStats = { attempted: 0, decoded: 0, failed: 0 };
+  let decodeStats = { attempted: 0, decoded: 0, failed: 0, budgetSkipped: 0 };
   for (let i = 0; i < toDecode.length; i += DECODE_CONCURRENCY) {
+    if (Date.now() - decodeStartedAt > DECODE_TIME_BUDGET_MS) {
+      decodeStats.budgetSkipped = toDecode.slice(i).filter(it =>
+        (it.url || "").includes("news.google.com/rss/articles/")).length;
+      console.log(`  [NEWS] ${cleanName}: decode time budget exhausted — ${decodeStats.budgetSkipped} URLs left undecoded (will score headline-only)`);
+      break;
+    }
     const batch = toDecode.slice(i, i + DECODE_CONCURRENCY);
     await Promise.all(batch.map(async item => {
       if (!item.url || !item.url.includes("news.google.com/rss/articles/")) return;
@@ -575,10 +587,15 @@ async function scanNews(company, taskDefs, threshold = 50, campaignId = null) {
     }
   }
 
-  // Slice to 50. With 3-attempt fetcher (worst case ~26s per article) and
-  // concurrency 8, 50 articles take ~7 batches × ~10-15s wall = 70-100s typical,
-  // up to ~180s worst case during a publisher outage. Leaves room for the
-  // second-pass retry and classify within the 300s POST budget.
+  // Slice to 50 for BODY FETCH ONLY. With 3-attempt fetcher (worst case ~26s
+  // per article) and concurrency 8, 50 articles take ~7 batches × ~10-15s wall
+  // = 70-100s typical, up to ~180s worst case during a publisher outage. Leaves
+  // room for the second-pass retry and classify within the 300s POST budget.
+  //
+  // Articles 51+ are NOT dropped anymore — they're scored on headline + excerpt
+  // below (see `overflow`). The old behavior silently discarded them, which lost
+  // real signals during high-news weeks (measured 2026-06-10: 16 multi-source
+  // events incl. Salesforce×FIFA died here fleet-wide in one week).
   const recentSlice = dedupedRecent.slice(0, 50);
   const stats = { total: recentSlice.length, succeeded: 0, errors: {}, secondPassRecovered: 0 };
   const enriched = [];
@@ -636,8 +653,28 @@ async function scanNews(company, taskDefs, threshold = 50, campaignId = null) {
     console.warn(`  [NEWS] ${cleanName}: ⚠ LOW FETCH SUCCESS RATE (${successRate}%). Some signals will be scored on headline alone — accuracy may be lower than usual.`);
   }
 
-  const classified = await classify(enriched, taskDefs, cleanName, "news", threshold, campaignId);
-  return { signals: classified, fetchStats: { succeeded: stats.succeeded, total: stats.total, successRate, errors: stats.errors, secondPassRecovered: stats.secondPassRecovered } };
+  // Overflow: everything past the body-fetch slice still gets scored, on
+  // headline + RSS excerpt only. The formatSignalForAI marker tells the AI
+  // not to penalize the missing body. Token cost ≈ one extra classify chunk;
+  // zero extra wall-clock (no fetches).
+  const overflow = dedupedRecent.slice(50).map(n => ({
+    ...n, taskType: "news", articleContent: "", fetchError: "overflow_headline_only",
+  }));
+  if (overflow.length > 0) {
+    console.log(`  [NEWS] ${cleanName}: scoring ${overflow.length} overflow articles (51+) on headline+excerpt`);
+  }
+
+  const classified = await classify(enriched.concat(overflow), taskDefs, cleanName, "news", threshold, campaignId);
+  return { signals: classified, fetchStats: {
+    succeeded: stats.succeeded, total: stats.total, successRate,
+    errors: stats.errors, secondPassRecovered: stats.secondPassRecovered,
+    // Funnel visibility — every stage observable so slippage audits are trivial.
+    funnel: {
+      feed: items.length, recent: recent.length, deduped: dedupedRecent.length,
+      bodyFetched: stats.succeeded, overflowScoredHeadlineOnly: overflow.length,
+      decode: decodeStats, guards: classified.guardStats || null,
+    },
+  } };
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -856,7 +893,11 @@ function formatSignalForAI(sig, idx, mode) {
       // Explicit marker so the AI doesn't silently penalize this signal for thin context.
       // Without this marker, the AI sees "headline + excerpt only" and tends to score
       // conservatively (~50-60), even when the headline is a strong match.
-      lines.push(`  [Article body unavailable — fetch error: ${sig.fetchError}. Score based on headline + excerpt only; do not penalize for missing body.]`);
+      // BUT the marker must not invite benefit-of-the-doubt either: audited 2026-06-10,
+      // headline-only earnings recaps were scoring 80-95 because "do not penalize"
+      // read as "assume the body would qualify". The criteria must be visible in the
+      // headline + excerpt themselves.
+      lines.push(`  [Article body unavailable — fetch error: ${sig.fetchError}. Score on headline + excerpt only: do not penalize a headline that clearly meets the criteria, but do NOT assume the missing body would qualify — if the headline + excerpt alone don't establish the criteria, score low.]`);
     }
   }
   return lines.join("\n");
@@ -972,6 +1013,8 @@ Score each signal 0-100 using these descriptive bands as a calibration guide:
 
 The user has set a threshold of ${threshold}. Return ONLY signals scoring ${threshold} or higher. Drop everything below ${threshold}.
 
+STAY IN YOUR LANE: you are scoring for THIS task only. If a signal's PRIMARY event clearly belongs to a different signal category (e.g. a leadership hire when this task is about earnings narratives, or a regulatory story when this task is about agency changes), score it below 30 — the task that owns that category will catch it. Do not stretch this task's criteria to claim adjacent events.
+
 Output format (strict JSON, no markdown):
 {
   "matches": [
@@ -993,7 +1036,9 @@ ${userPrompt ? `# User's scoring criteria:\n${userPrompt}\n` : "# User has not p
 
 ${signalBlock}`;
       const c = await getOpenAI().chat.completions.create({
-        model: "gpt-5.4-mini",
+        // Upgraded from gpt-5.4-mini 2026-06-10 (Samarth): mini was missing /
+        // under-scoring real signals; full gpt-5.4 for news + jobs scoring.
+        model: "gpt-5.4",
         // Temperature 0 = deterministic. Was 0.15 which caused 5-10 point score
         // variance run-to-run — the difference between "above threshold" and
         // "dropped" for borderline signals. User reported 1 vs 37 signals across
@@ -1139,6 +1184,108 @@ ${signalBlock}`;
       console.log(`  [TASK] "${task.name}" → ${matchCount} matches at threshold ${threshold}+ (distribution: ${scoreBuckets.zero} zero, ${scoreBuckets.low} <30, ${scoreBuckets.nearMiss} 30-${threshold-1}, ${scoreBuckets.atOrAbove} ≥${threshold})`);
     }
   }
+
+  // ─── POST-SCORING GUARDS (slip-proofing pass, 2026-06-10) ──────────
+  // Measured on a full-fleet audit: 1,327 articles matched at threshold 70 but
+  // only ~1% were genuine own-brand marketing actions — finance noise (earnings
+  // recaps, analyst ratings, board appointments) was scoring 80-95, the same
+  // event was matching up to 3 rules at once, and 8 sibling articles of one
+  // event each became a separate match. These guards are deterministic,
+  // model-independent backstops. Nothing is silently lost: hedge-capped
+  // matches land in the retain band (visible in Signal Review), arbitrated /
+  // event-deduped articles still surface via their best rule / best article.
+  const guardStats = { hedgeDemoted: 0, ruleArbitrated: 0, eventDeduped: 0 };
+
+  // Guard 1 — hedge cap (news only): a match whose headline + score reason are
+  // pure finance/governance noise with NO marketing-action language gets demoted
+  // to the retain band instead of becoming a Task.
+  const FINANCE_NOISE_RE = /(earnings (call|report|transcript|release|beat|miss|season|recap)|q[1-4]\s?(20\d\d|results|earnings|revenue|sales)|price target|analyst (rating|call|note|upgrade|downgrade)|stock (split|price|surge|fall|jump|drop)|shares? (fall|rise|jump|slide|surge|drop|tumbl)|dividend|valuation|52-week|market cap|beats? (estimates|expectations)|joins? .{0,40}board|board of directors|board (appointment|member|seat)|elects? .{0,40}board|appoint\w* .{0,40}board|governance)/i;
+  // NOTE: bare "agency" deliberately NOT in this list — the AI mislabels board/
+  // governance stories as "agency oversight" (audited: 8× 3M board appointments
+  // scored 95 under "Agency review or consolidation"). Only ad/creative/media
+  // agency contexts count as marketing actions.
+  const MARKETING_ACTION_RE = /(marketing|brand|campaign|cmo|cgo|chief (growth|marketing|brand|creative)|advertis|(ad|creative|media)\s+agency|agency (review|consolidat|account|appoint)|creative|rebrand|sponsor|media account|loyalty program)/i;
+  if (mode === "news") {
+    for (const r of results) {
+      for (const taskId of [...r.matchedTaskIds]) {
+        const blob = `${r.headline || ""} ${r.scoreReasons[taskId] || ""}`;
+        if (FINANCE_NOISE_RE.test(blob) && !MARKETING_ACTION_RE.test(blob)) {
+          r.subThresholdTaskIds.push(taskId);
+          r.subThresholdScores[taskId] = Math.max(SIGNAL_RETAIN_FLOOR, threshold - 1);
+          r.subThresholdReasons[taskId] = `[auto-demoted: finance/governance noise, no marketing action] ${r.scoreReasons[taskId] || ""}`.slice(0, 200);
+          r.matchedTaskIds = r.matchedTaskIds.filter(id => id !== taskId);
+          delete r.relevanceScores[taskId];
+          delete r.scoreReasons[taskId];
+          guardStats.hedgeDemoted++;
+        }
+      }
+    }
+  }
+
+  // Guard 2 — single-rule arbitration: one article = one event = ONE rule.
+  // When several rules claim the same article, the highest score wins (broad
+  // rules like "Earnings Season" were swallowing events that belong to
+  // specific rules — and each extra rule minted a duplicate Task).
+  for (const r of results) {
+    if (r.matchedTaskIds.length > 1) {
+      const best = r.matchedTaskIds.reduce((a, b) =>
+        (r.relevanceScores[b] || 0) > (r.relevanceScores[a] || 0) ? b : a);
+      for (const taskId of r.matchedTaskIds) {
+        if (taskId === best) continue;
+        delete r.relevanceScores[taskId];
+        delete r.scoreReasons[taskId];
+        guardStats.ruleArbitrated++;
+      }
+      r.matchedTaskIds = [best];
+    }
+  }
+
+  // Guard 3 — in-run event dedup (news only): sibling articles covering the
+  // same event under the same rule collapse to the single best-scoring one.
+  // (One 3M board appointment produced 8 matched articles in the audit.)
+  if (mode === "news") {
+    const wordsOf = h => new Set(
+      (h || "").toLowerCase()
+        .replace(/\s*[-–—|·•]\s*[^-–—|·•]+$/, "")
+        .replace(/[^\w\s]/g, " ")
+        .split(/\s+/).filter(w => w.length > 2)
+    );
+    const jaccard = (a, b) => {
+      if (!a.size || !b.size) return 0;
+      let inter = 0;
+      for (const w of a) if (b.has(w)) inter++;
+      return inter / (a.size + b.size - inter);
+    };
+    const byRule = new Map();
+    results.forEach((r, i) => {
+      const taskId = r.matchedTaskIds[0];
+      if (!taskId) return;
+      if (!byRule.has(taskId)) byRule.set(taskId, []);
+      byRule.get(taskId).push({ i, w: wordsOf(r.headline), score: r.relevanceScores[taskId] || 0 });
+    });
+    for (const [taskId, entries] of byRule) {
+      entries.sort((a, b) => b.score - a.score); // keep highest-scoring representative
+      const kept = [];
+      for (const e of entries) {
+        if (kept.some(k => jaccard(k.w, e.w) >= 0.6)) {
+          const r = results[e.i];
+          r.matchedTaskIds = [];
+          delete r.relevanceScores[taskId];
+          delete r.scoreReasons[taskId];
+          guardStats.eventDeduped++;
+        } else {
+          kept.push(e);
+        }
+      }
+    }
+  }
+
+  if (guardStats.hedgeDemoted || guardStats.ruleArbitrated || guardStats.eventDeduped) {
+    console.log(`  [GUARDS] ${companyName}: ${guardStats.hedgeDemoted} finance-noise matches demoted to retain band, ${guardStats.ruleArbitrated} multi-rule claims arbitrated, ${guardStats.eventDeduped} sibling articles event-deduped`);
+  }
+  // Non-enumerable-style side channel: arrays serialize without custom props,
+  // so this never leaks into API JSON; scanNews copies it into fetchStats.
+  results.guardStats = guardStats;
 
   // Log summary with diagnostic info
   const matched = results.filter(s => s.matchedTaskIds.length > 0);
