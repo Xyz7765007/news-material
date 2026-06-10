@@ -114,7 +114,9 @@ while time.time() < deadline:
             break
         if CRON_SECRET:
             try:
-                post(f"{LI}?mode=resume&key={CRON_SECRET}", {}, 290)
+                # Resume is a GET with key/base/campaign — the POST switch has
+                # no resume mode (doc error caused a 6h stall on 2026-06-10).
+                get(f"{LI}?key={CRON_SECRET}&base={BASE}&campaign={CAMP}", 320)
             except Exception as e:
                 log(f"resume tick error: {str(e)[:100]}")
     except Exception as e:
