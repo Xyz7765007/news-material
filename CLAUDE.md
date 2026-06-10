@@ -85,11 +85,35 @@ Active features expand dynamically based on actual Task Rules in the campaign's 
 
 **Client portal:** `/client/[campaignId]` mounts `SignalScope.jsx` with `clientMode={true}` + `fixedCampaignId={id}`. Read-only, separate per-campaign password.
 
-## 5. UI tabs (verified from operator screenshot May 29 2026)
+## 5. UI tabs — connector-first sidebar (revamped 2026-06-10)
 
-In sidebar order: Dashboard, Accounts, Leads, Task Rules, Prompts, Scoring, Tasks, LinkedIn Automation, LinkedIn Posts, Triggers, Email Campaign, Google Analytics, HubSpot, Post-Demo Auto, Coming Soon.
+The sidebar is **named, grouped sections** (no longer a flat tab list). Order:
 
-Sidebar also shows the campaign's Airtable base ID and a "Change" button (campaign switcher). `Test` / `Setup` buttons at the bottom hit setup-diagnostic / setup-fix endpoints.
+- **(top)** Dashboard
+- **DATA** — Accounts, Leads
+- **CONNECTORS** *(+ button → connector picker)* — one item per connector **TYPE**
+  present (`📰 News`, `📋 Job Posts`, `📣 Company Posts`, `🎯 Top X`, `💬 Outreach`),
+  plus scanner connectors once they have tasks (`📝 LinkedIn Posts`, `🔁 Lead
+  Movement`), then `⚙️ All connectors`. Clicking a type opens a uniform per-type
+  page (`tab==="connector_detail"`, keyed on `selectedConnectorType`): that type's
+  rules (Configure/Run/Dup/Delete) + their combined tasks with date/score/search
+  filters, capped to a 60-task preview with a "View all in Tasks" jump.
+- **TASKS** — Tasks, 🔎 Signal Review
+- **INTEGRATIONS** — LinkedIn Posts Scanner, LinkedIn Automation, Email Campaign,
+  HubSpot, Google Analytics, Post-Demo Auto
+- **SETTINGS** — Prompts, Scoring threshold, Coming Soon
+
+Mental model = Kunal's **Connectors → Tasks → Actions** (Jun-8 call). Connectors
+are grouped by TYPE, never per individual rule (Material has 20 rules → that was
+the clutter). Scanner-driven types (`linkedin_engagement`, `lead_movement`) have no
+Task Rule; their per-type page shows a run/info card instead of rule cards. The
+word `signal` was dropped from labels per Kunal, but **Signal Review keeps its
+name** (Samarth's call). All admin-only items are filtered out in `clientMode`;
+the client portal still shows only Dashboard / Accounts / Leads / Tasks.
+
+Sidebar also shows the campaign's Airtable base ID and a "Change" button (campaign
+switcher). `Test` / `Setup` buttons at the bottom hit setup-diagnostic / setup-fix.
+See `.learnings/2026-06-10-connector-first-revamp.md` for the full revamp record.
 
 ## 6. API routes (all 50, grouped)
 
