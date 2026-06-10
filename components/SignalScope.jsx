@@ -138,6 +138,8 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const taskSeenRef = useRef(new Set()); // tracks task fingerprints during scan to prevent dupes
   const [editRule, setEditRule] = useState(null); // unified rule editor — signal or top_x
   const [showConnectorPicker, setShowConnectorPicker] = useState(false); // connector-type picker on the Connectors home
+  const [selectedConnectorType, setSelectedConnectorType] = useState(null); // per-TYPE connector page (uniform interface, Kunal Jun-8). Groups all rules of a type.
+  const [connDetailFilter, setConnDetailFilter] = useState({q:"",from:"",to:"",minScore:0}); // local filters for the connector detail task list
   const [filter, setFilter] = useState({src:"all",target:"all",connector:"all",q:"",from:"",to:"",datePreset:"all"});
   const [csvModal, setCsvModal] = useState(null);
   const [csvUploadResult, setCsvUploadResult] = useState(null); // { msg, isError } — shows for ~8s after upload
@@ -1887,33 +1889,80 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     // duplicate, cross-mapped) — operators only, never the client portal.
     "signal_review",
   ]);
-  const navs = [
-    {id:"dashboard",label:"📊 Dashboard",count:null},
-    null,
-    {id:"accounts",label:"Accounts",count:accounts.length},
-    {id:"leads",label:"Leads",count:leads.length},
-    null,
-    {id:"rules",label:"Connectors",count:rules.length},
-    {id:"prompts",label:"Prompts",count:rules.length},
-    {id:"threshold",label:"Scoring",count:null},
-    null,
-    {id:"tasks",label:"Tasks",count:tasks.length},
-    {id:"signal_review",label:"🔎 Connector Review",count:null},
-    null,
-    // outreach / linkedin_posts / email_campaign / hubspot folded into the
-    // Connectors page as "Channels & integrations" instances (Kunal #11-full,
-    // 2026-06-09). Their tab===... panels + setTab(...) deep-links still work.
-    {id:"google_analytics",label:"📊 Google Analytics",count:null},
-    {id:"post_demo",label:"🤖 Post-Demo Auto",count:null},
-    ...(!clientMode ? [{id:"coming_soon",label:"🚀 Coming Soon",count:null}] : []),
-  ].filter(n => n === null || !clientMode || !ADMIN_ONLY_TABS.has(n.id));
+  // ─── Named, grouped sidebar (Kunal Jun-8 revamp) ──────────────────
+  // Each section has a title; the CONNECTORS section carries a + (opens the
+  // connector picker) and lists every configured connector as its own nav
+  // item that opens a uniform per-connector page (settings + that connector's
+  // tasks). Replaces the old bare-line dividers. Connectors-as-nav-items and
+  // the + are admin-only — the client portal keeps the flat results view.
+  const CONNECTOR_TYPE_META = {
+    news:{e:"📰",l:"News"},job_post:{e:"📋",l:"Job Posts"},both:{e:"🛰️",l:"News + Jobs"},
+    company_post:{e:"📣",l:"Company Posts"},top_x:{e:"🎯",l:"Top X"},linkedin_outreach:{e:"💬",l:"Outreach"},
+  };
+  const connectorTypeMeta = (tt) => CONNECTOR_TYPE_META[tt] || {e:"⚙️",l:tt||"Other"};
+  // Group configured rules by Task TYPE → one nav item per type present (NOT one
+  // per rule — Material has 20 rules, that's the clutter). Clicking a type opens
+  // a page with that type's rules + their combined tasks.
+  const connectorNavItems = clientMode ? [] : (()=>{
+    const order = ["news","job_post","both","company_post","top_x","linkedin_outreach"];
+    const present = [...new Set(rules.map(r=>(r.fields||{})["Task Type"]||"news"))];
+    present.sort((a,b)=>{const ia=order.indexOf(a),ib=order.indexOf(b);return (ia<0?99:ia)-(ib<0?99:ib);});
+    return present.map(tt=>{
+      const m=connectorTypeMeta(tt);
+      const ruleNames=new Set(rules.filter(r=>((r.fields||{})["Task Type"]||"news")===tt).map(r=>(r.fields||{}).Name));
+      return {connectorType:tt,label:`${m.e} ${m.l}`,count:tasks.filter(t=>ruleNames.has((t.fields||{})["Task Rule"])).length};
+    });
+  })();
+  const navSections = [
+    {title:null, items:[{id:"dashboard",label:"📊 Dashboard",count:null}]},
+    {title:"DATA", items:[
+      {id:"accounts",label:"Accounts",count:accounts.length},
+      {id:"leads",label:"Leads",count:leads.length},
+    ]},
+    {title:"CONNECTORS", plus:true, items:[
+      ...connectorNavItems,
+      {id:"rules",label:"⚙️ All connectors",count:clientMode?null:rules.length},
+    ]},
+    {title:"TASKS", items:[
+      {id:"tasks",label:"Tasks",count:tasks.length},
+      {id:"signal_review",label:"🔎 Signal Review",count:null},
+    ]},
+    // All delivery channels + connected systems live in ONE place now (was split
+    // between the Connectors page and the sidebar — that split was the confusion).
+    {title:"INTEGRATIONS", items:[
+      {id:"linkedin_posts",label:"📝 LinkedIn Posts",count:null},
+      {id:"outreach",label:"💬 LinkedIn Automation",count:null},
+      {id:"email_campaign",label:"📧 Email Campaign",count:null},
+      {id:"hubspot",label:"🔗 HubSpot",count:null},
+      {id:"google_analytics",label:"📊 Google Analytics",count:null},
+      {id:"post_demo",label:"🤖 Post-Demo Auto",count:null},
+    ]},
+    {title:"SETTINGS", items:[
+      {id:"prompts",label:"Prompts",count:null},
+      {id:"threshold",label:"Scoring threshold",count:null},
+      ...(!clientMode ? [{id:"coming_soon",label:"🚀 Coming Soon",count:null}] : []),
+    ]},
+  ];
 
   return(<><style>{CSS}</style><div className="dash">
   <div className="side"><div className="side-hd"><div className="side-brand">SignalScope</div><div className="side-camp">{camp.name}</div>{!clientMode&&<div className="side-back" onClick={()=>setCamp(null)}><I.Back/> All Campaigns</div>}{clientMode&&camp.desc&&<div style={{fontSize:10,color:"var(--t3)",marginTop:4,lineHeight:1.4}}>{camp.desc}</div>}</div>
-  <div className="side-nav">{navs.map((n,i)=> n===null
-    ? <div key={"sep"+i} style={{height:1,background:"var(--bdr)",margin:"6px 12px"}}/>
-    : <div key={n.id} className={"nav-i"+(tab===n.id?" on":"")} onClick={()=>{setTab(n.id);if(n.id==="outreach")loadOutreachStats();if(n.id==="signal_review")loadSignalArchive()}}><span>{n.label}</span>{n.count!==null&&n.count>0&&<span className="cnt">{n.count}</span>}</div>
-  )}</div>
+  <div className="side-nav">{navSections.map((sec,si)=>{
+    const items = sec.items.filter(it => it.connectorType || !clientMode || !ADMIN_ONLY_TABS.has(it.id));
+    if(!items.length) return null;
+    return (<div key={"sec"+si} style={{marginBottom:8}}>
+      {sec.title&&<div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 12px 2px"}}>
+        <span style={{fontSize:9,fontWeight:700,color:"var(--t3)",textTransform:"uppercase",letterSpacing:".06em"}}>{sec.title}</span>
+        {sec.plus&&!clientMode&&<span title="Add connector" onClick={()=>{setTab("rules");setShowConnectorPicker(true)}} style={{display:"flex",alignItems:"center",color:"var(--t3)",cursor:"pointer",padding:2,borderRadius:4}} onMouseEnter={e=>e.currentTarget.style.color="var(--acc)"} onMouseLeave={e=>e.currentTarget.style.color="var(--t3)"}><I.Plus/></span>}
+      </div>}
+      {items.map(it=>{
+        const on = it.connectorType ? (tab==="connector_detail"&&selectedConnectorType===it.connectorType) : tab===it.id;
+        return (<div key={it.connectorType||it.id} className={"nav-i"+(on?" on":"")} onClick={()=>{
+          if(it.connectorType){setSelectedConnectorType(it.connectorType);setConnDetailFilter({q:"",from:"",to:"",minScore:0});setTab("connector_detail")}
+          else {setTab(it.id);if(it.id==="outreach")loadOutreachStats();if(it.id==="signal_review")loadSignalArchive()}
+        }}><span style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{it.label}</span>{it.count!==null&&it.count>0&&<span className="cnt">{it.count}</span>}</div>);
+      })}
+    </div>);
+  })}</div>
   <div style={{padding:"12px 16px",borderTop:"1px solid var(--bdr)"}}>
     {/* Airtable Base — admin only */}
     {!clientMode&&(<>
@@ -2884,35 +2933,89 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         </div>);})}
     </div>}
 
-    {/* Channels & integrations — fixed delivery/integration instances folded in
-        from standalone nav tabs (Kunal #11-full). Always render (independent of
-        the Task-Rule connectors above) so these surfaces stay reachable even with
-        zero signal-source connectors. Not Task-Rule-backed → no count/delete,
-        just an Open affordance. */}
-    <div style={{height:1,background:"var(--bdr)",margin:"24px 0 16px"}}/>
-    <div style={{fontSize:12,fontWeight:600,color:"var(--t2)",marginBottom:4}}>Channels &amp; integrations</div>
-    <div style={{fontSize:11,color:"var(--t3)",marginBottom:12}}>Where detected events get delivered, plus connected systems.</div>
-    <div style={{display:"flex",flexDirection:"column",gap:12}}>
-      {[
-        {emoji:"📝",name:"LinkedIn Posts",desc:"Scan each account's LinkedIn engagement.",tab:"linkedin_posts"},
-        {emoji:"💬",name:"LinkedIn Automation",desc:"Connection requests + DM sequences.",tab:"outreach"},
-        {emoji:"📧",name:"Email Campaign",desc:"Smartlead-driven email sequences.",tab:"email_campaign"},
-        {emoji:"🔗",name:"HubSpot",desc:"Connect HubSpot, push tasks, sync CRM.",tab:"hubspot"},
-      ].map(c=>(
-        <div key={c.tab} style={{padding:16,border:"1px solid var(--bdr)",borderRadius:10,background:"var(--card)"}}>
-          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10}}>
-            <div style={{display:"flex",alignItems:"center",gap:10,minWidth:0}}>
-              <span style={{fontSize:18}}>{c.emoji}</span>
-              <div style={{minWidth:0}}>
-                <div style={{fontSize:14,fontWeight:600,color:"var(--t1)"}}>{c.name}</div>
-                <div style={{fontSize:11,color:"var(--t3)"}}>{c.desc}</div>
-              </div>
-            </div>
-            <button className="btn btn-s btn-p" style={{flexShrink:0}} onClick={()=>{setTab(c.tab);if(c.tab==="outreach")loadOutreachStats();}}>Open →</button>
-          </div>
+    {/* Delivery channels + connected systems (LinkedIn Posts/Automation, Email,
+        HubSpot, GA, Post-Demo) now live in the sidebar's INTEGRATIONS section —
+        kept out of the connectors list so this page is ONLY actual connectors. */}
+    </div>);
+  })()}
+
+  {/* ════ CONNECTOR DETAIL — uniform per-TYPE page (Kunal Jun-8) ════ */}
+  {/* Reached from the sidebar's per-type connector items. One page per connector
+      TYPE: header + run + that type's rules (configure/run/dup/delete) + their
+      combined tasks with date/score/search filters. Same layout for every type. */}
+  {tab==="connector_detail"&&!loading&&!clientMode&&(()=>{
+    const tt = selectedConnectorType;
+    const BLURB = {news:"Monitors Google News for company-level events at your accounts.",job_post:"Tracks LinkedIn job postings that point to buying intent.",both:"News and job-post events from one connector.",company_post:"Watches each account's own LinkedIn company-page posts.",top_x:"Ranks your leads or accounts by weighted + AI scoring.",linkedin_outreach:"Automated LinkedIn connection + DM sequences."};
+    const m = connectorTypeMeta(tt);
+    const blurb = BLURB[tt]||"Custom connector.";
+    const typeRules = rules.filter(r=>((r.fields||{})["Task Type"]||"news")===tt);
+    if(!typeRules.length) return (<div className="empty" style={{padding:48}}><div className="em">{m.e}</div><p style={{marginBottom:16}}>No {m.l} connectors configured.</p><button className="btn btn-p" onClick={()=>{setTab("rules");setShowConnectorPicker(true)}}><I.Plus/> Add a connector</button></div>);
+    const ruleNames = new Set(typeRules.map(r=>(r.fields||{}).Name));
+    const openConfigure = (r)=>{
+      const f=r.fields||{}; const dest=f["Delivery Destination"]||"Sidekick app"; const freq=f["Delivery Frequency"]||"Real-time";
+      if(tt==="top_x"){
+        const sf = (()=>{try{return JSON.parse(f["Scoring Fields"]||"[]")}catch{return[]}})();
+        let compiledRules=null; try{if(f["Compiled Rules JSON"])compiledRules=JSON.parse(f["Compiled Rules JSON"])}catch{}
+        setEditRule({airtableId:r.id,taskType:"top_x",name:f.Name,description:f.Description||"",scanTarget:f["Scan Target"]||"leads",topN:f["Top N"]||10,scoringFields:sf,ease:f.Ease||"Medium",strength:f.Strength||"Strong",scoringPrompt:f["Scoring Prompt"]||"",smartCompile:f["Smart Compile"]==="true"||f["Smart Compile"]===true,compiledRules,compiledAt:f["Compiled At"]||null,deliveryDestination:dest,deliveryFrequency:freq,baseId:bid});
+      } else if(tt==="linkedin_outreach"){ setTab("outreach"); }
+      else { setEditRule({airtableId:r.id,name:f.Name,description:f.Description,taskType:tt,scanTarget:f["Scan Target"]||"accounts",ease:f.Ease,strength:f.Strength,sources:(f.Sources||"").split(",").map(s=>s.trim()).filter(Boolean),keywords:(f.Keywords||"").split(",").map(k=>k.trim()).filter(Boolean),jobTitleKeywords:(f["Job Title Keywords"]||"").split(",").map(k=>k.trim()).filter(Boolean),scoringPrompt:f["Scoring Prompt"]||"",deliveryDestination:dest,deliveryFrequency:freq}); }
+    };
+    const scanAll = ()=>{ if(tt==="job_post")startScan("jobs"); else if(tt==="company_post")startScan("company_posts"); else if(tt==="news"||tt==="both")startScan("news"); };
+    const scannable = ["news","both","job_post","company_post"].includes(tt);
+    const cf = connDetailFilter;
+    const myTasks = tasks.filter(t=>{const tf=t.fields||{};if(!ruleNames.has(tf["Task Rule"]))return false;if(cf.q&&!(tf.Company||"").toLowerCase().includes(cf.q.toLowerCase())&&!(tf.Name||"").toLowerCase().includes(cf.q.toLowerCase()))return false;if(cf.minScore&&(tf.Score||0)<cf.minScore)return false;if(cf.from&&(tf.Date||"")<cf.from)return false;if(cf.to&&(tf.Date||"")>cf.to)return false;return true}).sort((a,b)=>((b.fields||{}).Score||0)-((a.fields||{}).Score||0));
+    return (<div>
+      <div className="ph"><div><div className="pt"><span style={{cursor:"pointer",color:"var(--t3)",marginRight:8}} onClick={()=>setTab("rules")} title="All connectors">←</span>{m.e} {m.l}</div><div className="pd">{blurb}</div></div>
+        <div style={{display:"flex",gap:6}}>
+          {scannable&&<button className="btn btn-s btn-p" onClick={scanAll} disabled={scanning||!accounts.length}>{scanning?"Running…":"▶ Run scan"}</button>}
+          <button className="btn btn-s" onClick={()=>{setTab("rules");setShowConnectorPicker(true)}}><I.Plus/> Add</button>
         </div>
-      ))}
-    </div>
+      </div>
+      <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:14}}>
+        <span className="chip cg">{m.l.toLowerCase()}</span>
+        <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>{typeRules.length} connector{typeRules.length===1?"":"s"}</span>
+        <span className="chip" style={{background:"var(--hover)",color:"var(--t2)",cursor:"pointer"}} onClick={()=>setTab("threshold")}>scoring threshold: {threshold}</span>
+        <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>{myTasks.length} tasks</span>
+      </div>
+
+      {/* This type's connectors */}
+      <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:20}}>{typeRules.map(r=>{const f=r.fields||{};const dest=f["Delivery Destination"]||"Sidekick app";const freq=f["Delivery Frequency"]||"Real-time";const tc=tasks.filter(t=>(t.fields||{})["Task Rule"]===f.Name).length;return(
+        <div key={r.id} style={{padding:"12px 14px",border:"1px solid var(--bdr)",borderRadius:8,background:"var(--card)"}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:f.Description?6:0}}>
+            <span style={{fontSize:14,fontWeight:600,color:"var(--t1)",flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{f.Name}</span>
+            <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>{f["Scan Target"]||(tt==="top_x"?"leads":"accounts")}</span>
+            <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>📬 {dest} · {freq}</span>
+            <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>{tc} tasks</span>
+            <button className="btn btn-s btn-p" onClick={()=>openConfigure(r)}>⚙️ Configure</button>
+            {tt==="top_x"&&<button className="btn btn-s btn-p" onClick={()=>runTopX(r)} disabled={scanning}>{scanning?"…":"▶ Run"}</button>}
+            <button className="btn btn-s" onClick={()=>duplicateRule(r)} title="Duplicate"><I.Copy/></button>
+            <button className="btn btn-d btn-s" onClick={()=>del("Task Rules",[r.id],setRules)}><I.Trash/></button>
+          </div>
+          {f.Description&&<div style={{fontSize:11,color:"var(--t3)"}}>{f.Description}</div>}
+        </div>);})}</div>
+
+      {/* This type's tasks */}
+      <div style={{fontSize:12,fontWeight:600,color:"var(--t2)",marginBottom:8}}>Tasks from {m.l}</div>
+      <div className="fb">
+        <input className="inp" placeholder="Search company…" value={cf.q} onChange={e=>setConnDetailFilter(s=>({...s,q:e.target.value}))} style={{maxWidth:220}}/>
+        <input type="number" min="0" max="100" className="inp" placeholder="Min score" value={cf.minScore||""} onChange={e=>setConnDetailFilter(s=>({...s,minScore:parseInt(e.target.value)||0}))} style={{width:110}}/>
+        <input type="date" className="inp" style={{width:140,fontSize:11}} value={cf.from} onChange={e=>setConnDetailFilter(s=>({...s,from:e.target.value}))}/>
+        <span style={{color:"var(--t3)",fontSize:11}}>to</span>
+        <input type="date" className="inp" style={{width:140,fontSize:11}} value={cf.to} onChange={e=>setConnDetailFilter(s=>({...s,to:e.target.value}))}/>
+      </div>
+      {!myTasks.length
+        ? <div className="empty" style={{padding:"40px 20px"}}><div className="em">{m.e}</div><p>No tasks from this connector yet{(cf.q||cf.minScore||cf.from||cf.to)?" matching your filters":""}.</p></div>
+        : <div style={{display:"flex",flexDirection:"column",gap:8}}>{myTasks.map(t=>{const tf=t.fields||{};const sc=tf.Score||0;return(
+            <div key={t.id} style={{padding:"10px 14px",border:"1px solid var(--bdr)",borderRadius:8,background:"var(--card)"}}>
+              <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:tf.Signal?6:0}}>
+                <span style={{fontSize:13,fontWeight:600,color:"var(--t1)",flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{tf.Company||tf.Name||"—"}{tf["Lead Title"]?<span style={{color:"var(--t3)",fontWeight:400,marginLeft:8}}>{tf["Lead Title"]}</span>:null}</span>
+                {typeRules.length>1&&tf["Task Rule"]&&<span className="chip" style={{background:"var(--hover)",color:"var(--t3)",maxWidth:140,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{tf["Task Rule"]}</span>}
+                {tf.Date&&<span style={{fontSize:10,color:"var(--t3)"}}>{tf.Date}</span>}
+                <span className="chip" style={{background:sc>=80?"rgba(93,168,122,.15)":sc>=60?"var(--acc-d)":"rgba(200,90,90,.12)",color:sc>=80?"var(--grn)":sc>=60?"var(--acc)":"var(--red)"}}>{sc}</span>
+                {tf.URL&&<a href={tf.URL} target="_blank" rel="noreferrer" className="btn btn-s" style={{textDecoration:"none"}}>↗</a>}
+              </div>
+              {tf.Signal&&<div style={{fontSize:11,color:"var(--t2)",lineHeight:1.5,maxHeight:60,overflow:"hidden"}}>{tf.Signal}</div>}
+            </div>);})}</div>}
     </div>);
   })()}
 
@@ -3143,7 +3246,7 @@ Output format (strict JSON, no markdown):
     const groups=gk==="none"?null:Object.entries(scoped.reduce((m,r)=>{const k=groupOf(r);const g=m[k]||(m[k]={q:0,u:0,d:0,t:0});if(r.status==="qualified")g.q++;else if(r.status==="unqualified")g.u++;else if(r.status==="duplicate")g.d++;g.t++;return m;},{})).sort((a,b)=>b[1].t-a[1].t);
     const archiveAbsent=archiveRecs!==null&&archiveRecs.length===0;
     return(<div>
-      <div className="ph"><div><div className="pt">🔎 Connector Review</div><div className="pd">Everything the connectors caught — qualified, disqualified, de-duplicated, role-checked, and routed — in one place. Clients never see this surface.</div></div>
+      <div className="ph"><div><div className="pt">🔎 Signal Review</div><div className="pd">Everything the connectors caught — qualified, disqualified, de-duplicated, role-checked, and routed — in one place. Clients never see this surface.</div></div>
       <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
         <button className="btn btn-s btn-p" onClick={verifyRoles} disabled={srVerifying} title="Check that lead-level LinkedIn results in view are still in the role we think — flags 'no longer CMO' before an SDR engages">{srVerifying?"⏳ Verifying…":"🛡 Verify roles"}</button>
         <button className="btn btn-s" onClick={loadSignalArchive} disabled={archiveLoading}>{archiveLoading?"⏳ Loading…":"↻ Refresh"}</button>
