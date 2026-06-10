@@ -264,8 +264,22 @@ async function tick(origin, state, campaignAirtableId) {
       const { tasks, archive } = bufferSignals(d.news, co.name, newsDefs, threshold, seen, archSeen);
       const { tw, aw } = await writeOut(tasks, archive);
       state.totals.news_tasks += tw; state.totals.news_archived += aw;
+      if (state.retry_account === co.name) delete state.retry_account; // retry succeeded
     } catch (e) {
-      state.failures.push(`news:${co.name} (${String(e.message).slice(0, 80)})`);
+      const msg = String(e.message || e.name || "");
+      // Tick-boundary protection: a scan aborted because THIS tick's remaining
+      // budget was smaller than the account needed is not the account's fault.
+      // Give it ONE retry at the top of the next tick (fresh 240s); a second
+      // failure records it and moves on (prevents an always-slow account from
+      // wedging the run).
+      const isTimeout = /timeout|abort/i.test(msg) || e.name === "TimeoutError" || e.name === "AbortError";
+      if (isTimeout && state.retry_account !== co.name) {
+        state.retry_account = co.name;
+        await writeState(campaignAirtableId, state);
+        return state; // do NOT advance the cursor — next tick retries this account
+      }
+      state.failures.push(`news:${co.name} (${msg.slice(0, 80)})`);
+      if (state.retry_account === co.name) delete state.retry_account;
     }
     state.news_idx++;
     await writeState(campaignAirtableId, state);

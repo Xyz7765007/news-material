@@ -135,6 +135,9 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const [scanProg, setScanProg] = useState(0);
   const [scanText, setScanText] = useState("");
   const scanRef = useRef(false);
+  const [srvScan, setSrvScan] = useState(null);   // /api/scan-run progress (server-side resumable scan)
+  const [srvBusy, setSrvBusy] = useState(false);  // a resume loop is actively driving ticks from this tab
+  const srvBusyRef = useRef(false);
   const taskSeenRef = useRef(new Set()); // tracks task fingerprints during scan to prevent dupes
   const [editRule, setEditRule] = useState(null); // unified rule editor — signal or top_x
   const [showConnectorPicker, setShowConnectorPicker] = useState(false); // connector-type picker on the Connectors home
@@ -1729,6 +1732,41 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
     setScanProg(100);setScanning(false);scanRef.current=false;
   },[accounts,rules,threshold,scanning,bid,tasks]);
 
+  // ── Server-side resumable scan (/api/scan-run, LinkedIn-posts pattern) ──
+  // Unlike startScan (browser-held loop — closing the tab kills the run), the
+  // server scan persists its cursor on the Campaigns row and works in ~4-min
+  // ticks. The Resume CTA (or any cron/driver) continues from the cursor.
+  const srvScanCall = async (action, extra = {}) => {
+    try {
+      const r = await fetch("/api/scan-run", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, campaignAirtableId: camp?.airtableId, ...extra }) });
+      const d = await r.json().catch(() => ({}));
+      if (d.progress !== undefined) setSrvScan(d.progress);
+      return d;
+    } catch (e) { console.error("[scan-run]", e); return {}; }
+  };
+  const srvResumeLoop = async () => {
+    if (srvBusyRef.current) return;
+    srvBusyRef.current = true; setSrvBusy(true);
+    try {
+      let guard = 0;
+      while (guard++ < 200) { // each resume = one ~4-min server tick
+        const d = await srvScanCall("resume");
+        if (!d?.progress || d.progress.status !== "running") break;
+      }
+    } finally { srvBusyRef.current = false; setSrvBusy(false); }
+  };
+  const srvStart = async () => {
+    const d = await srvScanCall("start", { baseId: bid, threshold });
+    if (d?.progress?.status === "running") srvResumeLoop();
+  };
+  useEffect(() => {
+    if (tab === "connector_detail" && ["news", "both", "job_post"].includes(selectedConnectorType) && camp?.airtableId) {
+      srvScanCall("get_progress");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, selectedConnectorType, camp?.airtableId]);
+
   // Buffer signals with instant dedup (layers 1-3), defer AI dedup to post-scan.
   // Two buckets now persist instead of one being silently dropped:
   //   • qualified (≥ threshold, not a duplicate) → live Tasks (scanBuffer)
@@ -2993,6 +3031,36 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
         <span className="chip" style={{background:"var(--hover)",color:"var(--t2)",cursor:"pointer"}} onClick={()=>setTab("threshold")}>scoring threshold: {threshold}</span>
         <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>{myTasks.length} tasks</span>
       </div>
+
+      {/* Server-side resumable scan (news/jobs): survives tab close, 4-min ticks,
+          Resume CTA continues from the saved cursor. /api/scan-run. */}
+      {["news","both","job_post"].includes(tt)&&(()=>{
+        const ss=srvScan;
+        const stale=ss&&ss.status==="running"&&ss.updated_at&&(Date.now()-new Date(ss.updated_at).getTime()>30000)&&!srvBusy;
+        return(
+        <div style={{padding:"12px 14px",border:"1px solid var(--bdr)",borderRadius:8,background:"var(--card)",marginBottom:14}}>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>🛰 Server scan (resumable)</div>
+              <div style={{fontSize:11,color:"var(--t3)"}}>Runs server-side in ~4-minute chunks. Close the tab any time — progress is saved; Resume continues from where it stopped.</div>
+            </div>
+            {(!ss||ss.status==="complete"||ss.status==="stopped")&&<button className="btn btn-s btn-p" style={{flexShrink:0}} onClick={srvStart} disabled={srvBusy}>▶ Start server scan</button>}
+            {ss&&ss.status==="running"&&<button className="btn btn-s btn-p" style={{flexShrink:0}} onClick={srvResumeLoop} disabled={srvBusy}>{srvBusy?"Running…":"⟳ Resume"}</button>}
+            {ss&&ss.status==="error"&&<button className="btn btn-s btn-p" style={{flexShrink:0}} onClick={srvResumeLoop} disabled={srvBusy}>⟳ Retry</button>}
+            {ss&&ss.status==="running"&&<button className="btn btn-s" style={{flexShrink:0}} onClick={()=>srvScanCall("stop")}>Stop</button>}
+          </div>
+          {ss&&<div style={{marginTop:8}}>
+            <div style={{display:"flex",gap:6,fontSize:11,flexWrap:"wrap"}}>
+              <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>{ss.status}{ss.phase?` · ${ss.phase}`:""}</span>
+              <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>news {ss.news_idx||0}/{ss.accounts_total||0}</span>
+              <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>jobs batch {ss.jobs_idx||0}/{Math.ceil((ss.accounts_total||0)/5)}</span>
+              <span className="chip" style={{background:"var(--hover)",color:"var(--t2)"}}>tasks {((ss.totals||{}).news_tasks||0)+((ss.totals||{}).jobs_tasks||0)} · retained {((ss.totals||{}).news_archived||0)+((ss.totals||{}).jobs_archived||0)}</span>
+              {(ss.failures||[]).length>0&&<span className="chip" style={{background:"var(--hover)",color:"#b8860b"}}>{ss.failures.length} failure{ss.failures.length===1?"":"s"}</span>}
+            </div>
+            {ss.status==="error"&&<div style={{fontSize:11,color:"#c0392b",marginTop:6}}>{ss.error}</div>}
+            {stale&&<div style={{fontSize:11,color:"var(--t3)",marginTop:6}}>Paused — no active driver. Press Resume to continue from account {ss.news_idx||0}.</div>}
+          </div>}
+        </div>);})()}
 
       {/* Scanner connectors have no editable rule — show a run/info card instead */}
       {isScanner
