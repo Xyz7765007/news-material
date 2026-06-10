@@ -1199,7 +1199,7 @@ ${signalBlock}`;
   // Guard 1 — hedge cap (news only): a match whose headline + score reason are
   // pure finance/governance noise with NO marketing-action language gets demoted
   // to the retain band instead of becoming a Task.
-  const FINANCE_NOISE_RE = /(earnings (call|report|transcript|release|beat|miss|season|recap)|q[1-4]\s?(20\d\d|results|earnings|revenue|sales)|price target|analyst (rating|call|note|upgrade|downgrade)|stock (split|price|surge|fall|jump|drop)|shares? (fall|rise|jump|slide|surge|drop|tumbl)|dividend|valuation|52-week|market cap|beats? (estimates|expectations)|joins? .{0,40}board|board of directors|board (appointment|member|seat)|elects? .{0,40}board|appoint\w* .{0,40}board|governance)/i;
+  const FINANCE_NOISE_RE = /(earnings (call|report|transcript|release|beat|miss|season|recap)|q[1-4]\s?(20\d\d|results|earnings|revenue|sales)|price target|analyst (rating|call|note|upgrade|downgrade)|stock (split|price|surge|fall|jump|drop)|stock an? (buy|sell|hold)|(buy|sell)\w* (on )?the dip|lifts? pt\b|raises? pt\b|initiated (with|at) (buy|sell|hold|outperform)|overweight|underweight|outperform|underperform|(sticks? with|raises?|cuts?|lifts?) (its )?guidance|top(s|ping|ped)? estimates|defy estimates|beats? wall street|shares? (fall|rise|jump|slide|surge|drop|tumbl)|dividend|valuation|52-week|market cap|beats? (estimates|expectations)|joins? .{0,40}board|board of directors|board (appointment|member|seat)|elects? .{0,40}board|appoint\w* .{0,40}board|governance)/i;
   // NOTE: bare "agency" deliberately NOT in this list — the AI mislabels board/
   // governance stories as "agency oversight" (audited: 8× 3M board appointments
   // scored 95 under "Agency review or consolidation"). Only ad/creative/media
