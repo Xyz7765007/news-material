@@ -376,10 +376,12 @@ async function fetchPostsForUrn(urn, cutoffMs, maxPages = 3, maxPosts = 2) {
 
       if (!ts) {
         undatableCount++;
-        // If this is one of the first 3 posts in the response AND it has text, accept it.
-        // Posts are newest-first, so first 3 are almost certainly within the 7-day window.
-        // This is a pragmatic fallback — better than rejecting every post when API schema changes.
-        if (idx < 3 && text) {
+        // If this is one of the first 3 posts in the response AND it has meaningful
+        // text, accept it. Posts are newest-first, so first 3 are almost certainly
+        // within the 7-day window. This is a pragmatic fallback — better than
+        // rejecting every post when API schema changes. Same <30-char text gate as
+        // the dated path: media-only posts have nothing to score on.
+        if (idx < 3 && text.length >= 30) {
           // Log the rejected-schema for debugging, just once
           if (undatableCount <= 2) {
             console.warn(`[linkedin-posts] Accepting undatable post (idx=${idx}, assumed recent):`, {
@@ -410,8 +412,12 @@ async function fetchPostsForUrn(urn, cutoffMs, maxPages = 3, maxPosts = 2) {
         continue;
       }
 
-      // Skip posts without text
-      if (!text) continue;
+      // Skip posts without meaningful text. Kunal (Jun 9): an image/video-only
+      // post has no text to reason over — don't fetch/score the media, just drop
+      // it. Scoring stays purely text-based (matches Material). The provider does
+      // not return media bytes here anyway; a trimmed length < 30 chars means
+      // there's no substantive caption worth a scoring call.
+      if (!text || text.length < 30) continue;
 
       all.push({
         text,
