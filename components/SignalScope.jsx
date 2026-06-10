@@ -2994,8 +2994,15 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
           {f.Description&&<div style={{fontSize:11,color:"var(--t3)"}}>{f.Description}</div>}
         </div>);})}</div>
 
-      {/* This type's tasks */}
-      <div style={{fontSize:12,fontWeight:600,color:"var(--t2)",marginBottom:8}}>Tasks from {m.l}</div>
+      {/* This type's tasks — capped preview (rendering 600+ cards made the page
+          50k px tall). Filters narrow in place; full list lives in Tasks. */}
+      {(()=>{ const TASK_PREVIEW=60; const srcFor={news:"news",both:"all",job_post:"job_post",company_post:"company_post",top_x:"top_x",linkedin_outreach:"all"}[tt]||"all";
+        return (<>
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+        <span style={{fontSize:12,fontWeight:600,color:"var(--t2)"}}>Tasks from {m.l}</span>
+        <span style={{fontSize:11,color:"var(--t3)"}}>{myTasks.length>TASK_PREVIEW?`showing top ${TASK_PREVIEW} of ${myTasks.length}`:`${myTasks.length} task${myTasks.length===1?"":"s"}`}</span>
+        <button className="btn btn-s" style={{marginLeft:"auto"}} onClick={()=>{setTab("tasks");setFilter(ff=>({...ff,connector:"all",src:srcFor}))}}>Open all in Tasks →</button>
+      </div>
       <div className="fb">
         <input className="inp" placeholder="Search company…" value={cf.q} onChange={e=>setConnDetailFilter(s=>({...s,q:e.target.value}))} style={{maxWidth:220}}/>
         <input type="number" min="0" max="100" className="inp" placeholder="Min score" value={cf.minScore||""} onChange={e=>setConnDetailFilter(s=>({...s,minScore:parseInt(e.target.value)||0}))} style={{width:110}}/>
@@ -3005,7 +3012,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
       </div>
       {!myTasks.length
         ? <div className="empty" style={{padding:"40px 20px"}}><div className="em">{m.e}</div><p>No tasks from this connector yet{(cf.q||cf.minScore||cf.from||cf.to)?" matching your filters":""}.</p></div>
-        : <div style={{display:"flex",flexDirection:"column",gap:8}}>{myTasks.map(t=>{const tf=t.fields||{};const sc=tf.Score||0;return(
+        : <div style={{display:"flex",flexDirection:"column",gap:8}}>{myTasks.slice(0,TASK_PREVIEW).map(t=>{const tf=t.fields||{};const sc=tf.Score||0;return(
             <div key={t.id} style={{padding:"10px 14px",border:"1px solid var(--bdr)",borderRadius:8,background:"var(--card)"}}>
               <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:tf.Signal?6:0}}>
                 <span style={{fontSize:13,fontWeight:600,color:"var(--t1)",flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{tf.Company||tf.Name||"—"}{tf["Lead Title"]?<span style={{color:"var(--t3)",fontWeight:400,marginLeft:8}}>{tf["Lead Title"]}</span>:null}</span>
@@ -3015,7 +3022,10 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
                 {tf.URL&&<a href={tf.URL} target="_blank" rel="noreferrer" className="btn btn-s" style={{textDecoration:"none"}}>↗</a>}
               </div>
               {tf.Signal&&<div style={{fontSize:11,color:"var(--t2)",lineHeight:1.5,maxHeight:60,overflow:"hidden"}}>{tf.Signal}</div>}
-            </div>);})}</div>}
+            </div>);})}
+            {myTasks.length>TASK_PREVIEW&&<button className="btn btn-s" style={{alignSelf:"center",marginTop:4}} onClick={()=>{setTab("tasks");setFilter(ff=>({...ff,connector:"all",src:srcFor}))}}>View all {myTasks.length} in Tasks →</button>}
+            </div>}
+        </>);})()}
     </div>);
   })()}
 
