@@ -1194,7 +1194,17 @@ ${signalBlock}`;
   // model-independent backstops. Nothing is silently lost: hedge-capped
   // matches land in the retain band (visible in Signal Review), arbitrated /
   // event-deduped articles still surface via their best rule / best article.
-  const guardStats = { hedgeDemoted: 0, ruleArbitrated: 0, eventDeduped: 0 };
+  const guardStats = { hedgeDemoted: 0, ruleArbitrated: 0, eventDeduped: 0,
+    // Rules whose AI scoring call FAILED outright (quota, rate limit, network).
+    // When this equals taskDefs.length the scan produced zero scores — that is
+    // an OUTAGE, not "no relevant news" (happened 2026-06-10: OpenAI
+    // insufficient_quota made every scan return 0 tasks with no visible alarm).
+    aiErrorTasks: taskOutputs.filter(t => t.scores === null).length,
+    aiErrorSample: (taskOutputs.find(t => t.error) || {}).error?.slice(0, 160) || null,
+  };
+  if (guardStats.aiErrorTasks === taskDefs.length && taskDefs.length > 0) {
+    console.error(`  [CLASSIFY] ⚠ ALL ${taskDefs.length} rule scoring calls FAILED — zero scores is an AI outage, not clean news. Sample: ${guardStats.aiErrorSample}`);
+  }
 
   // Guard 1 — hedge cap (news only): a match whose headline + score reason are
   // pure finance/governance noise with NO marketing-action language gets demoted
