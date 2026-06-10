@@ -1,0 +1,43 @@
+# Wednesday scan — Material news + job posts + LinkedIn posts
+#
+# This is the automation that was documented but never existed (audited
+# 2026-06-10: the Tasks table only grew on weeks someone clicked Scan in the
+# UI). Runs scripts/wednesday-scan.py against the prod deployment.
+#
+# Setup (already true for outreach-cron): repo secret CRON_SECRET must match
+# the Vercel CRON_SECRET env var.
+#
+# Triggers:
+#   - cron: Wednesdays 06:00 UTC (11:30 IST)
+#   - workflow_dispatch: manual re-run button (use after fixing an abort,
+#     e.g. an OpenAI quota outage — the script exits 1 loudly on those)
+#
+# NOTE GH Actions cron can lag up to ~30 min at peak. A cron-job.org backup
+# hitting workflow_dispatch (or simply re-running the scan) is the documented
+# secondary trigger; see the SignalScope ops docs.
+
+name: wednesday-scan
+
+on:
+  schedule:
+    - cron: "0 6 * * 3"
+  workflow_dispatch:
+
+concurrency:
+  group: wednesday-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run Wednesday scan
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          SIGNALSCOPE_URL: https://news-material-two.vercel.app
+        run: python scripts/wednesday-scan.py
