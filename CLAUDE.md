@@ -194,8 +194,8 @@ All authenticated with `Authorization: Bearer <SIDEKICK_API_KEY>`.
 
 ## 8. AI models (verified by grep across `app/api/` + `lib/`)
 
-- **`gpt-5.4`** — `/api/classify` (5 call sites: classify, refine, insights, generate scoring prompt), `/api/airtable` Top X scoring. The "smart" model.
-- **`gpt-5.4-mini`** — Default everywhere else: `/api/sidekick/diagnose-ai`, `/api/sidekick/auto-batch/generate`, `/api/post-demo`, `/api/linkedin-posts`, `/api/outreach` (3 sites — AI lead select + personalize message), `/api/airtable` (auto-create rule, lead enrichment), `/api/scan` (news classification fallback)
+- **`gpt-5.4`** — `/api/classify` (5 call sites: classify, refine, insights, generate scoring prompt), `/api/airtable` Top X scoring, **`/api/scan` news+jobs scoring and `/api/linkedin-posts` post scoring (upgraded from mini 2026-06-10 — mini was handing 95s to board appointments and earnings recaps)**.
+- **`gpt-5.4-mini`** — Default for the rest: `/api/sidekick/diagnose-ai`, `/api/sidekick/auto-batch/generate`, `/api/post-demo`, `/api/outreach` (3 sites — AI lead select + personalize message), `/api/airtable` (auto-create rule, lead enrichment), `/api/classify` dedup, `/api/company-posts`
 - **`claude-sonnet-4-6`** — **Only** in `/api/email-campaign` (line 189). All email sequence drafting goes through Claude; everything else is OpenAI.
 
 Costs tracked via `trackOpenAIUsage(campaignId, model, usage)` scattered across routes.
