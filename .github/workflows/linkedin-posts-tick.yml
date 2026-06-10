@@ -1,0 +1,36 @@
+# LinkedIn Posts Scan Tick
+# Every 5 minutes, hit /api/linkedin-posts?mode=resume — if a scan is running
+# it processes the next ~22-lead chunk (300s budget); if not, it no-ops.
+# This makes the resumable scan self-driving: no browser tab, no external
+# cron-job.org dependency, no session-bound driver. Mirrors
+# movement-scan-tick.yml. Required secret: CRON_SECRET.
+
+name: LinkedIn Posts Tick
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: linkedin-posts-tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - name: Resume tick
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "$CRON_SECRET" ]; then echo "::error::CRON_SECRET secret not set"; exit 1; fi
+          resp=$(curl -sS -X POST -m 350 \
+            "https://news-material-two.vercel.app/api/linkedin-posts?mode=resume&key=$CRON_SECRET" || echo '{"curl":"failed"}')
+          echo "$resp" | head -c 2000
+          case "$resp" in
+            *'"curl":"failed"'*) echo "::warning::tick request failed";;
+            *'"status":"running"'*) echo "::notice::processed a chunk";;
+            *) echo "::notice::idle or scan not running";;
+          esac
