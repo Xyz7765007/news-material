@@ -1325,16 +1325,19 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
 
   // Check if a new task is a duplicate of anything we've seen
   // existingTasks is the campaign's current Tasks list.
-  // opts.strict — when true, skip Layer 3 (fuzzy company+rule+signal overlap).
+  // opts.strict — when true, skip Layers 1 and 3 (signal-text-based dedup).
   //   Use this for Top X / Smart Compile flows where multiple distinct leads
   //   at the same company legitimately share the same compiled match-reason,
-  //   so a fuzzy match on signal text would wrongly kill every fresh task.
+  //   so signal-text matching wrongly kills fresh tasks. Layer 1 is just as
+  //   wrong as Layer 3 there: the fingerprint is Company|Rule|first-60-chars-
+  //   of-Signal, Top X signals open with boilerplate score text, and leads
+  //   with no Company collide with prior runs' tasks on that prefix alone
+  //   (2026-06-10 Volopay run: 144 of 149 fresh tasks killed this way).
   //   Server-side excludeKeys (URL + name|company) is the source of truth for
-  //   those flows; client-side fuzzy dedup is unnecessary on top.
+  //   those flows; only Layer 2 (URL+Company exact) runs on top.
   const isDuplicate = (newTask, existingTasks, opts = {}) => {
-    const fp = taskFingerprint(newTask);
-    // Layer 1: exact fingerprint
-    if (taskSeenRef.current.has(fp)) return true;
+    // Layer 1: exact fingerprint. Skipped in strict mode.
+    if (!opts.strict && taskSeenRef.current.has(taskFingerprint(newTask))) return true;
     // Layer 2: URL dedup — same URL for same company = same signal
     const newUrl = (newTask.URL || "").toLowerCase().trim();
     if (newUrl) {

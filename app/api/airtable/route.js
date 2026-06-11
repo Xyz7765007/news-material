@@ -1179,7 +1179,7 @@ CRITICAL RULES:
 4. fuzzy_check should be enabled ONLY when criteria genuinely need text interpretation (e.g. "headline suggests interest in X", "title sounds related to finance"). If user's criteria are all explicit field comparisons, set fuzzy_check.enabled to false.
 5. If a boolean field has a "Not Sure" middle state, use partial_credit to give half points.
 6. Be CONCRETE. Don't write "title contains finance-related keywords" — list the actual keywords: ["CFO", "Finance", "Controller", "Treasurer"].
-7. For numeric ranges, use the exact bounds the user gave. If they say "between 200 and 2000", use min:200 max:2000.
+7. For numeric ranges, use the exact bounds the user gave. If they say "between 200 and 2000", use the between operator with min:200 max:2000. For single-bound comparisons (gt/gte/lt/lte), put the threshold in "value" — never min or max.
 8. case_sensitive defaults to false.
 9. CROSS-REFERENCE: When the user message includes an "Account fields" section, you MAY reference account-level fields by prefixing with "Account." (e.g. field "Account.Decentralized" or "Account.Industry"). Only do this when the user's prompt clearly references account-level criteria. The lead-account match is automatic via domain/website/LinkedIn URL.
 
@@ -1410,7 +1410,12 @@ function executeCompiledRule(rule, fieldValue) {
     }
     case "gt": case "gte": case "lt": case "lte": {
       const num = parseFloat(fv);
-      const target = parseFloat(rule.value);
+      // The compiler sometimes emits the threshold as min/max (the range
+      // guidance bleeds into single-bound operators) instead of value —
+      // accept both shapes so those rules don't silently never match.
+      const rawTarget = rule.value !== undefined ? rule.value
+        : (rule.operator === "gt" || rule.operator === "gte") ? rule.min : rule.max;
+      const target = parseFloat(rawTarget);
       if (isNaN(num) || isNaN(target)) return { matched: false, score: 0 };
       const ok = rule.operator === "gt" ? num > target
               : rule.operator === "gte" ? num >= target
