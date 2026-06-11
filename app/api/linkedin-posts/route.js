@@ -791,7 +791,7 @@ OUTPUT JSON (no other text, no markdown):
 }`;
 }
 
-async function scorePost({ post, lead, campaignContext, systemPromptOverride, categoryHint, campaignId = null }) {
+async function scorePost({ post, lead, campaignContext, systemPromptOverride, categoryHint, campaignId = null, reviewerFeedback = "" }) {
   const openai = new OpenAI({ apiKey: OPENAI_KEY });
   const f = lead.fields || {};
   const fullName = f.Name || f["Full Name"] || ((f["First Name"] || "") + " " + (f["Last Name"] || "")).trim() || "Unknown";
@@ -807,9 +807,16 @@ async function scorePost({ post, lead, campaignContext, systemPromptOverride, ca
     pre_filter_category: categoryHint || "genuine_content",
   };
 
-  const systemPrompt = systemPromptOverride && systemPromptOverride.trim()
+  let systemPrompt = systemPromptOverride && systemPromptOverride.trim()
     ? systemPromptOverride
     : defaultScoringSystemPrompt(campaignContext);
+  // Reviewer feedback memory — Signal Review demotes/promotes of linkedin_engagement
+  // tasks, stored on the master Campaigns row ("LinkedIn Posts Feedback"). Injected
+  // so a human-corrected scoring mistake isn't repeated on the next scan.
+  const fb = String(reviewerFeedback || "").trim().slice(0, 4000);
+  if (fb) {
+    systemPrompt += `\n\nREVIEWER FEEDBACK — human corrections on past post scoring for this campaign (most recent last). DEMOTED = the AI's score was too HIGH for that post; score similar posts LOWER. PROMOTED = too LOW; score similar posts HIGHER. Apply these corrections; do NOT repeat these mistakes:\n${fb}`;
+  }
 
   try {
     const c = await openai.chat.completions.create({
@@ -955,11 +962,13 @@ async function runLinkedInPostScan({
   // Load campaign for context
   let campaignContext = "";
   let campaignName = "";
+  let reviewerFeedback = ""; // Signal Review demote/promote memory for linkedin_engagement
   if (campaignAirtableId) {
     const camp = await atGet(MASTER_BASE_ID, "Campaigns", campaignAirtableId);
     if (camp) {
       campaignContext = camp.fields?.["Email Reference"] || camp.fields?.["ICP Description"] || camp.fields?.["Campaign Context"] || "";
       campaignName = camp.fields?.Name || camp.fields?.["Campaign Name"] || "";
+      reviewerFeedback = camp.fields?.["LinkedIn Posts Feedback"] || "";
     }
   }
 
@@ -1224,6 +1233,7 @@ async function runLinkedInPostScan({
         post, lead, campaignContext, systemPromptOverride,
         categoryHint: cat.category,
         campaignId: campaignAirtableId,
+        reviewerFeedback,
       });
       progress.posts_scored++;
 

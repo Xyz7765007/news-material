@@ -967,6 +967,11 @@ async function classify(signals, taskDefs, companyName, mode, threshold = 50, ca
 
     const userPrompt = (task.scoringPrompt || "").trim();
     const taskName = task.name || "(unnamed task)";
+    // Reviewer feedback memory — corrections from Signal Review demotes/promotes,
+    // stored on the Task Rule ("Reviewer Feedback") and passed in via taskDefs.
+    // Injected into every scoring call so a human-corrected mistake isn't
+    // repeated on the next scan. Capped at the source (4000 chars).
+    const reviewerFeedback = String(task.reviewerFeedback || "").trim().slice(0, 4000);
 
     // System prompt: format only. No judgement rules. The user's prompt is authority.
     // Score tiers are descriptive guideposts — the threshold (set by the user via the
@@ -1032,6 +1037,12 @@ If no signals score ${threshold}+, return: { "matches": [] }`;
       const userMessage = `# Task: ${taskName}
 ${task.description ? `\nTask description: ${task.description}\n` : ""}
 ${userPrompt ? `# User's scoring criteria:\n${userPrompt}\n` : "# User has not provided custom criteria. Use the task name and description above as the guide.\n"}
+${reviewerFeedback ? `# REVIEWER FEEDBACK — human corrections on this task's past scoring (most recent last):
+DEMOTED = the AI qualified a signal a human reviewer rejected — its score was too HIGH; score similar signals LOWER.
+PROMOTED = the AI under-scored a signal a human reviewer promoted — its score was too LOW; score similar signals HIGHER.
+Apply these corrections; do NOT repeat these mistakes:
+${reviewerFeedback}
+` : ""}
 # Signals to score:
 
 ${signalBlock}`;

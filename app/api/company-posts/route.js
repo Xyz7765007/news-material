@@ -166,7 +166,9 @@ async function scorePosts(companyName, posts, taskDefs, threshold, campaignId) {
   }));
   if (!base.length || !taskDefs.length) return base;
 
-  const ruleBlock = taskDefs.map((t, i) => `RULE ${i} — "${t.name}": ${(t.scoringPrompt || t.description || t.name).slice(0, 600)}`).join("\n");
+  // Reviewer feedback memory (Signal Review demotes/promotes on this rule) —
+  // appended per rule so human corrections steer the next scoring pass.
+  const ruleBlock = taskDefs.map((t, i) => `RULE ${i} — "${t.name}": ${(t.scoringPrompt || t.description || t.name).slice(0, 600)}${String(t.reviewerFeedback || "").trim() ? `\n  REVIEWER FEEDBACK on this rule's past scoring (DEMOTED = was scored too high, PROMOTED = too low — do not repeat): ${String(t.reviewerFeedback).trim().slice(0, 1500)}` : ""}`).join("\n");
   const postBlock = base.map((b, i) => `[${i}] ${b.articleContent}`).join("\n\n");
   const sys = `You score a company's LinkedIn posts against engagement/signal rules for "${companyName}". For each post, pick the SINGLE best-matching rule and score 0-100 how strongly it matches that rule (how worthy it is of being an account-level signal/engagement task). Be honest — most posts are routine and score low. Output strict JSON: {"matches":[{"idx":<post index>,"rule":<rule index>,"score":<0-100>,"reason":"<=140 chars"}]}. One entry per post you score.`;
   try {

@@ -245,7 +245,11 @@ const CAMPAIGN_TABLES = {
   // Company is first so it becomes the Airtable primary (primary can't be select).
   "Signal Archive": [
     { name: "Company", type: "singleLineText" },
-    { name: "Signal Status", type: "singleSelect", options: { choices: [{ name: "unqualified" }, { name: "duplicate" }, { name: "aged_out" }] } },
+    // "demoted" = a qualified Task a reviewer rejected in Signal Review
+    // (2026-06-11) — retained here with the reviewer's feedback, reversible
+    // via Promote. On pre-existing tables the choice is auto-created by
+    // typecast:true at first demote.
+    { name: "Signal Status", type: "singleSelect", options: { choices: [{ name: "unqualified" }, { name: "duplicate" }, { name: "aged_out" }, { name: "demoted" }] } },
     { name: "Score", type: "number", options: { precision: 0 } },
     { name: "Score Reason", type: "multilineText" },
     { name: "Signal", type: "multilineText" },
@@ -259,6 +263,15 @@ const CAMPAIGN_TABLES = {
     { name: "Lead Title", type: "singleLineText" },
     { name: "Date", type: "date", options: { dateFormat: { name: "iso" } } },
     { name: "Created", type: "dateTime", options: TZ_ISO },
+    // ─── Reviewer feedback (demote/promote loop, 2026-06-11) ──────
+    // Name + LinkedIn URL preserve lead identity when a linkedin_engagement
+    // task is demoted. Review Feedback is the reviewer's verbatim correction;
+    // the digest the scorer learns from lives on the Task Rule ("Reviewer
+    // Feedback") / Campaigns row ("LinkedIn Posts Feedback").
+    { name: "Name", type: "singleLineText" },
+    { name: "LinkedIn URL", type: "url" },
+    { name: "Review Feedback", type: "multilineText" },
+    { name: "Reviewed At", type: "dateTime", options: TZ_ISO },
   ],
 
   // ─── Sidekick Chat — persistent chat history + dynamic memory ──
@@ -350,6 +363,9 @@ const CAMPAIGN_TABLES = {
     { name: "Name", type: "singleLineText" },
     { name: "Task Type", type: "singleLineText" },
     { name: "Outreach Config", type: "multilineText" },
+    // Scoring-correction memory appended by Signal Review demote/promote
+    // (/api/review-feedback) and injected into every scan's scoring prompt.
+    { name: "Reviewer Feedback", type: "multilineText" },
   ],
 };
 

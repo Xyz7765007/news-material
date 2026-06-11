@@ -200,7 +200,10 @@ async function buildDefs(baseId, taskType) {
     }
     defs.push({ id: r.id, name: f.Name || "", description: f.Description || "", taskType: tt,
       scanTarget: f["Scan Target"] || "accounts", ease: f.Ease || "Medium", strength: f.Strength || "Medium",
-      sources: split(f.Sources), keywords: kws, jobTitleKeywords: jtk, scoringPrompt: sp });
+      sources: split(f.Sources), keywords: kws, jobTitleKeywords: jtk, scoringPrompt: sp,
+      // Signal Review demote/promote corrections — /api/scan injects this into
+      // the scoring prompt so reviewed mistakes aren't repeated.
+      reviewerFeedback: f["Reviewer Feedback"] || "" });
   }
   return defs;
 }
