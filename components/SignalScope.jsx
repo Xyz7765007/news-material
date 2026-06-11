@@ -3322,7 +3322,14 @@ Output format (strict JSON, no markdown):
     //   • live Tasks (the signal pipeline — excludes Top X lead-scoring) = "qualified"
     //   • Signal Archive rows = "unqualified" | "duplicate"
     const F=k=>srFilter[k]??"all"; // tolerate older state shapes missing newer keys
-    const normRow=(t,status)=>{const f=t.fields||{};return{id:t.id,company:f.Company||"",rule:f["Task Rule"]||"",type:f["Task Type"]||"news",score:Number(f.Score)||0,status,reason:f["Score Reason"]||"",signal:f.Signal||"",url:f.URL||"",source:f.Source||"",date:f.Date||"",created:f.Created||"",leadTitle:f["Lead Title"]||"",target:f["Scan Target"]||"accounts",dupOf:f["Dup Of"]||"",name:f.Name||"",linkedinUrl:f["LinkedIn URL"]||"",roleStatus:(f["Role Status"]||"").toLowerCase(),roleNote:f["Role Check Note"]||"",roleCheckedAt:f["Role Checked At"]||"",assignedTo:f["Assigned To"]||""};};
+    // Campaign Tag lookup: prefer the field stored on the Task; otherwise derive
+    // by joining the signal back to a Lead (by LinkedIn URL or name) or an Account
+    // (by company) so the column also populates for older news/job tasks.
+    const _normUrl=u=>(u||"").toLowerCase().replace(/^https?:\/\//,"").replace(/^www\./,"").replace(/\/+$/,"").split("?")[0];
+    const tagByLi={},tagByName={},tagByCompany={};
+    (leads||[]).forEach(l=>{const f=l.fields||{};const tag=f["Campaign Tag"];if(!tag)return;const u=_normUrl(f["LinkedIn URL"]);if(u)tagByLi[u]=tag;if(f.Name)tagByName[f.Name.toLowerCase()]=tag;});
+    (accounts||[]).forEach(a=>{const f=a.fields||{};if(f.Name&&f["Campaign Tag"])tagByCompany[f.Name.toLowerCase()]=f["Campaign Tag"];});
+    const normRow=(t,status)=>{const f=t.fields||{};const campaignTag=f["Campaign Tag"]||tagByLi[_normUrl(f["LinkedIn URL"])]||tagByName[(f.Name||"").toLowerCase()]||tagByCompany[(f.Company||"").toLowerCase()]||"";return{id:t.id,company:f.Company||"",rule:f["Task Rule"]||"",type:f["Task Type"]||"news",score:Number(f.Score)||0,status,reason:f["Score Reason"]||"",signal:f.Signal||"",url:f.URL||"",source:f.Source||"",date:f.Date||"",created:f.Created||"",leadTitle:f["Lead Title"]||"",target:f["Scan Target"]||"accounts",dupOf:f["Dup Of"]||"",name:f.Name||"",linkedinUrl:f["LinkedIn URL"]||"",roleStatus:(f["Role Status"]||"").toLowerCase(),roleNote:f["Role Check Note"]||"",roleCheckedAt:f["Role Checked At"]||"",assignedTo:f["Assigned To"]||"",campaignTag};};
     const srQualified=tasks.filter(t=>((t.fields||{})["Task Type"]||"news")!=="top_x").map(t=>normRow(t,"qualified"));
     const srArchive=(archiveRecs||[]).map(t=>normRow(t,((t.fields||{})["Signal Status"]||"unqualified").toLowerCase()));
     const srAll=[...srQualified,...srArchive];
@@ -3330,10 +3337,14 @@ Output format (strict JSON, no markdown):
     const srRules=[...new Set(srAll.map(r=>r.rule).filter(Boolean))].sort();
     const srTypes=[...new Set(srAll.map(r=>r.type).filter(Boolean))].sort();
     const srPeople=[...new Set(srAll.map(r=>r.assignedTo).filter(Boolean))].sort();
+    const srTags=[...new Set(srAll.map(r=>r.campaignTag).filter(Boolean))].sort();
+    // Owner dropdown options: Jonathan (default routing for signal review) + every
+    // Lead Owner pulled from the campaign's lead data + anyone already assigned.
+    const ownerOptions=(()=>{const s=new Set((leads||[]).map(l=>(l.fields||{})["Lead Owner"]).filter(Boolean));srAll.forEach(r=>{if(r.assignedTo)s.add(r.assignedTo);});s.delete("Jonathan");return["Jonathan",...[...s].sort()];})();
     const now=Date.now();const winMs=F("days")==="all"?Infinity:Number(F("days"))*86400000;
     const inWindow=r=>{if(winMs===Infinity)return true;const t=new Date(r.created||r.date).getTime();return !Number.isFinite(t)||(now-t)<=winMs;};
     // "scoped" = all filters EXCEPT status (so the status pills show contextual counts)
-    const scoped=srAll.filter(r=>(F("account")==="all"||r.company===F("account"))&&(F("rule")==="all"||r.rule===F("rule"))&&(F("type")==="all"||r.type===F("type"))&&(F("role")==="all"||(r.roleStatus||"none")===F("role"))&&(F("person")==="all"||r.assignedTo===F("person"))&&inWindow(r)&&(!srFilter.q||(r.company+" "+r.rule+" "+r.signal+" "+r.reason+" "+r.leadTitle+" "+r.name+" "+r.assignedTo).toLowerCase().includes(srFilter.q.toLowerCase())));
+    const scoped=srAll.filter(r=>(F("account")==="all"||r.company===F("account"))&&(F("rule")==="all"||r.rule===F("rule"))&&(F("type")==="all"||r.type===F("type"))&&(F("role")==="all"||(r.roleStatus||"none")===F("role"))&&(F("person")==="all"||r.assignedTo===F("person"))&&(F("tag")==="all"||r.campaignTag===F("tag"))&&inWindow(r)&&(!srFilter.q||(r.company+" "+r.rule+" "+r.signal+" "+r.reason+" "+r.leadTitle+" "+r.name+" "+r.assignedTo).toLowerCase().includes(srFilter.q.toLowerCase())));
     const cnt=s=>s==="all"?scoped.length:scoped.filter(r=>r.status===s).length;
     const rows=scoped.filter(r=>F("status")==="all"||r.status===F("status")).sort((a,b)=>new Date(b.created||b.date)-new Date(a.created||a.date));
     const STA={qualified:{bg:"var(--grn-d)",fg:"var(--grn)",lbl:"Qualified"},unqualified:{bg:"rgba(245,158,11,.15)",fg:"var(--amb)",lbl:"Unqualified"},duplicate:{bg:"var(--hover)",fg:"var(--t2)",lbl:"Duplicate"}};
@@ -3341,7 +3352,7 @@ Output format (strict JSON, no markdown):
     const ROLE={verified:{t:"✅ in role",c:"var(--grn)"},changed:{t:"⚠ title changed",c:"var(--amb)"},stale:{t:"⛔ left role",c:"var(--red)"},unverified:{t:"❔ unverified",c:"var(--t3)"},unknown:{t:"— no URL",c:"var(--t3)"}};
     const staleCount=scoped.filter(r=>r.roleStatus==="stale"||r.roleStatus==="changed").length;
     const promote=async r=>{if(!confirm(`Promote this unqualified result (score ${r.score}) to a live Task?\n\n${r.signal}`))return;const nt={Company:r.company,"Task Rule":r.rule,Score:r.score,"Score Reason":r.reason,"Scan Target":r.target,Signal:r.signal,Source:r.source,URL:r.url,"Task Type":r.type,Date:r.date,Created:new Date().toISOString()};try{const res=await at("create","Tasks",{records:[nt]},bid);setTasks(p=>[...(res.records||[]),...p]);await at("delete","Signal Archive",{recordIds:[r.id]},bid);setArchiveRecs(p=>(p||[]).filter(x=>x.id!==r.id));}catch(e){alert("Promote failed: "+e.message);}};
-    const assign=async r=>{const who=prompt(`Route "${(r.name||r.signal||"").slice(0,48)}" to which person? (e.g. Jonathan, Chris — blank to unassign)`,r.assignedTo||"");if(who===null)return;const v=who.trim();try{await at("update","Tasks",{records:[{id:r.id,fields:{"Assigned To":v}}]},bid);setTasks(p=>p.map(t=>t.id===r.id?{...t,fields:{...t.fields,"Assigned To":v}}:t));}catch(e){alert("Assign failed: "+e.message);}};
+    const assignTo=async(r,v)=>{try{await at("update","Tasks",{records:[{id:r.id,fields:{"Assigned To":v}}]},bid);setTasks(p=>p.map(t=>t.id===r.id?{...t,fields:{...t.fields,"Assigned To":v}}:t));}catch(e){alert("Assign failed: "+e.message);}};
     // Role-freshness verification — runs only on the lead-level LinkedIn signals
     // currently in view (Kunal: few signals go out, cheap to check). Isolated
     // /api/role-check endpoint stamps Role Status back onto each Task.
@@ -3395,6 +3406,7 @@ Output format (strict JSON, no markdown):
         <select className="inp" style={{width:120}} value={F("type")} onChange={e=>setSrFilter(f=>({...f,type:e.target.value}))}><option value="all">All Types</option>{srTypes.map(t=><option key={t} value={t}>{t.replace(/_/g," ")}</option>)}</select>
         <select className="inp" style={{width:130}} value={F("role")} onChange={e=>setSrFilter(f=>({...f,role:e.target.value}))} title="Role-freshness status"><option value="all">Any role status</option><option value="verified">✅ In role</option><option value="changed">⚠ Title changed</option><option value="stale">⛔ Left role</option><option value="unverified">❔ Unverified</option><option value="none">· Not checked</option></select>
         <select className="inp" style={{width:130}} value={F("person")} onChange={e=>setSrFilter(f=>({...f,person:e.target.value}))} title="Routed to (Assigned To)"><option value="all">Any owner</option>{srPeople.map(p=><option key={p} value={p}>{p}</option>)}</select>
+        <select className="inp" style={{width:150}} value={F("tag")} onChange={e=>setSrFilter(f=>({...f,tag:e.target.value}))} title="Filter by Campaign Tag"><option value="all">All Campaign Tags</option>{srTags.map(t=><option key={t} value={t}>{t}</option>)}</select>
         <select className="inp" style={{width:110}} value={F("days")} onChange={e=>setSrFilter(f=>({...f,days:e.target.value}))}><option value="1">24h</option><option value="7">7 days</option><option value="14">14 days</option><option value="30">30 days</option><option value="all">All time</option></select>
         <select className="inp" style={{width:130}} value={gk} onChange={e=>setSrFilter(f=>({...f,group:e.target.value}))} title="Group the view"><option value="none">Flat list</option><option value="account">Group: Account</option><option value="person">Group: Owner</option><option value="rule">Group: Rule</option><option value="type">Group: Type</option></select>
       </div>
@@ -3411,16 +3423,17 @@ Output format (strict JSON, no markdown):
         </tr>))}</tbody></table><div style={{fontSize:10,color:"var(--t3)",padding:"8px 4px"}}>{groups.length} group{groups.length===1?"":"s"} · click a row to drill in</div></div>):
        rows.length===0?<div className="empty"><div className="em">🔎</div><p>{srAll.length===0?"Nothing caught yet — run a scan from the Tasks tab.":"Nothing matches these filters."}</p>{archiveAbsent&&<div style={{fontSize:10,color:"var(--t3)",marginTop:8,maxWidth:440,textAlign:"center",lineHeight:1.5}}>Unqualified + duplicate retention turns on after the archive table is provisioned and the next scan runs. Qualified Tasks show here regardless.</div>}</div>:
       <div className="tw"><table><thead><tr>
-        <th>Status</th><th>Company</th><th>Person / Connector</th><th>Role</th><th>Score</th><th>Type</th><th>Event</th><th>Owner</th><th>Date</th><th>Link</th><th></th>
+        <th>Status</th><th>Company</th><th>Tag</th><th>Person / Connector</th><th>Role</th><th>Score</th><th>Type</th><th>Event</th><th>Owner</th><th>Date</th><th>Link</th><th></th>
       </tr></thead><tbody>{rows.slice(0,400).map((r,i)=>{const st=STA[r.status]||STA.unqualified;const rl=r.roleStatus&&ROLE[r.roleStatus];return(<tr key={r.id+i}>
         <td><span className="chip" style={{background:st.bg,color:st.fg}}>{st.lbl}</span></td>
         <td style={{color:"var(--t1)",fontWeight:500}}>{r.company}</td>
+        <td style={{whiteSpace:"nowrap"}}>{r.campaignTag?<span className="chip" style={{fontSize:9}}>{r.campaignTag}</span>:<span style={{fontSize:9,color:"var(--t3)"}}>—</span>}</td>
         <td style={{maxWidth:170}}><div style={{fontSize:11,color:"var(--t1)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.name||r.leadTitle||"—"}</div><div style={{fontSize:9,color:"var(--t3)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.leadTitle&&r.name?r.leadTitle+" · ":""}{r.rule}</div></td>
         <td style={{whiteSpace:"nowrap"}}>{r.type==="linkedin_engagement"?(rl?<span style={{fontSize:9,color:rl.c}} title={r.roleNote||""}>{rl.t}</span>:<span style={{fontSize:9,color:"var(--t3)"}}>·</span>):<span style={{fontSize:9,color:"var(--t3)"}}>—</span>}</td>
         <td><div className="sb" style={{width:68}} title={r.reason?`AI reason: ${r.reason}`:""}><div className="st"><div className="sf" style={{width:r.score+"%",background:r.score>=80?"var(--grn)":r.score>=60?"var(--amb)":"var(--red)"}}/></div><span className="sv" style={{color:r.score>=80?"var(--grn)":r.score>=60?"var(--amb)":"var(--red)"}}>{r.score}</span></div></td>
         <td><span className={"chip "+(r.type==="job_post"?"cb":r.type==="top_x"?"cp":"cg")}>{(r.type||"news").replace(/_/g," ").toUpperCase()}</span></td>
         <td style={{maxWidth:230,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={r.signal+(r.reason?"\n\n💡 "+r.reason:"")+(r.dupOf?"\n\n↔ Dup of: "+r.dupOf:"")+(r.roleNote?"\n\n🛡 "+r.roleNote:"")}>{r.signal}</td>
-        <td style={{whiteSpace:"nowrap"}}>{r.status==="qualified"?<button className="btn btn-s" style={{fontSize:9,padding:"3px 7px"}} title="Route this to a person" onClick={()=>assign(r)}>{r.assignedTo?`👤 ${r.assignedTo}`:"＋ assign"}</button>:r.assignedTo?<span style={{fontSize:9,color:"var(--t3)"}}>{r.assignedTo}</span>:"—"}</td>
+        <td style={{whiteSpace:"nowrap"}}>{r.status==="qualified"?<select className="inp" style={{fontSize:9,padding:"2px 4px",maxWidth:120}} value={r.assignedTo||""} onChange={e=>assignTo(r,e.target.value)} title="Route this signal to an owner"><option value="">＋ assign</option>{ownerOptions.map(o=><option key={o} value={o}>{o}</option>)}</select>:r.assignedTo?<span style={{fontSize:9,color:"var(--t3)"}}>{r.assignedTo}</span>:"—"}</td>
         <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10}}>{(r.date||r.created||"").slice(0,10)}</td>
         <td>{r.url?<a href={r.url} target="_blank" rel="noopener" style={{color:"var(--blu)",fontSize:10}}>↗</a>:"—"}</td>
         <td style={{whiteSpace:"nowrap"}}>{r.status==="unqualified"&&<button className="btn btn-s" style={{fontSize:9,padding:"3px 7px",color:"var(--grn)",borderColor:"rgba(93,168,122,.3)"}} title="Promote to a live Task" onClick={()=>promote(r)}>▲ Promote</button>}{r.status!=="qualified"&&<button className="btn btn-d btn-s" style={{marginLeft:4}} title="Delete from archive" onClick={()=>del("Signal Archive",[r.id],setArchiveRecs)}><I.Trash/></button>}</td>
