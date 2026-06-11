@@ -10,12 +10,15 @@ import { NextResponse } from "next/server";
 //   {
 //     baseId: "appXYZ...",  // Airtable base for this campaign
 //     taskId: "recABC...",  // The Task record ID to update
-//     action: "done" | "skip",  // What the user chose
+//     action: "done" | "skip" | "reopen",  // What the user chose
 //     notes?: "Optional human note"
 //   }
 //
-// Stamps the Task row so it disappears from the chatbot's feed. Does
-// not delete the task — historical state stays in Airtable for audit.
+// done/skip: stamps the Task row so it disappears from the chatbot's
+// feed. Does not delete the task — historical state stays in Airtable.
+// reopen (2026-06-11, Samarth: "revisit tasks even if actioned once"):
+// clears Handled At / Handled As / Handled Notes so the task returns to
+// the pending feed. The chatbot's Handled panel + toast-Undo drive this.
 //
 // Returns: { ok: true, taskId, handledAt }
 //
@@ -57,17 +60,24 @@ export async function POST(request) {
   const { baseId, taskId, action, notes } = body || {};
   if (!baseId) return NextResponse.json({ ok: false, error: "baseId required" }, { status: 400 });
   if (!taskId) return NextResponse.json({ ok: false, error: "taskId required" }, { status: 400 });
-  if (!action || !["done", "skip"].includes(action)) {
-    return NextResponse.json({ ok: false, error: "action must be 'done' or 'skip'" }, { status: 400 });
+  if (!action || !["done", "skip", "reopen"].includes(action)) {
+    return NextResponse.json({ ok: false, error: "action must be 'done', 'skip' or 'reopen'" }, { status: 400 });
   }
 
   const handledAt = new Date().toISOString();
-  const fields = {
-    "Handled At": handledAt,
-    "Handled As": action,
-  };
-  if (notes && typeof notes === "string") {
-    fields["Handled Notes"] = notes.slice(0, 2000); // cap to keep payload sane
+  let fields;
+  if (action === "reopen") {
+    // Clear the handled stamps → task returns to the pending feed. Notes
+    // are cleared too (they described the action being undone).
+    fields = { "Handled At": null, "Handled As": null, "Handled Notes": null };
+  } else {
+    fields = {
+      "Handled At": handledAt,
+      "Handled As": action,
+    };
+    if (notes && typeof notes === "string") {
+      fields["Handled Notes"] = notes.slice(0, 2000); // cap to keep payload sane
+    }
   }
 
   try {
