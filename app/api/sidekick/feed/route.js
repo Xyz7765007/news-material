@@ -59,6 +59,10 @@ function formatCard(record) {
     task_rule: f["Task Rule"] || "",
     source: f.Source || "",
     signal: f.Signal || "",
+    // Full raw post text (linkedin_engagement only; written by /api/linkedin-posts,
+    // capped 3000). The chatbot's "Read full post here" prefers this over the
+    // Signal-derived summary. Empty for legacy tasks created before 2026-06-11.
+    post_text: f["Post Text"] || "",
     score_reason: f["Score Reason"] || "",
     movement_type: f["Movement Type"] || "",
     url: f.URL || f["Post URL"] || f["Signal URL"] || "",

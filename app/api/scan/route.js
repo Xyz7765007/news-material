@@ -63,8 +63,13 @@ function isCreditExhausted(status, body) {
  * Tries each token in order. If one is exhausted, tries the next.
  * Returns { data, usedToken } or { error }.
  */
-async function apifyCallWithFallback(actorId, input, timeoutMs = 480000) {
-  const tokens = getApifyTokens();
+async function apifyCallWithFallback(actorId, input, timeoutMs = 480000, overrideToken = null) {
+  // overrideToken (e.g. an operator's personal Apify token passed in the request)
+  // becomes the SOLE token — no fallback to the server tokens. This is deliberate:
+  // when an operator runs a fetch on their own account (because the shared/server
+  // account is over its cap), a fallback would silently bill the very account they
+  // were trying to avoid. Exhaustion should fail loudly instead.
+  const tokens = overrideToken ? [{ key: "OVERRIDE", token: overrideToken }] : getApifyTokens();
   if (tokens.length === 0) {
     console.log("  [APIFY] No tokens configured");
     return { error: "No APIFY_TOKEN configured", data: null };
@@ -690,8 +695,10 @@ function normCo(s) {
   return (s || "").normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-async function scanJobsBatch(companies, taskDefs, threshold = 50, campaignId = null) {
-  const tokens = getApifyTokens();
+async function scanJobsBatch(companies, taskDefs, threshold = 50, campaignId = null, apifyToken = null) {
+  // apifyToken: optional per-request override (operator's own account). When set
+  // it is the only token used; otherwise fall back to the server tokens.
+  const tokens = apifyToken ? [{ key: "OVERRIDE", token: apifyToken }] : getApifyTokens();
   if (tokens.length === 0) {
     console.log("  [JOBS-BATCH] No Apify tokens configured — skipping");
     return companies.map(c => ({ company: c.name, signals: [] }));
@@ -731,10 +738,10 @@ async function scanJobsBatch(companies, taskDefs, threshold = 50, campaignId = n
     const chunkResults = await Promise.all(chunk.map(async (c) => {
       const cleanName = cleanCompanyName(c.name);
       if (!cleanName) return { c, jobs: [] };
-      let { data, error } = await apifyCallWithFallback(actorId, { urls: [buildUrl(cleanName, true)], ...baseInput }, 240000);
+      let { data, error } = await apifyCallWithFallback(actorId, { urls: [buildUrl(cleanName, true)], ...baseInput }, 240000, apifyToken);
       let jobs = Array.isArray(data) ? data : [];
       if (jobs.length === 0 && !error) {
-        const retry = await apifyCallWithFallback(actorId, { urls: [buildUrl(cleanName, false)], ...baseInput }, 240000);
+        const retry = await apifyCallWithFallback(actorId, { urls: [buildUrl(cleanName, false)], ...baseInput }, 240000, apifyToken);
         jobs = Array.isArray(retry.data) ? retry.data : [];
       }
       console.log(`  [JOBS-BATCH] ${cleanName}: ${jobs.length} jobs fetched`);
@@ -1351,8 +1358,12 @@ export async function POST(request) {
       if (!companies?.length) return NextResponse.json({ error: "No companies provided" }, { status: 400 });
       if (!taskDefs?.length) return NextResponse.json({ error: "No task definitions provided" }, { status: 400 });
 
-      console.log(`\n── Jobs Batch: ${companies.length} companies (threshold: ${threshold}) ──`);
-      const results = await scanJobsBatch(companies, taskDefs, threshold, campaignId);
+      // Optional per-request Apify token override — lets an operator run the
+      // fetch on their OWN Apify account (e.g. when the shared/server account is
+      // over its monthly cap). When present it is the only token used.
+      const apifyToken = typeof body.apifyToken === "string" && body.apifyToken.trim() ? body.apifyToken.trim() : null;
+      console.log(`\n── Jobs Batch: ${companies.length} companies (threshold: ${threshold})${apifyToken ? " [override Apify token]" : ""} ──`);
+      const results = await scanJobsBatch(companies, taskDefs, threshold, campaignId, apifyToken);
       return NextResponse.json({ results, threshold });
     }
 

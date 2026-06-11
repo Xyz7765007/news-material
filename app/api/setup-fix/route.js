@@ -212,6 +212,11 @@ const CAMPAIGN_TABLES = {
     // excluded from the feed yet stay queryable + analytics-clean.
     { name: "Post Date", type: "date", options: { dateFormat: { name: "iso" } } },
     { name: "Archived At", type: "dateTime", options: TZ_ISO },
+    // Full raw post text (capped 3000 chars at write time). The chatbot's
+    // "Read full post here" renders THIS verbatim — Signal only carries the
+    // structured summary + internal scoring, which is not the post
+    // (Samarth 2026-06-11). Written by /api/linkedin-posts at task creation.
+    { name: "Post Text", type: "multilineText" },
     // ─── Side Kick chatbot integration ────────────────────────
     // When a user clicks a CTA in the chatbot, the action endpoint
     // stamps these fields. "Handled At" empty = pending (shows up

@@ -1393,6 +1393,12 @@ async function runLinkedInPostScan({
             "LinkedIn URL": pickLeadField(f, "linkedinUrl"),
             Phone: pickLeadField(f, "phone"),
             Signal: signalParts.join("\n"),
+            // Full raw post text (capped 3000, same cap as the AI prompt input).
+            // The chatbot's "Read full post here" renders THIS — the Signal
+            // field only carries the structured summary + internal scoring,
+            // which is not the post (Samarth 2026-06-11). Auto-heal strips
+            // this field on bases that haven't run setup-fix yet.
+            "Post Text": (sp.post.text || "").slice(0, 3000),
             URL: postUrl,              // canonical post URL field
             "Post URL": postUrl,       // alt name — some schemas use this
             "Signal URL": postUrl,     // alt name — some schemas use this
