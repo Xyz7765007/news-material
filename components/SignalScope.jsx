@@ -155,6 +155,7 @@ export default function SignalScope({ clientMode = false, fixedCampaignId = null
   const [baseConnecting, setBaseConnecting] = useState(false);
   const [baseError, setBaseError] = useState("");
   const [selectedTasks, setSelectedTasks] = useState(new Set());
+  const [deletingTasks, setDeletingTasks] = useState(false);
   const [showExportModal, setShowExportModal] = useState(false);
   const [linkedinAccount, setLinkedinAccount] = useState(null);
   const [outreachStats, setOutreachStats] = useState(null);
@@ -3265,6 +3266,19 @@ Output format (strict JSON, no markdown):
     {selCount>0&&(<div style={{display:"flex",alignItems:"center",gap:10,padding:"8px 14px",background:"var(--acc-d)",border:"1px solid rgba(191,163,90,.3)",borderRadius:8,marginBottom:12}}>
       <span style={{fontSize:11,color:"var(--acc)",fontWeight:600}}>{selCount} selected</span>
       <button className="btn btn-s" style={{fontSize:10,marginLeft:"auto"}} onClick={()=>setShowExportModal(true)}><I.Download/> Export Selected</button>
+      {!clientMode&&<button className="btn btn-d btn-s" style={{fontSize:10}} disabled={deletingTasks} onClick={async()=>{
+        const ids=fTasks.filter(t=>selectedTasks.has(t.id)).map(t=>t.id);
+        if(!ids.length)return;
+        if(!confirm(`Delete ${ids.length} selected task${ids.length===1?"":"s"} permanently from Airtable?\n\nThis cannot be undone. Leads and accounts are untouched — only the task records are removed. A future scan can re-create the same signals.`))return;
+        setDeletingTasks(true);
+        try{
+          await at("delete","Tasks",{recordIds:ids},bid);
+          const gone=new Set(ids);
+          setTasks(p=>p.filter(t=>!gone.has(t.id)));
+          setSelectedTasks(p=>{const n=new Set(p);ids.forEach(id=>n.delete(id));return n});
+        }catch(e){alert("Delete failed: "+e.message);}
+        setDeletingTasks(false);
+      }}>{deletingTasks?"Deleting...":"🗑 Delete Selected"}</button>}
       <button className="btn btn-s" style={{fontSize:10}} onClick={()=>setSelectedTasks(new Set())}>Clear</button>
     </div>)}
 
