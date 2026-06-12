@@ -4,6 +4,7 @@ import { trackOpenAIUsage } from "@/lib/ai-usage";
 import { pickLeadField } from "@/lib/lead-fields";
 import { checkRoleFreshness } from "@/lib/role-freshness";
 import { fetchActiveRelevanceRules } from "@/lib/relevance-rules";
+import { LINKEDIN_CONNECTORS_ENABLED, connectorDisabledResponse } from "@/lib/connector-flags";
 
 // Role-freshness gate: confirm a lead still belongs to the company before we
 // create an engagement task (Kunal, 2026-06-04 — never surface "engage with
@@ -1644,6 +1645,13 @@ export async function POST(request) {
       }
 
       case "scan": {
+        // LinkedIn connectors kill-switch (Kunal's lever — see lib/connector-flags.js).
+        // Only the scan (data-in) action is gated; get_progress/stop_scan/cleanup
+        // stay live so an operator can still observe and halt any in-flight run.
+        if (!LINKEDIN_CONNECTORS_ENABLED) {
+          console.warn("[CONNECTOR-FLAG] LinkedIn connectors OFF — blocked linkedin-posts scan");
+          return NextResponse.json(connectorDisabledResponse("connectors"), { status: 403 });
+        }
         // Kick off a scan. This is a long-running op (can take several minutes for large campaigns).
         // Vercel has a 60s limit on Hobby, 300s on Pro — so we process as much as we can within the
         // budget, leaving progress state. User hits "resume" to continue.
@@ -1762,6 +1770,14 @@ export async function GET(request) {
 
   if (!baseId || !campaignAirtableId) {
     return NextResponse.json({ error: "base and campaign query params required" }, { status: 400 });
+  }
+
+  // LinkedIn connectors kill-switch (Kunal's lever — see lib/connector-flags.js).
+  // This GET is the cron-driven scan RESUME; pause it with the connector family
+  // so a previously-started scan isn't kept alive by cron-job.org while OFF.
+  if (!LINKEDIN_CONNECTORS_ENABLED) {
+    console.warn("[CONNECTOR-FLAG] LinkedIn connectors OFF — blocked linkedin-posts cron resume");
+    return NextResponse.json(connectorDisabledResponse("connectors"), { status: 403 });
   }
 
   try {

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import { trackOpenAIUsage } from "@/lib/ai-usage";
+import { LINKEDIN_DMS_ENABLED, connectorDisabledResponse } from "@/lib/connector-flags";
 
 export const dynamic = "force-dynamic";
 export const fetchCache = "force-no-store";
@@ -1775,6 +1776,29 @@ export async function POST(request) {
 
     if (!UNIPILE_DSN || !UNIPILE_KEY) {
       return NextResponse.json({ error: "UNIPILE_DSN and UNIPILE_API_KEY environment variables required. Click Test Unipile Connection for diagnostics." }, { status: 400 });
+    }
+
+    // ─── LinkedIn DMs kill-switch (Kunal's lever — see lib/connector-flags.js) ──
+    // Every action that QUEUES or SENDS a LinkedIn connection request or DM is
+    // blocked when LINKEDIN_DMS_ENABLED !== "true". This single gate covers the
+    // manual UI sends AND the 4-hourly outreach cron (it routes its sends back
+    // through this route as action:"process_queue"). Read-only / diagnostic
+    // actions (list_*, get_*, check_replies, preview_*, classify/reclassify reply,
+    // get_auth_link, *_account, record_manual_* logging) stay live so the UI and
+    // reply-tracking keep working while sending is paused.
+    const DM_SEND_ACTIONS = new Set([
+      "enqueue_leads",
+      "send_invitation",
+      "send_message",
+      "send_connection_with_note",
+      "quick_send_connection",
+      "send_manual_connections",
+      "trigger_manual_dms",
+      "process_queue",
+    ]);
+    if (DM_SEND_ACTIONS.has(action) && !LINKEDIN_DMS_ENABLED) {
+      console.warn(`[CONNECTOR-FLAG] LinkedIn DMs OFF — blocked outreach action "${action}"`);
+      return NextResponse.json(connectorDisabledResponse("dms"), { status: 403 });
     }
 
     switch (action) {

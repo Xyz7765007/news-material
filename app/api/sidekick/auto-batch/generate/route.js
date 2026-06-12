@@ -8,6 +8,7 @@ import {
   deriveNames,
 } from "@/lib/message-merge.js";
 import { buildLeadBrief, briefToPromptBlock, briefToUiBullets } from "@/lib/lead-brief.js";
+import { LINKEDIN_DMS_ENABLED, connectorDisabledResponse } from "@/lib/connector-flags.js";
 import { fetchPreferences } from "@/app/api/sidekick/preferences/route.js";
 
 // ═══════════════════════════════════════════════════════════════════
@@ -543,6 +544,13 @@ Generate the 4 messages following ALL rules above. Cite ONLY from PUBLIC FACTS. 
 export async function POST(request) {
   if (!authOk(request)) {
     return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+  }
+  // LinkedIn DMs kill-switch (Kunal's lever — see lib/connector-flags.js).
+  // This route AI-generates the connection note + DM sequence for the chatbot
+  // auto-batch, so it is part of the "LinkedIn DMs" family and is paused with it.
+  if (!LINKEDIN_DMS_ENABLED) {
+    console.warn("[CONNECTOR-FLAG] LinkedIn DMs OFF — blocked auto-batch generate");
+    return NextResponse.json(connectorDisabledResponse("dms"), { status: 403 });
   }
   if (!AIRTABLE_KEY) {
     return NextResponse.json({ ok: false, error: "AIRTABLE_API_KEY missing" }, { status: 500 });
