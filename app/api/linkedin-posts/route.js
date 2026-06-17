@@ -1771,11 +1771,18 @@ export async function POST(request) {
         // Accepts EITHER { baseId, leadId } OR a raw { urn } (Kunal Jun16
         // engagement-count verification — lets us confirm the provider's real
         // like/comment field names against any known URN without a lead row).
-        const { baseId, leadId, urn: rawUrn } = body;
+        const { baseId, leadId, urn: rawUrn, username } = body;
         let urn = rawUrn;
         let cached = false;
+        // Resolve a bare { username } (e.g. "williamhgates") → URN via the
+        // profile endpoint, so field-name verification needs no lead row.
+        if (!urn && username) {
+          const pr = await rapidCall("/api/v1/user/profile", { username });
+          urn = pr.data?.data?.urn || pr.data?.urn || pr.data?.data?.profile?.urn || null;
+          if (!urn) return NextResponse.json({ ok: false, error: `No URN for username ${username}`, raw: JSON.stringify(pr.data).slice(0, 300) });
+        }
         if (!urn) {
-          if (!baseId || !leadId) return NextResponse.json({ error: "Provide either { urn } or { baseId, leadId }" }, { status: 400 });
+          if (!baseId || !leadId) return NextResponse.json({ error: "Provide { username }, { urn }, or { baseId, leadId }" }, { status: 400 });
           const lead = await atGet(baseId, "Leads", leadId);
           if (!lead) return NextResponse.json({ error: "Lead not found" }, { status: 404 });
           const urnResult = await getUrnForLead(lead, baseId);
