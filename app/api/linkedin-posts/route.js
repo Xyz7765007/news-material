@@ -301,6 +301,47 @@ async function getUrnForLead(lead, baseId) {
   return { urn, username };
 }
 
+// Extract an engagement count (likes/comments/reposts) from a provider post
+// object. Field names vary across the RapidAPI schema, so we check a wide set
+// of candidates incl. nested social-count objects. Returns an INTEGER when a
+// real value is present, or NULL when the provider didn't give us one — we
+// deliberately do NOT default to 0, because a false "0 comments" reads as a
+// real signal to the operator (Kunal Jun16: "zero comments tells me
+// something"). Null = "no data, hide it"; 0 = "genuinely zero".
+function extractCount(p, kind) {
+  if (!p || typeof p !== "object") return null;
+  const keysByKind = {
+    likes: ["total_reactions", "reaction_counter", "reactions_count", "reactionsCount",
+            "num_likes", "numLikes", "likes_count", "likesCount", "like_count", "likes",
+            "totalReactionCount", "num_reactions", "reactions"],
+    comments: ["comment_counter", "comments_count", "commentsCount", "num_comments",
+               "numComments", "comment_count", "comments"],
+    reposts: ["repost_counter", "reposts_count", "repostsCount", "num_reposts",
+              "numReposts", "shares_count", "share_count", "reposts", "shares"],
+  };
+  const nested = [p.social_counts, p.socialCounts, p.engagement, p.stats,
+                  p.activity_counts, p.social_detail, p.socialDetail, p.counts];
+  const toInt = (v) => {
+    if (typeof v === "number" && Number.isFinite(v)) return Math.round(v);
+    if (typeof v === "string" && /^\d+$/.test(v.trim())) return parseInt(v.trim(), 10);
+    return null;
+  };
+  for (const k of keysByKind[kind] || []) {
+    // `reactions`/`comments` can be an array of items rather than a count
+    if (Array.isArray(p[k])) return p[k].length;
+    const n = toInt(p[k]);
+    if (n !== null) return n;
+    for (const obj of nested) {
+      if (obj && typeof obj === "object") {
+        if (Array.isArray(obj[k])) return obj[k].length;
+        const nn = toInt(obj[k]);
+        if (nn !== null) return nn;
+      }
+    }
+  }
+  return null;
+}
+
 // Fetch posts for a URN. Paginates until we hit a post older than cutoff, collect N recent posts,
 // OR we exhaust pages. maxPosts caps how many we keep.
 //
@@ -395,9 +436,9 @@ async function fetchPostsForUrn(urn, cutoffMs, maxPages = 3, maxPosts = 2) {
             date: new Date().toISOString(), // best guess: now
             url: p.post_url || p.url || p.share_url || "",
             urn: p.urn || p.post_urn || p.activity_urn || "",
-            likes: p.total_reactions || p.likes_count || p.likes || 0,
-            comments: p.comments_count || p.comments || 0,
-            reposts: p.reposts_count || p.reposts || 0,
+            likes: extractCount(p, "likes"),
+            comments: extractCount(p, "comments"),
+            reposts: extractCount(p, "reposts"),
             is_repost: !!(p.reshared || p.is_repost || p.reposted_post),
             _undated: true, // flag so we know this one's date is a guess
           });
@@ -425,9 +466,9 @@ async function fetchPostsForUrn(urn, cutoffMs, maxPages = 3, maxPosts = 2) {
         date: new Date(ts).toISOString(),
         url: p.post_url || p.url || p.share_url || "",
         urn: p.urn || p.post_urn || p.activity_urn || "",
-        likes: p.total_reactions || p.likes_count || p.likes || 0,
-        comments: p.comments_count || p.comments || 0,
-        reposts: p.reposts_count || p.reposts || 0,
+        likes: extractCount(p, "likes"),
+        comments: extractCount(p, "comments"),
+        reposts: extractCount(p, "reposts"),
         is_repost: !!(p.reshared || p.is_repost || p.reposted_post),
       });
 
@@ -1382,6 +1423,15 @@ async function runLinkedInPostScan({
           sp.sanity_flags?.length ? `   • Sanity flags: ${sp.sanity_flags.join(", ")}` : null,
         ].filter(v => v !== null && v !== undefined);
 
+        // Engagement counts (Kunal Jun16) — surfaced on the chatbot card so the
+        // exec sees traction (likes/comments) before deciding to engage. Only
+        // written when the provider actually returned a number; null is omitted
+        // so the card can distinguish "no data" from a genuine 0. Columns are
+        // auto-stripped by atCreateBatch on bases that haven't run setup-fix.
+        const engagementFields = {};
+        if (typeof sp.post.likes === "number") engagementFields["Post Likes"] = sp.post.likes;
+        if (typeof sp.post.comments === "number") engagementFields["Post Comments"] = sp.post.comments;
+
         return {
           fields: {
             Name: leadName,
@@ -1393,6 +1443,7 @@ async function runLinkedInPostScan({
             Email: pickLeadField(f, "email"),
             "LinkedIn URL": pickLeadField(f, "linkedinUrl"),
             Phone: pickLeadField(f, "phone"),
+            ...engagementFields,
             Signal: signalParts.join("\n"),
             // Full raw post text (capped 3000, same cap as the AI prompt input).
             // The chatbot's "Read full post here" renders THIS — the Signal
@@ -1716,16 +1767,36 @@ export async function POST(request) {
       }
 
       case "test_profile": {
-        // Debug: fetch a single lead's URN + first page of posts without scoring
-        const { baseId, leadId } = body;
-        if (!baseId || !leadId) return NextResponse.json({ error: "baseId and leadId required" }, { status: 400 });
-        const lead = await atGet(baseId, "Leads", leadId);
-        if (!lead) return NextResponse.json({ error: "Lead not found" }, { status: 404 });
-        const urnResult = await getUrnForLead(lead, baseId);
-        if (urnResult.error) return NextResponse.json({ ok: false, error: urnResult.error });
+        // Debug: fetch a single lead's URN + first page of posts without scoring.
+        // Accepts EITHER { baseId, leadId } OR a raw { urn } (Kunal Jun16
+        // engagement-count verification — lets us confirm the provider's real
+        // like/comment field names against any known URN without a lead row).
+        const { baseId, leadId, urn: rawUrn } = body;
+        let urn = rawUrn;
+        let cached = false;
+        if (!urn) {
+          if (!baseId || !leadId) return NextResponse.json({ error: "Provide either { urn } or { baseId, leadId }" }, { status: 400 });
+          const lead = await atGet(baseId, "Leads", leadId);
+          if (!lead) return NextResponse.json({ error: "Lead not found" }, { status: 404 });
+          const urnResult = await getUrnForLead(lead, baseId);
+          if (urnResult.error) return NextResponse.json({ ok: false, error: urnResult.error });
+          urn = urnResult.urn;
+          cached = !!urnResult.cached;
+        }
         const cutoffMs = Date.now() - (7 * 86400000);
-        const posts = await fetchPostsForUrn(urnResult.urn, cutoffMs, 1);
-        return NextResponse.json({ ok: true, urn: urnResult.urn, cached: !!urnResult.cached, posts });
+        const posts = await fetchPostsForUrn(urn, cutoffMs, 1);
+        // Echo the RAW first-post keys + a preview so we can confirm which field
+        // carries reactions/comments (the scan logs this too, but this is easier).
+        let raw_first_post_keys = null, raw_first_post_preview = null;
+        try {
+          const rr = await rapidCall("/api/v1/user/posts", { urn, page: "1" });
+          const fp = rr.data?.data?.posts?.[0] || (Array.isArray(rr.data?.data) ? rr.data.data[0] : null) || rr.data?.posts?.[0] || (Array.isArray(rr.data) ? rr.data[0] : null);
+          if (fp && typeof fp === "object") {
+            raw_first_post_keys = Object.keys(fp).slice(0, 40);
+            raw_first_post_preview = JSON.stringify(fp).slice(0, 1200);
+          }
+        } catch {}
+        return NextResponse.json({ ok: true, urn, cached, posts, raw_first_post_keys, raw_first_post_preview });
       }
 
       default:

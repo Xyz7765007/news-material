@@ -217,6 +217,11 @@ const CAMPAIGN_TABLES = {
     // structured summary + internal scoring, which is not the post
     // (Samarth 2026-06-11). Written by /api/linkedin-posts at task creation.
     { name: "Post Text", type: "multilineText" },
+    // Engagement counts on the underlying LinkedIn post (Kunal Jun16).
+    // Written by /api/linkedin-posts when the provider returns them; surfaced
+    // on the chatbot card so the exec sees traction before engaging.
+    { name: "Post Likes", type: "number", options: { precision: 0 } },
+    { name: "Post Comments", type: "number", options: { precision: 0 } },
     // ─── Side Kick chatbot integration ────────────────────────
     // When a user clicks a CTA in the chatbot, the action endpoint
     // stamps these fields. "Handled At" empty = pending (shows up

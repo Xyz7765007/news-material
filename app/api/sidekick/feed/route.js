@@ -63,6 +63,11 @@ function formatCard(record) {
     // capped 3000). The chatbot's "Read full post here" prefers this over the
     // Signal-derived summary. Empty for legacy tasks created before 2026-06-11.
     post_text: f["Post Text"] || "",
+    // Engagement counts on the underlying post (Kunal Jun16). Numbers (incl. 0)
+    // when the scan captured them; null when not, so the card can hide the
+    // metric rather than show a misleading 0. linkedin_engagement tasks only.
+    post_likes: typeof f["Post Likes"] === "number" ? f["Post Likes"] : null,
+    post_comments: typeof f["Post Comments"] === "number" ? f["Post Comments"] : null,
     score_reason: f["Score Reason"] || "",
     movement_type: f["Movement Type"] || "",
     url: f.URL || f["Post URL"] || f["Signal URL"] || "",
