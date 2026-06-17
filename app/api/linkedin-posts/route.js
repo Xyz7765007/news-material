@@ -1500,6 +1500,46 @@ async function runLinkedInPostScan({
       }
     }
 
+    // ── Non-qualified retention (Samarth 2026-06-17, no-slippage) ──────────
+    // Sub-threshold scored posts (real posts the AI scored below the engagement
+    // bar) → Signal Archive as "unqualified" so nothing is dropped; they show in
+    // Signal Review for human triage. Best-effort (wrapped — NEVER breaks the
+    // scan). Floor keeps out pure category-noise (holiday/award/etc.). Default
+    // ON; disable with LINKEDIN_SUBTHRESHOLD_ARCHIVE=false, tune LINKEDIN_RETAIN_FLOOR.
+    try {
+      const ARCHIVE_ON = process.env.LINKEDIN_SUBTHRESHOLD_ARCHIVE !== "false";
+      const RETAIN_FLOOR = parseInt(process.env.LINKEDIN_RETAIN_FLOOR) || 40;
+      const isTaskWorthy = sp => sp.adjusted_score >= scoreThreshold && VALID_TASK_POST_TYPES.has(sp.post_type) && !NEVER_TASK_CATEGORIES.has(sp.category);
+      const nonQual = ARCHIVE_ON ? scoredPosts.filter(sp => !isTaskWorthy(sp) && sp.adjusted_score >= RETAIN_FLOOR) : [];
+      if (nonQual.length) {
+        const todayStr2 = new Date().toISOString().slice(0, 10);
+        const nowISO2 = new Date().toISOString();
+        const archRecords = nonQual.map(sp => {
+          const postUrl = sp.post.url || "";
+          const eng = {};
+          if (typeof sp.post.likes === "number") eng["Post Likes"] = sp.post.likes;
+          if (typeof sp.post.comments === "number") eng["Post Comments"] = sp.post.comments;
+          const postDateStr = (() => { const d = new Date(sp.post.date || nowISO2); return isNaN(d.getTime()) ? todayStr2 : d.toISOString().slice(0, 10); })();
+          return { fields: {
+            Name: leadName, Company: leadCompany, "Task Rule": taskRuleName,
+            "Signal Status": "unqualified", Score: sp.adjusted_score, "Scan Target": leadName,
+            "Lead Title": pickLeadField(f, "title"), Email: pickLeadField(f, "email"),
+            "LinkedIn URL": pickLeadField(f, "linkedinUrl"), ...eng,
+            Signal: [postUrl ? `🔗 ${postUrl}` : null, `📝 ${sp.structured_sentence}`, ``, `💬 Suggested comment: ${sp.suggested_comment}`, ``, `🔍 Evidence: "${sp.evidence_quote}"`, ``, `💡 ${sp.rationale}`, ``, `📊 Score ${sp.adjusted_score}/100 (below ${scoreThreshold} bar) · type ${sp.post_type} · category ${sp.category}`].filter(v => v !== null).join("\n"),
+            "Post Text": (sp.post.text || "").slice(0, 3000),
+            "Score Reason": `below_threshold ${sp.adjusted_score} (cat ${sp.category}, type ${sp.post_type})`,
+            URL: postUrl, "Post URL": postUrl, "Signal URL": postUrl,
+            Source: "LinkedIn Posts (RapidAPI)", "Task Type": "linkedin_engagement",
+            "Post Date": postDateStr, Date: todayStr2, Created: nowISO2,
+          } };
+        });
+        const { results: arch } = await atCreateBatch(baseId, "Signal Archive", archRecords);
+        progress.subthreshold_archived = (progress.subthreshold_archived || 0) + (arch?.length || 0);
+      }
+    } catch (e) {
+      progress.errors.push(`⚠️ sub-threshold archive (non-fatal) ${leadName}: ${String(e.message).slice(0, 120)}`);
+    }
+
     progress.completed_lead_ids.push(lead.id);
     progress.leads_done++;
     progress.leads_remaining--;
