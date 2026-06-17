@@ -865,9 +865,9 @@ async function scorePost({ post, lead, campaignContext, systemPromptOverride, ca
 
   try {
     const c = await openai.chat.completions.create({
-      // Upgraded from gpt-5.4-mini 2026-06-10 (Samarth): full gpt-5.4 for
-      // post engagement scoring — fewer mis-bucketed/fluff-scored posts.
-      model: "gpt-5.4",
+      // 2026-06-10 upgraded mini→gpt-5.4 for post scoring; 2026-06-17 reverted to
+      // mini (default) for cost — Samarth. Override via LINKEDIN_SCORING_MODEL env.
+      model: process.env.LINKEDIN_SCORING_MODEL || "gpt-5.4-mini",
       temperature: 0.1, // very low — we want consistency, not creativity
       max_completion_tokens: 500,
       response_format: { type: "json_object" },

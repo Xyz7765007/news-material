@@ -433,6 +433,14 @@ const SIGNAL_RETAIN_FLOOR = (() => {
   return Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : 40;
 })();
 
+// News + jobs scoring model. Default gpt-5.4-mini (Samarth 2026-06-17: gpt-5.4
+// was too expensive at fleet scale — ~3.3x mini's cost). Override without a
+// redeploy by setting SCAN_SCORING_MODEL in the Vercel env (e.g. back to
+// "gpt-5.4" if mini's noise discrimination proves too weak; the slip-proof
+// guards — FINANCE_NOISE_RE, headline-only protocol, one-rule-per-article —
+// stay in effect regardless of model).
+const SCAN_SCORING_MODEL = process.env.SCAN_SCORING_MODEL || "gpt-5.4-mini";
+
 function filterRecent(items) {
   const cutoff = Date.now() - MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
   return items.filter(item => {
@@ -1054,9 +1062,10 @@ ${reviewerFeedback}
 
 ${signalBlock}`;
       const c = await getOpenAI().chat.completions.create({
-        // Upgraded from gpt-5.4-mini 2026-06-10 (Samarth): mini was missing /
-        // under-scoring real signals; full gpt-5.4 for news + jobs scoring.
-        model: "gpt-5.4",
+        // 2026-06-10 upgraded gpt-5.4-mini → gpt-5.4 for noise discrimination;
+        // 2026-06-17 reverted to mini (default) for cost — Samarth. Toggle via
+        // SCAN_SCORING_MODEL env (see const def near top).
+        model: SCAN_SCORING_MODEL,
         // Temperature 0 = deterministic. Was 0.15 which caused 5-10 point score
         // variance run-to-run — the difference between "above threshold" and
         // "dropped" for borderline signals. User reported 1 vs 37 signals across
