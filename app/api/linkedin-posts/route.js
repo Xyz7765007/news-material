@@ -316,11 +316,14 @@ function extractCount(p, kind) {
             "totalReactionCount", "num_reactions", "reactions"],
     comments: ["comment_counter", "comments_count", "commentsCount", "num_comments",
                "numComments", "comment_count", "comments"],
-    reposts: ["repost_counter", "reposts_count", "repostsCount", "num_reposts",
+    reposts: ["num_shares", "repost_counter", "reposts_count", "repostsCount", "num_reposts",
               "numReposts", "shares_count", "share_count", "reposts", "shares"],
   };
-  const nested = [p.social_counts, p.socialCounts, p.engagement, p.stats,
-                  p.activity_counts, p.social_detail, p.socialDetail, p.counts];
+  // fresh-linkedin-scraper-api nests the counts under `activity`
+  // (activity.num_likes / num_comments / num_shares — verified 2026-06-17).
+  // Keep the other names as fallbacks in case the provider schema shifts.
+  const nested = [p.activity, p.content, p.social_counts, p.socialCounts, p.engagement,
+                  p.stats, p.activity_counts, p.social_detail, p.socialDetail, p.counts];
   const toInt = (v) => {
     if (typeof v === "number" && Number.isFinite(v)) return Math.round(v);
     if (typeof v === "string" && /^\d+$/.test(v.trim())) return parseInt(v.trim(), 10);
