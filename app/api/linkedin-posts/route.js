@@ -1795,15 +1795,21 @@ export async function POST(request) {
         // Echo the RAW first-post keys + a preview so we can confirm which field
         // carries reactions/comments (the scan logs this too, but this is easier).
         let raw_first_post_keys = null, raw_first_post_preview = null;
+        let raw_first_post_activity = null, raw_first_post_content_keys = null, raw_first_post_social = null;
         try {
           const rr = await rapidCall("/api/v1/user/posts", { urn, page: "1" });
           const fp = rr.data?.data?.posts?.[0] || (Array.isArray(rr.data?.data) ? rr.data.data[0] : null) || rr.data?.posts?.[0] || (Array.isArray(rr.data) ? rr.data[0] : null);
           if (fp && typeof fp === "object") {
             raw_first_post_keys = Object.keys(fp).slice(0, 40);
             raw_first_post_preview = JSON.stringify(fp).slice(0, 1200);
+            // Engagement counts likely live in the nested `activity` (and maybe
+            // `content`) object — surface them verbatim for field-name verification.
+            raw_first_post_activity = fp.activity ?? null;
+            raw_first_post_content_keys = fp.content && typeof fp.content === "object" ? Object.keys(fp.content).slice(0, 30) : null;
+            raw_first_post_social = fp.social_counts ?? fp.socialCounts ?? fp.stats ?? fp.engagement ?? null;
           }
         } catch {}
-        return NextResponse.json({ ok: true, urn, cached, posts, raw_first_post_keys, raw_first_post_preview });
+        return NextResponse.json({ ok: true, urn, cached, posts, raw_first_post_keys, raw_first_post_preview, raw_first_post_activity, raw_first_post_content_keys, raw_first_post_social });
       }
 
       default:
