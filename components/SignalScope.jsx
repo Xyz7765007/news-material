@@ -3387,6 +3387,17 @@ Output format (strict JSON, no markdown):
       }catch(e){alert("Role check error: "+e.message);}
       setSrVerifying(false);
     };
+    // Export CSV — downloads the CURRENT view (every active filter incl. status
+    // applied; full set, not the 400-row render cap). Client-side blob, no deps.
+    const exportCsv=()=>{
+      const cols=[["Status","status"],["Company","company"],["Campaign Tag","campaignTag"],["Name","name"],["Lead Title","leadTitle"],["Role Status","roleStatus"],["Score","score"],["Type","type"],["Task Rule","rule"],["Signal","signal"],["Score Reason","reason"],["Owner","assignedTo"],["Source","source"],["Date","date"],["Created","created"],["URL","url"]];
+      const esc=v=>{const s=String(v??"").replace(/"/g,'""');return /[",\n\r]/.test(s)?`"${s}"`:s;};
+      const csv="﻿"+cols.map(c=>c[0]).join(",")+"\n"+rows.map(r=>cols.map(c=>esc(r[c[1]])).join(",")).join("\n");
+      const blob=new Blob([csv],{type:"text/csv;charset=utf-8;"});
+      const a=document.createElement("a");a.href=URL.createObjectURL(blob);
+      a.download=`signal-review-${(camp?.id||camp?.name||"export").toString().toLowerCase().replace(/[^a-z0-9]+/g,"-")}-${new Date().toISOString().slice(0,10)}.csv`;
+      document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+    };
     // Group-by rollup — answers "what are we tracking / what came in per account / lead-owner / rule / type".
     const gk=F("group");
     const groupOf=r=>gk==="account"?(r.company||"(none)"):gk==="person"?(r.assignedTo||"(unassigned)"):gk==="rule"?(r.rule||"(none)"):gk==="type"?(r.type||"news"):null;
@@ -3398,6 +3409,7 @@ Output format (strict JSON, no markdown):
         <button className="btn btn-s btn-p" onClick={verifyRoles} disabled={srVerifying} title="Check that lead-level LinkedIn results in view are still in the role we think — flags 'no longer CMO' before an SDR engages">{srVerifying?"⏳ Verifying…":"🛡 Verify roles"}</button>
         <button className="btn btn-s" onClick={loadSignalArchive} disabled={archiveLoading}>{archiveLoading?"⏳ Loading…":"↻ Refresh"}</button>
         <button className="btn btn-s btn-d" onClick={purgeOldArchive} disabled={srPurging||!archiveRecs?.length} title={`Delete archived results older than ${ARCHIVE_RETAIN_DAYS} days`}>{srPurging?"⏳":`🧹 Clear >${ARCHIVE_RETAIN_DAYS}d`}</button>
+        <button className="btn btn-s" onClick={exportCsv} disabled={!rows.length} title="Download the current view (all active filters applied) as a CSV">⬇ Export CSV <span style={{opacity:.7,marginLeft:4,fontFamily:"'JetBrains Mono',monospace"}}>{rows.length}</span></button>
       </div></div>
 
       {/* Cross-map summary — answers "what are we tracking, what came in" at a glance */}
