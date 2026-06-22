@@ -74,6 +74,10 @@ function formatCard(record) {
     account_id: f["Account ID"] || "",
     event_id: f["Event ID"] || "",
     created_at: f.Created || f.Date || "",
+    // The underlying LinkedIn post's publish date (linkedin_engagement only).
+    // Drives client-side freshness-weighted prioritization (Kunal 2026-06-19:
+    // a post from today should outrank a 6-day-old one, modulated by seniority).
+    post_date: f["Post Date"] || "",
   };
 }
 

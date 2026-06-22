@@ -39,6 +39,13 @@ export async function GET(request) {
   if (!baseId) {
     return NextResponse.json({ ok: false, error: "baseId query param required" }, { status: 400 });
   }
+  // Optional task-type scope so the chatbot's badge counts ONLY the task types
+  // the queue actually shows. The queue currently renders linkedin_engagement
+  // only (FEATURES.otherCards off), so a global count would overstate "tasks
+  // left" vs the visible queue. Whitelist to [a-z_] so it can't break the
+  // filterByFormula string literal.
+  const taskTypeRaw = url.searchParams.get("taskType") || "";
+  const taskType = /^[a-z_]+$/.test(taskTypeRaw) ? taskTypeRaw : "";
 
   // Same filter as /feed (see comments there) — keeps badge consistent.
   // Time-sensitive types (engagement, linkedin_engagement, lead_movement) age
@@ -46,9 +53,15 @@ export async function GET(request) {
   // ALSO ages out by the underlying post's publish date ({Post Date}); archived
   // tasks ({Archived At} set) are excluded. (2026-06-09 post-freshness gate.)
   const POST_DATE_GATE = `NOT(AND(FIND("linkedin_engagement", {Task Type}), NOT({Post Date} = BLANK()), NOT(IS_AFTER({Post Date}, DATEADD(NOW(), -7, 'days')))))`;
-  const PENDING_FILTER = `AND({Handled At} = BLANK(), {Archived At} = BLANK(), {LinkedIn URL} != BLANK(), ${POST_DATE_GATE}, OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
+  let PENDING_FILTER = `AND({Handled At} = BLANK(), {Archived At} = BLANK(), {LinkedIn URL} != BLANK(), ${POST_DATE_GATE}, OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
   // Legacy fallback for bases that haven't run setup-fix (no Post Date/Archived At).
-  const LEGACY_PENDING_FILTER = `AND({Handled At} = BLANK(), {LinkedIn URL} != BLANK(), OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
+  let LEGACY_PENDING_FILTER = `AND({Handled At} = BLANK(), {LinkedIn URL} != BLANK(), OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
+  // Scope to one task type when requested (keeps the badge == the visible queue).
+  if (taskType) {
+    const typeClause = `FIND("${taskType}", {Task Type})`;
+    PENDING_FILTER = `AND(${PENDING_FILTER}, ${typeClause})`;
+    LEGACY_PENDING_FILTER = `AND(${LEGACY_PENDING_FILTER}, ${typeClause})`;
+  }
 
   // ─── Universal relevance feedback (2026-06-09) ────────────────────
   // Fold the SAME suppression clause the feed uses into both filters so the

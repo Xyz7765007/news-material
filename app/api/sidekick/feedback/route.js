@@ -50,7 +50,13 @@ const SIDEKICK_API_KEY = process.env.SIDEKICK_API_KEY;
 const AT_API = "https://api.airtable.com/v0";
 
 const FEEDBACK_TABLE = "Sidekick Feedback";
-const VALID_ITEM_TYPES = ["comment", "connection_note", "dm"];
+// comment / connection_note / dm are STYLE feedback read back as generation
+// prefs (see /api/sidekick/preferences). task_feedback is the operator telling
+// the per-post chatbot something about the TASK/feed ("not relevant", "too
+// junior"). It is captured durably but deliberately NOT in the style-pref
+// taxonomy — the preferences reader whitelists the three style types, so
+// task_feedback can never leak into comment/DM generation.
+const VALID_ITEM_TYPES = ["comment", "connection_note", "dm", "task_feedback"];
 
 function authOk(request) {
   if (!SIDEKICK_API_KEY) return false;
@@ -64,6 +70,7 @@ function normalizeItemType(raw) {
   if (t === "dm" || /^dm\s*[123]$/.test(t) || /^dm[123]$/.test(t)) return "dm";
   if (t === "connection_note" || t === "connection note") return "connection_note";
   if (t === "comment") return "comment";
+  if (t === "task_feedback" || t === "task feedback") return "task_feedback";
   return null;
 }
 
