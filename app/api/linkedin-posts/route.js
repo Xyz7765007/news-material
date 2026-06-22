@@ -35,6 +35,11 @@ const MASTER_BASE_ID = process.env.AIRTABLE_BASE_ID;
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
 const RAPIDAPI_HOST = "fresh-linkedin-scraper-api.p.rapidapi.com";
+// Provider-degradation guard: a streak of leads that ALL return zero raw posts is
+// the signature of a transient fresh-linkedin-scraper-api hiccup (soft-empty 200s),
+// not genuine "no posts". Pause the scan rather than silently mark them done.
+// See .learnings/2026-06-22-linkedin-posts-silent-zero-fetch.md.
+const EMPTY_RAW_STREAK_LIMIT = parseInt(process.env.LINKEDIN_EMPTY_STREAK_LIMIT || "12", 10);
 
 const atHdr = { Authorization: `Bearer ${AIRTABLE_KEY}`, "Content-Type": "application/json" };
 
@@ -1093,6 +1098,7 @@ async function runLinkedInPostScan({
     posts_filtered_out: prior?.posts_filtered_out || 0,
     posts_deduped: prior?.posts_deduped || 0,
     tasks_created: prior?.tasks_created || 0,
+    consecutive_empty_raw: prior?.consecutive_empty_raw || 0,
     errors: prior?.errors || [],
     completed_lead_ids: Array.from(completedLeadIds),
     // Scan config persisted so external cron resume knows how to call runLinkedInPostScan
@@ -1224,6 +1230,39 @@ async function runLinkedInPostScan({
     }
     if (postsResult.rawReturnedCount) {
       progress.posts_raw_returned = (progress.posts_raw_returned || 0) + postsResult.rawReturnedCount;
+    }
+
+    // ── Provider-degradation guard ──────────────────────────────────────────
+    // rawReturnedCount > 0 means the provider DID return this lead's posts (even
+    // if none are inside the N-day window) → provider is healthy, reset streak.
+    // rawReturnedCount === 0 means the provider returned nothing — either a genuine
+    // no-posts profile OR a soft-empty/rate-limited 200. A long STREAK of these is
+    // the degradation signature (see 2026-06-22 learning): without this guard the
+    // scan silently marks active leads done forever. On trip: roll the streak back
+    // (so Resume re-attempts them once the provider recovers) and pause with an error.
+    if (postsResult.rawReturnedCount > 0) {
+      progress.consecutive_empty_raw = 0;
+    } else {
+      progress.consecutive_empty_raw = (progress.consecutive_empty_raw || 0) + 1;
+      if (progress.consecutive_empty_raw >= EMPTY_RAW_STREAK_LIMIT) {
+        // The prior (LIMIT-1) empty leads were already marked completed; the current
+        // lead hasn't been yet. Roll back the marked ones so none are falsely skipped.
+        const rollback = Math.min(EMPTY_RAW_STREAK_LIMIT - 1, progress.completed_lead_ids.length);
+        if (rollback > 0) {
+          progress.completed_lead_ids.splice(progress.completed_lead_ids.length - rollback, rollback);
+          progress.leads_done = Math.max(0, progress.leads_done - rollback);
+          progress.leads_remaining += rollback;
+        }
+        progress.consecutive_empty_raw = 0;
+        progress.status = "error";
+        progress.phase = "done";
+        progress.error_kind = "provider_empty_streak";
+        progress.last_log = `⚠️ Provider returned ${EMPTY_RAW_STREAK_LIMIT} consecutive empty post responses — likely a transient fresh-linkedin-scraper-api degradation, not real "no posts". Paused so these leads aren't falsely skipped; rolled back ${rollback} for retry. Hit Resume once it recovers.`;
+        progress.errors.push(`Provider-degradation guard: ${EMPTY_RAW_STREAK_LIMIT} consecutive zero-raw-post leads, rolled back ${rollback} for retry.`);
+        progress.ended_at = new Date().toISOString();
+        await writeProgress(campaignAirtableId, progress);
+        return progress;
+      }
     }
 
     if (fetchedPosts.length === 0) {
