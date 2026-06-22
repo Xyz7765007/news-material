@@ -35,17 +35,31 @@ Net: any transient provider hiccup during a multi-hour scan silently zeroes a ch
 of leads and marks them done forever. Same null outcome as a stall, harder to detect
 (it "completes").
 
-## Recommended fix (needs Samarth ship-it — not yet built)
-Mirror the AI-outage guard pattern already in `scan-run`:
-- Track consecutive leads with `rawReturnedCount === 0`. If it crosses a threshold
-  (e.g. 8–10 in a row), treat as **provider degradation**: set `status:"error"` +
-  message and PAUSE (do not mark the streak's leads done), so Resume retries them
-  when the provider recovers — instead of blazing through all 4973 recording zeros.
-- Optionally: in `rapidCall`, detect soft-failure 200 bodies (`success===false`,
-  `data==null`, message contains "denied"/"rate") and return `{ok:false}` so the
-  existing retry/backoff kicks in and the lead logs a real error rather than a zero.
-- Do NOT permanently mark a lead done on a 0-raw-posts result during a degraded
-  streak.
+## What was shipped (FINAL — supersedes the pause idea below)
+First attempt (commits `b9edc91`/`714e262`/`8408587`) PAUSED the whole scan on a
+zero-raw streak (roll back + resumable). **That was a throughput regression** — the
+original scan, on an empty stretch, marks those leads done and KEEPS FLOWING to the
+next leads (that's how it pulled 1031 leads / 2388 posts on 2026-06-15). Pausing
+stalled it at ~20 leads, re-trying the same rate-limited leads forever. Samarth
+flagged it ("you broke a working system, make it work like before WITH the
+improvements, no extra cost"). Reverted.
+
+**FINAL (`acaf33a`): restore the original flow-through verbatim; add ONLY non-blocking
+visibility.** Net diff vs pre-session `7d8568c` is purely additive:
+- Mark zero-post leads done and keep flowing — identical throughput + cost to before.
+- When a zero-RAW-post streak (`>= RATE_LIMIT_STREAK_HINT`, env `LINKEDIN_EMPTY_STREAK_LIMIT`,
+  default 3) indicates soft-rate-limiting, RECORD the lead ids in `rate_limited_lead_ids`
+  on progress. NO pause, NO slow-down, NO re-fetch.
+- Completion log surfaces the count + how to recover: targeted re-scan via
+  `{action:"scan", leadIds: rate_limited_lead_ids}` — paid only if/when desired.
+- Verified: fresh run flowed 77 leads/tick (time-budget pause, not a stall), 1022 raw
+  posts, no flags — matches original behaviour.
+
+**Lesson:** for a scan whose provider intermittently rate-limits, NEVER pause the whole
+scan on a transient empty stretch — flow through it (the provider serves the next leads
+/ refills as you go). Make data-loss VISIBLE/recoverable, don't trade it for a stall.
+Also: heavy diagnostic test_profile calls + repeated restarts drain the shared RapidAPI
+rate budget — that made throughput look far worse mid-debug than a clean run does.
 
 ## Operational note
 - Verified via `test_profile` action (route.js ~1812) — accepts `{username}`,
