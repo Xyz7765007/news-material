@@ -1244,6 +1244,15 @@ async function runLinkedInPostScan({
       progress.consecutive_empty_raw = 0;
     } else {
       progress.consecutive_empty_raw = (progress.consecutive_empty_raw || 0) + 1;
+      // Adaptive slow-down: a BUILDING streak of zero-raw responses means the
+      // provider is soft-rate-limiting (empty 200s that don't trip the 429 backoff).
+      // Grow the global call interval + pause briefly so its rate window recovers,
+      // BEFORE the hard guard trips. Mirrors the 429 path; healthy scans never reach
+      // here, so this never slows a clean run.
+      if (progress.consecutive_empty_raw >= 3) {
+        rapidMinIntervalMs = Math.min(rapidMinIntervalMs * 1.5, 8000);
+        await new Promise(res => setTimeout(res, 4000));
+      }
       if (progress.consecutive_empty_raw >= EMPTY_RAW_STREAK_LIMIT) {
         // The prior (LIMIT-1) empty leads were already marked completed; the current
         // lead hasn't been yet. Roll back the marked ones so none are falsely skipped.
