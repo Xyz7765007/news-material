@@ -40,12 +40,15 @@ export async function GET(request) {
     return NextResponse.json({ ok: false, error: "baseId query param required" }, { status: 400 });
   }
   // Optional task-type scope so the chatbot's badge counts ONLY the task types
-  // the queue actually shows. The queue currently renders linkedin_engagement
-  // only (FEATURES.otherCards off), so a global count would overstate "tasks
-  // left" vs the visible queue. Whitelist to [a-z_] so it can't break the
-  // filterByFormula string literal.
+  // the queue actually shows (otherwise a global count overstates "tasks left"
+  // vs the visible queue). Accepts a comma-separated list (e.g.
+  // "linkedin_engagement,unipile_connection_accepted"). Each type is whitelisted
+  // to [a-z_] so it can't break the filterByFormula string literal.
   const taskTypeRaw = url.searchParams.get("taskType") || "";
-  const taskType = /^[a-z_]+$/.test(taskTypeRaw) ? taskTypeRaw : "";
+  const taskTypes = taskTypeRaw
+    .split(",")
+    .map(t => t.trim())
+    .filter(t => /^[a-z_]+$/.test(t));
 
   // Same filter as /feed (see comments there) — keeps badge consistent.
   // Time-sensitive types (engagement, linkedin_engagement, lead_movement) age
@@ -56,9 +59,11 @@ export async function GET(request) {
   let PENDING_FILTER = `AND({Handled At} = BLANK(), {Archived At} = BLANK(), {LinkedIn URL} != BLANK(), ${POST_DATE_GATE}, OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
   // Legacy fallback for bases that haven't run setup-fix (no Post Date/Archived At).
   let LEGACY_PENDING_FILTER = `AND({Handled At} = BLANK(), {LinkedIn URL} != BLANK(), OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
-  // Scope to one task type when requested (keeps the badge == the visible queue).
-  if (taskType) {
-    const typeClause = `FIND("${taskType}", {Task Type})`;
+  // Scope to the requested task type(s) (keeps the badge == the visible queue).
+  // Multiple types → OR of FIND clauses.
+  if (taskTypes.length) {
+    const finds = taskTypes.map(t => `FIND("${t}", {Task Type})`);
+    const typeClause = finds.length === 1 ? finds[0] : `OR(${finds.join(", ")})`;
     PENDING_FILTER = `AND(${PENDING_FILTER}, ${typeClause})`;
     LEGACY_PENDING_FILTER = `AND(${LEGACY_PENDING_FILTER}, ${typeClause})`;
   }
