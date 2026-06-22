@@ -1263,12 +1263,16 @@ async function runLinkedInPostScan({
           progress.leads_remaining += rollback;
         }
         progress.consecutive_empty_raw = 0;
-        progress.status = "error";
-        progress.phase = "done";
+        // Leave the scan RESUMABLE (status running, NOT phase:done) so the 5-min
+        // cron + Resume button auto-retry it. The 5-min spacing lets the provider's
+        // rate window recover; the rollback above means no leads were falsely
+        // skipped. Healthy resumes proceed; a still-limited provider just rolls back
+        // again next cycle (minimal calls), self-healing once it frees up.
+        progress.status = "running";
+        progress.paused_for_provider = true;
         progress.error_kind = "provider_empty_streak";
-        progress.last_log = `⚠️ Provider returned ${EMPTY_RAW_STREAK_LIMIT} consecutive empty post responses — likely a transient fresh-linkedin-scraper-api degradation, not real "no posts". Paused so these leads aren't falsely skipped; rolled back ${rollback} for retry. Hit Resume once it recovers.`;
-        progress.errors.push(`Provider-degradation guard: ${EMPTY_RAW_STREAK_LIMIT} consecutive zero-raw-post leads, rolled back ${rollback} for retry.`);
-        progress.ended_at = new Date().toISOString();
+        progress.last_log = `⏸ Paused: provider returned ${EMPTY_RAW_STREAK_LIMIT} consecutive empty post responses (soft rate-limit, not real "no posts"). Rolled back ${rollback} for retry; auto-resumes when it recovers.`;
+        progress.errors.push(`[provider degradation] ${EMPTY_RAW_STREAK_LIMIT} consecutive zero-raw-post leads — rolled back ${rollback} for retry, scan left resumable.`);
         await writeProgress(campaignAirtableId, progress);
         return progress;
       }
