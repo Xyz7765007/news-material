@@ -160,6 +160,9 @@ See `.learnings/2026-06-10-connector-first-revamp.md` for the full revamp record
 ### Debug
 - `POST /api/debug-campaigns`, `/api/debug/article-fetch`, `/api/debug/jobs`, `/api/debug/jobs-prefilter`
 
+### Billing / cost
+- `GET /api/cost-snapshot?key=<CRON_SECRET>` — Reads each campaign's cumulative OpenAI + RapidAPI usage counters and pushes the DELTA since last run as dated rows to the external Google Sheet cost tracker (billing ledger), one OpenAI + one RapidAPI row per client. Per-campaign watermark fields (`Cost Sheet * Pushed`) prevent double-counting; watermarks only advance after a successful sheet post. `?mode=preview` = dry run, `?baseline=1` = set watermark to current cumulative without posting (skip backfilling pre-sheet spend). Driven daily by `cost-snapshot-cron.github-actions.yml`. Posts via `lib/cost-sheet.js` (needs `COST_TRACKER_URL` + `COST_TRACKER_SECRET`). Deliberately a periodic delta, NOT a per-call POST — a scan makes hundreds of scoring calls; per-call would flood the ledger + add hot-path latency.
+
 ### Sidekick chatbot backend (chatbot is a separate repo; these are the endpoints it calls)
 All authenticated with `Authorization: Bearer <SIDEKICK_API_KEY>`.
 
@@ -191,6 +194,7 @@ All authenticated with `Authorization: Bearer <SIDEKICK_API_KEY>`.
 - **`message-merge.js`** — Centralized merge + sanitize. Strips markdown/quotes/code fences, detects AI refusals, runs merge-field safety pass. **Belt-and-suspenders layer for outreach output.**
 - **`movement-detection.js`** — Classifies movement as Hired/Promoted/Exited
 - **`rapidapi-usage.js`** — Mirror of `ai-usage.js` for RapidAPI calls
+- **`cost-sheet.js`** — Fire-and-forget poster to the external Google Sheet cost tracker (`postCostRows`). Used only by `/api/cost-snapshot`; never on the per-call hot path. No-op if `COST_TRACKER_URL`/`_SECRET` unset.
 
 ## 8. AI models (verified by grep across `app/api/` + `lib/`)
 
@@ -245,6 +249,8 @@ APIFY_TOKEN                    # Primary
 APIFY_TOKEN_2                  # Rotation slot 2 (optional)
 APIFY_TOKEN_3                  # Rotation slot 3 (optional)
 APOLLO_API_KEY
+COST_TRACKER_URL               # Apps Script /exec for the client cost-tracking Google Sheet (billing)
+COST_TRACKER_SECRET            # SECRET for that cost-tracker web app
 CRON_SECRET                    # signalscope_7765007 in current deployment
 EXPORT_API_KEY                 # CSV export auth
 GOOGLE_OAUTH_CLIENT_ID         # GA OAuth

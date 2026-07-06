@@ -1,0 +1,44 @@
+name: Cost Snapshot (daily)
+
+# Once a day, hits /api/cost-snapshot which reads each campaign's cumulative OpenAI +
+# RapidAPI usage counters and pushes the DELTA since the last run as dated rows into the
+# Google Sheet cost tracker (billing ledger). One OpenAI + one RapidAPI row per client.
+#
+# Setup:
+#   1. Place this file at .github/workflows/cost-snapshot-cron.yml in the news-material repo.
+#   2. Repo secret CRON_SECRET must already exist (same one the outreach cron uses).
+#   3. In Vercel, set COST_TRACKER_URL (Apps Script /exec URL) + COST_TRACKER_SECRET.
+#   4. Commit + push. First run posts each client's full cumulative spend as the opening
+#      delta. If you do NOT want pre-sheet spend backfilled, hit
+#      /api/cost-snapshot?baseline=1&key=<CRON_SECRET> ONCE first to set the watermark.
+#
+# Cost: ~5 sec/run × 1 run/day ≈ 2.5 min/month. Effectively free.
+# Verify: repo → Actions → "Cost Snapshot (daily)" → run history. Or hit
+#         /api/cost-snapshot?mode=preview&key=<CRON_SECRET> for a dry-run of the next push.
+
+on:
+  schedule:
+    # 23:30 UTC daily = 05:00 IST next morning (after the day's scans have run).
+    - cron: "30 23 * * *"
+  workflow_dispatch:
+
+jobs:
+  push-cost-snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Hit Vercel cost-snapshot endpoint
+        run: |
+          response=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" \
+            "https://news-material-eta.vercel.app/api/cost-snapshot?key=${{ secrets.CRON_SECRET }}")
+
+          http_status=$(echo "$response" | tail -n1 | sed 's/HTTP_STATUS://')
+          body=$(echo "$response" | sed '$d')
+
+          echo "Status: $http_status"
+          echo "Response: $body"
+
+          if [ "$http_status" -lt 200 ] || [ "$http_status" -ge 300 ]; then
+            echo "::error::cost-snapshot endpoint returned $http_status"
+            exit 1
+          fi
