@@ -47,6 +47,14 @@ const WATERMARK_FIELDS = [
   { name: "Cost Sheet Last Push At",        type: "singleLineText" },
 ];
 
+// Display-name normalization for the billing ledger (Airtable campaign name → client name
+// Samarth uses). Anything not listed passes through unchanged.
+const CLIENT_NAME_MAP = {
+  "Material Signals Campaign": "Material",
+};
+// Campaigns whose name matches this are internal test rows — never billed, never pushed.
+const SKIP_NAME_RE = /test/i;
+
 function num(v) { return typeof v === "number" && !isNaN(v) ? v : 0; }
 function round6(n) { return Math.round(n * 1e6) / 1e6; }
 function slug(s) { return String(s || "client").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40); }
@@ -129,8 +137,10 @@ export async function GET(request) {
 
   for (const rec of campaigns) {
     const f = rec.fields || {};
-    const name = String(f.Name || "").trim();
-    if (!name) continue;
+    const rawName = String(f.Name || "").trim();
+    if (!rawName) continue;
+    if (SKIP_NAME_RE.test(rawName)) continue;              // skip internal test campaigns
+    const name = CLIENT_NAME_MAP[rawName] || rawName;      // client display name for the ledger
 
     // Cumulative counters (maintained by the tracking helpers).
     const aiCost = num(f["AI Total Cost USD"]);
