@@ -15,12 +15,18 @@ name: Outreach Cron (4-hour)
 # To verify: GitHub repo → Actions tab → "Outreach Cron (4-hour)" workflow → see run history with timestamps and status.
 
 on:
-  schedule:
-    # Every 4 hours. Cron syntax in GitHub Actions is UTC.
-    # 0 */4 * * * = 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC
-    # = 5:30am, 9:30am, 1:30pm, 5:30pm, 9:30pm, 1:30am IST
-    - cron: "0 */4 * * *"
-  # Allow manual trigger from GitHub UI for testing
+  # PAUSED 2026-07-07: the schedule is intentionally disabled so LinkedIn outreach
+  # sends do NOT fire automatically. With LINKEDIN_DMS_ENABLED now defaulting ON,
+  # an active schedule would auto-send EVERY campaign's queue every 4h. Per Samarth,
+  # Veloka (and everyone) stays MANUAL-only for now — sends are driven by hand via
+  # POST /api/outreach {action:"process_queue"}. Re-enable by un-commenting the
+  # schedule below once we're ready to auto-schedule (add a send-window gate first).
+  # schedule:
+  #   # Every 4 hours. Cron syntax in GitHub Actions is UTC.
+  #   # 0 */4 * * * = 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC
+  #   # = 5:30am, 9:30am, 1:30pm, 5:30pm, 9:30pm, 1:30am IST
+  #   - cron: "0 */4 * * *"
+  # Manual trigger stays available (GitHub UI) for a supervised run.
   workflow_dispatch:
 
 jobs:
