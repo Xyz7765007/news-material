@@ -188,14 +188,19 @@ export async function GET(request) {
     const lastMs = num(lastMarkedDone);
     const dayAgoMs = Date.now() - DAY_MS;
 
-    // 2. Our sent connection requests (exact-match filter; DATE compare in JS).
-    const filter = `AND({Campaign} = "${CONNECT_CAMPAIGN}", {Status} = "${CONNECT_STATUS}")`;
+    // 2. Every connection request that ACTUALLY WENT OUT — keyed on the presence
+    //    of "Connection Sent At", NOT the current Status. A request that was sent
+    //    and then accepted (Status→connected), replied, or completed still "went
+    //    out" and must stay counted (Kunal's ask is "how many have gone out").
+    //    Filtering on Status="connection_sent" wrongly dropped accepted ones.
+    //    (DATE compare in JS — Airtable IS_AFTER is buggy on this data.)
+    const filter = `AND({Campaign} = "${CONNECT_CAMPAIGN}", {Connection Sent At})`;
     const rows = await atList(baseId, "Outreach", filter, "Connection Sent At");
 
     // 3. Since last marked done → the headline count. past24h = the gate input.
     const sinceDone = rows
       .map((r) => ({ f: r.fields || {}, ms: num((r.fields || {})["Connection Sent At"]) }))
-      .filter((x) => x.ms > lastMs)
+      .filter((x) => x.ms > 0 && x.ms > lastMs)
       .sort((a, b) => b.ms - a.ms);
 
     const count = sinceDone.length;
