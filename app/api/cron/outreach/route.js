@@ -87,6 +87,12 @@ export async function GET(request) {
   const url = new URL(request.url);
   const isManual = url.searchParams.get("manual") === "1";
   const manualKey = url.searchParams.get("key");
+  // Optional isolation: when ?onlyRule=<Rule Name> is passed, process ONLY the
+  // linkedin_outreach rule whose Name matches — every other rule (in every
+  // campaign) is skipped. Lets a dedicated scheduled trigger drive exactly one
+  // campaign's queue (e.g. "Veloka Connect") without touching any other active
+  // rule (e.g. the old "Sidekick Auto-Batch v1"). Added 2026-07-09.
+  const onlyRule = (url.searchParams.get("onlyRule") || "").trim();
 
   // Auth: support both Vercel cron header AND manual key query param
   const authHeader = request.headers.get("authorization");
@@ -228,6 +234,11 @@ export async function GET(request) {
 
       for (const rule of outreachRules) {
         const rf = rule.fields || {};
+        // Isolation filter (see onlyRule above): skip every rule except the named one.
+        if (onlyRule && (rf.Name || "").trim() !== onlyRule) {
+          summary.skipReasons.push(`Rule "${rf.Name}" skipped: onlyRule=${onlyRule} isolation`);
+          continue;
+        }
         let config;
         try { config = JSON.parse(rf["Outreach Config"] || "{}"); }
         catch (e) {
