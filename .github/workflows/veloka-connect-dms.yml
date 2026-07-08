@@ -1,0 +1,40 @@
+name: Veloka Connect DMs (daily, in-window)
+
+# Drives ONLY the "Veloka Connect" outreach queue (connection-acceptance → DM
+# sequence) once a day, inside Kunal's 8-10am IST send window.
+#
+# Isolation: hits /api/cron/outreach with ?onlyRule=Veloka%20Connect, so it
+# processes exactly that one linkedin_outreach rule and skips every other rule
+# (never touches the old "Sidekick Auto-Batch v1" queue). See the onlyRule filter
+# in app/api/cron/outreach/route.js.
+#
+# SAFETY: this sends nothing unless the "Veloka Connect" rule's Outreach Config
+# has "active": true. Until it's armed, each run finds the rule and skips it
+# (not active) — a safe no-op. Arming is a deliberate, separate step.
+#
+# Schedule: 03:00 UTC = 08:30 IST (inside 8-10am even with GitHub's cron lag).
+# Requires repo secret CRON_SECRET (already set — same one the outreach cron used).
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # 03:00 UTC = 08:30 IST, daily
+  workflow_dispatch:       # manual supervised run from the Actions tab
+
+jobs:
+  veloka-connect-dms:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Drive the Veloka Connect queue (onlyRule isolated)
+        run: |
+          response=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            "https://news-material-two.vercel.app/api/cron/outreach?onlyRule=Veloka%20Connect")
+          http_status=$(echo "$response" | tail -n1 | sed 's/HTTP_STATUS://')
+          body=$(echo "$response" | sed '$d')
+          echo "Status: $http_status"
+          echo "Response: $body"
+          if [ "$http_status" -lt 200 ] || [ "$http_status" -ge 300 ]; then
+            echo "::error::onlyRule cron returned $http_status"
+            exit 1
+          fi
