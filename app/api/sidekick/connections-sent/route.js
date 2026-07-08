@@ -218,6 +218,39 @@ export async function GET(request) {
       linkedin: x.f["LinkedIn URL"] || "",
     }));
 
+    // Enrich the <=10 shown leads with company website + employee size from the
+    // Leads table (the Outreach row doesn't carry them). ONE targeted list over
+    // just the shown names, so it stays cheap. Best-effort: any failure leaves the
+    // base fields intact. `website` gets an https:// scheme so it's a valid href.
+    try {
+      const names = [...new Set(leads.map((l) => l.name).filter(Boolean))];
+      if (names.length) {
+        const esc = (s) => String(s).replace(/"/g, '\\"');
+        const formula = `OR(${names.map((n) => `{Name}="${esc(n)}"`).join(",")})`;
+        const leadRows = await atList(baseId, "Leads", formula, null);
+        const byName = new Map();
+        for (const r of leadRows) {
+          const lf = r.fields || {};
+          const key = (lf.Name || "").trim().toLowerCase();
+          if (key && !byName.has(key)) byName.set(key, lf);
+        }
+        const withScheme = (u) => {
+          const s = (u || "").trim();
+          if (!s) return "";
+          return /^https?:\/\//i.test(s) ? s : `https://${s}`;
+        };
+        for (const l of leads) {
+          const lf = byName.get((l.name || "").trim().toLowerCase());
+          if (!lf) continue;
+          l.website = withScheme(lf["Company Website"]);
+          l.company_linkedin = lf["Company Linkedin"] || "";
+          const cnt = lf["Employee count"];
+          l.employees = cnt != null && cnt !== "" ? String(cnt) : "";
+          l.employee_range = lf["Employee Range"] || "";
+        }
+      }
+    } catch { /* best-effort enrichment — website/employees just stay empty */ }
+
     return NextResponse.json({ ok: true, count, past24h, leads, lastMarkedDone });
   } catch (e) {
     return NextResponse.json({ ok: false, error: e.message }, { status: 500 });
