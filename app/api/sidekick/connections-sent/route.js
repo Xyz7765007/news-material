@@ -22,9 +22,9 @@ import { NextResponse } from "next/server";
 //   count    = Outreach rows (Veloka Connect / connection_sent) with
 //              Connection Sent At > lastMarkedDone.
 //   past24h  = the VISIBILITY-GATE input — the subset of `count` also sent within
-//              the last 24h (so after Mark-as-done the gate falls to 0 and the
-//              card only returns once 5+ NEW requests have gone out, matching the
-//              approved mockup's copy).
+//              the recent window (widened 24h→72h, Samarth 2026-07-08; name kept
+//              for frontend compat). After Mark-as-done the gate falls to 0 and
+//              the card only returns once 5+ NEW requests have gone out.
 //   leads    = the 10 most-recent of the `count` set (public facts only).
 //
 // POST:
@@ -57,7 +57,12 @@ const DEFAULT_CAMPAIGN_RECORD = "recV0RlBHUmrhtVq2";
 const CONNECT_CAMPAIGN = "Veloka Connect";
 const CONNECT_STATUS = "connection_sent";
 const MARKED_DONE_FIELD = "Connections Card Marked Done At";
-const DAY_MS = 24 * 60 * 60 * 1000;
+// Recent-window for the visibility gate. Widened 24h→72h (Samarth 2026-07-08):
+// a batch sent yesterday was aging out of a 24h window overnight and the review
+// card vanished before it was reviewed. 72h keeps it up across a weekend gap.
+// (`past24h` in the response keeps its name for frontend compat; it now carries
+// the 72h count.)
+const DAY_MS = 72 * 60 * 60 * 1000;
 
 const atHdr = {
   Authorization: `Bearer ${AIRTABLE_KEY}`,
