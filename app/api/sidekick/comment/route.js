@@ -90,6 +90,50 @@ function socialIdFromUrl(rawUrl) {
   return null;
 }
 
+// ── URN shape (VERIFIED live 2026-07-27) ───────────────────────────────
+// Unipile's POST /posts/{id}/comments accepts ONLY an `urn:li:activity:` id.
+// Probed against the live chain: a ugcPost URN and a share URN BOTH come back
+// 422 "Requested post might not be accessible, or has a misspelled ID.", every
+// time — so forwarding those shapes verbatim (which socialIdFromUrl happily
+// extracts) is a guaranteed failure. We don't refuse them, because refusing
+// would strand any card whose provider handed us a ugcPost/share URL; we send
+// the activity form first and keep the original as a single retry.
+// A `comment` URN is a reply target, not a post — that one we do refuse.
+function urnKind(socialId) {
+  const m = String(socialId || "").match(/^urn:li:([A-Za-z]+):/);
+  return m ? m[1] : "";
+}
+function asActivityUrn(socialId) {
+  const d = String(socialId || "").match(/(\d{6,})/);
+  return d ? `urn:li:activity:${d[1]}` : null;
+}
+
+// Turn a Unipile failure into something the operator can ACT on. Kunal hit this
+// live on the 2026-07-27 call ("Some error. It didn't post." → "I have no choice
+// but to skip") because the only thing that reached the UI was Unipile's raw
+// string, which is frequently "Please try again later." — advice that is wrong
+// whenever the post is simply gone.
+function classifyUnipileError(status, data) {
+  const raw =
+    typeof data === "object" && data
+      ? data.detail || data.error || data.title || JSON.stringify(data)
+      : String(data);
+  const low = String(raw).toLowerCase();
+  if (status === 429 || /rate limit|too many|throttl/.test(low))
+    return { reason: "rate_limited", message: "LinkedIn is throttling comments from this account. Wait a few minutes, then try again, or comment manually on the post." };
+  if (status === 401 || status === 403 || /disconnect|credential|checkpoint|reconnect|unauthor/.test(low))
+    return { reason: "account_disconnected", message: "This LinkedIn account is no longer connected in Unipile. Reconnect it, then try again." };
+  if (status === 404 || status === 422 || /misspelled id|not be accessible|not found/.test(low))
+    return { reason: "post_unavailable", message: "LinkedIn will not accept a comment on this post. It was most likely deleted, made private, or has comments restricted. Open it on LinkedIn to check." };
+  // Verified 2026-07-27: Unipile returns 503 "Please try again later." for a
+  // post it cannot reach AND (per LinkedIn's standard behaviour) when we are
+  // being throttled. The string alone cannot tell them apart, so say both
+  // rather than guess — and the full body is logged for whoever looks next.
+  if (status === 503 || /try again later/.test(low))
+    return { reason: "post_unreachable_or_throttled", message: "LinkedIn would not take this comment. Either the post is gone or LinkedIn is throttling us. Open the post on LinkedIn to comment manually." };
+  return { reason: "unknown", message: `LinkedIn rejected the comment: ${String(raw).slice(0, 300)}` };
+}
+
 // The house-style formatting pass for a comment about to hit LinkedIn.
 function cleanComment(raw) {
   let t = String(raw || "").replace(/\r\n/g, "\n").trim();
@@ -157,8 +201,16 @@ export async function POST(request) {
   const { baseId, postUrl, text, dryRun } = body || {};
   const social_id = socialIdFromUrl(postUrl);
   if (!social_id) {
-    return NextResponse.json({ ok: false, error: "Could not read the post id from the URL. Open the post and try again." }, { status: 400 });
+    return NextResponse.json({ ok: false, reason: "no_post_id", error: "Could not read the post id from the URL. Open the post and try again." }, { status: 400 });
   }
+  // A comment URN targets a REPLY, not a post — posting to it would either fail
+  // or land the text somewhere the operator did not intend. Refuse explicitly.
+  if (urnKind(social_id) === "comment") {
+    return NextResponse.json({ ok: false, reason: "not_a_post", error: "That link points at a comment, not a post. Open it on LinkedIn and reply there." }, { status: 400 });
+  }
+  // Send the activity form first (the only shape Unipile accepts), keeping the
+  // extracted URN as a single fallback. Deduped, so an activity URN = 1 call.
+  const attempts = [...new Set([asActivityUrn(social_id), social_id].filter(Boolean))];
   const clean = cleanComment(text);
   if (!clean) return NextResponse.json({ ok: false, error: "Comment text is empty" }, { status: 400 });
 
@@ -172,19 +224,44 @@ export async function POST(request) {
     return NextResponse.json({
       ok: true,
       dryRun: true,
-      wouldPost: { social_id, account: { id: acctId, name }, text: clean, textLength: clean.length },
+      wouldPost: { social_id, attempts, account: { id: acctId, name }, text: clean, textLength: clean.length },
     });
   }
 
-  // LIVE: post the comment.
-  const res = await unipileReq(`/posts/${encodeURIComponent(social_id)}/comments`, "POST", {
-    account_id: acctId,
-    text: clean,
-  });
-  if (!res.ok) {
-    const err = typeof res.data === "object" ? (res.data.detail || res.data.error || res.data.title || JSON.stringify(res.data)) : String(res.data);
-    return NextResponse.json({ ok: false, error: `LinkedIn rejected the comment: ${String(err).slice(0, 300)}`, status: res.status }, { status: 502 });
+  // LIVE: post the comment. Retry ONLY on a definitive rejection (400/422) —
+  // those mean Unipile refused the id outright and created nothing, so a second
+  // attempt with a different URN shape cannot double-post. A 5xx or a network
+  // failure is NEVER retried: the comment may well have landed.
+  let res = null;
+  let used = attempts[0];
+  for (const candidate of attempts) {
+    used = candidate;
+    res = await unipileReq(`/posts/${encodeURIComponent(candidate)}/comments`, "POST", {
+      account_id: acctId,
+      text: clean,
+    });
+    if (res.ok) break;
+    if (res.status !== 400 && res.status !== 422) break;
+  }
+  if (!res || !res.ok) {
+    const { reason, message } = classifyUnipileError(res?.status, res?.data);
+    const detail =
+      typeof res?.data === "object" && res?.data
+        ? JSON.stringify(res.data).slice(0, 500)
+        : String(res?.data ?? "").slice(0, 500);
+    // Logged so the NEXT failure is diagnosable after the fact. Before this, the
+    // route swallowed everything except a 300-char `detail` and Vercel kept no
+    // record at all, which is why the 2026-07-27 call failure could not be
+    // traced the same day.
+    console.error(
+      "[sidekick/comment] post failed",
+      JSON.stringify({ tried: attempts, used, account: acctId, status: res?.status ?? 0, reason, detail })
+    );
+    return NextResponse.json(
+      { ok: false, reason, error: message, detail, status: res?.status ?? 0, social_id: used, account: { id: acctId, name } },
+      { status: 502 }
+    );
   }
   const commentId = (res.data && typeof res.data === "object" && (res.data.id || res.data.comment_id)) || null;
-  return NextResponse.json({ ok: true, commentId, social_id, account: { id: acctId, name }, text: clean });
+  return NextResponse.json({ ok: true, commentId, social_id: used, account: { id: acctId, name }, text: clean });
 }
