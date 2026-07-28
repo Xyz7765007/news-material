@@ -68,10 +68,16 @@ export async function POST(request) {
 }
 
 // ─── Airtable read ──────────────────────────────────────────────────────────
-async function listRows(sinceISO) {
+// `from` / `to` are ISO instants. They exist so the operator can draw a hard
+// baseline: everything on or after the baseline is the live measurement window,
+// everything before it is prior activity that must not contaminate it.
+async function listRows(fromISO, toISO) {
   const rows = [];
   let offset = null;
-  const formula = `IS_AFTER({Called At}, "${sinceISO}")`;
+  const clauses = [];
+  if (fromISO) clauses.push(`IS_AFTER({Called At}, "${fromISO}")`);
+  if (toISO) clauses.push(`IS_BEFORE({Called At}, "${toISO}")`);
+  const formula = clauses.length > 1 ? `AND(${clauses.join(", ")})` : (clauses[0] || "TRUE()");
   do {
     const qs = new URLSearchParams({ filterByFormula: formula, pageSize: "100" });
     if (offset) qs.set("offset", offset);
@@ -136,10 +142,17 @@ export async function GET(request) {
   const days = Math.min(Math.max(parseInt(url.searchParams.get("days") || "7", 10) || 7, 1), 90);
   const campaignFilter = (url.searchParams.get("campaign") || "").toLowerCase();
   const providerFilter = (url.searchParams.get("provider") || "").toLowerCase();
-  const since = new Date(Date.now() - days * 86400000).toISOString();
+
+  // Explicit bounds win over the rolling `days` window. `from` alone means
+  // "everything since the baseline"; `to` alone means "everything before it".
+  const fromParam = url.searchParams.get("from") || "";
+  const toParam = url.searchParams.get("to") || "";
+  const from = fromParam ? new Date(fromParam).toISOString() : null;
+  const to = toParam ? new Date(toParam).toISOString() : null;
+  const since = from || (to ? null : new Date(Date.now() - days * 86400000).toISOString());
 
   try {
-    let records = await listRows(since);
+    let records = await listRows(since, to);
     if (campaignFilter) records = records.filter((r) => String(r.fields?.Campaign || "").toLowerCase() === campaignFilter);
     if (providerFilter) records = records.filter((r) => String(r.fields?.Provider || "").toLowerCase() === providerFilter);
 
@@ -227,7 +240,7 @@ export async function GET(request) {
 
     return Response.json({
       ok: true,
-      window: { days, since, daysWithActivity: dayCount },
+      window: { days, since, to, from, daysWithActivity: dayCount, bounded: !!(from || to) },
 
       totals: {
         rows: records.length,
