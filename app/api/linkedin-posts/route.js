@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import { trackOpenAIUsage } from "@/lib/ai-usage";
-import { trackLLMCall } from "@/lib/llm-cost-log";
+import { trackLLMCall, trackAPICall } from "@/lib/llm-cost-log";
 import { pickLeadField } from "@/lib/lead-fields";
 import { checkRoleFreshness } from "@/lib/role-freshness";
 import { fetchActiveRelevanceRules } from "@/lib/relevance-rules";
@@ -225,6 +225,12 @@ function timestampFromActivityUrl(url) {
 let rapidLastCallMs = 0;
 let rapidMinIntervalMs = 1200; // starts at 1.2s, grows after 429s
 
+// Campaign attribution for RapidAPI cost rows. A serverless invocation
+// processes exactly one campaign's scan, so a module-scoped value is safe here
+// and avoids threading campaignId through fetchPostsForUrn/getOrFetchUrn.
+let _costCampaignId = "";
+export function setCostCampaign(id) { _costCampaignId = String(id || ""); }
+
 async function rapidCall(path, params, { retries = 3, timeoutMs = 45000 } = {}) {
   if (!RAPIDAPI_KEY) return { ok: false, status: 0, error: "RAPIDAPI_KEY not set in Vercel env" };
   const qs = new URLSearchParams(params).toString();
@@ -267,6 +273,16 @@ async function rapidCall(path, params, { retries = 3, timeoutMs = 45000 } = {}) 
         }
         return { ok: false, status: r.status, error: text.slice(0, 300) };
       }
+      // Bill the call. RapidAPI charges per request that reaches the API, so a
+      // soft-empty 200 (the documented false-zero failure mode) costs exactly
+      // as much as a good one — log it either way or the cost model lies.
+      trackAPICall({
+        route: path.includes("/posts") ? "rapidapi_user_posts" : "rapidapi_user_profile",
+        host: RAPIDAPI_HOST,
+        campaignId: _costCampaignId,
+        action: path,
+        meta: { path, page: params?.page || "", emptyBody: text.length < 40 },
+      });
       try { return { ok: true, data: JSON.parse(text) }; }
       catch { return { ok: false, status: 200, error: "Invalid JSON from RapidAPI: " + text.slice(0, 200) }; }
     } catch (e) {
@@ -1021,6 +1037,8 @@ async function runLinkedInPostScan({
   timeBudgetMs = 270_000, // 270s default for UI runs; cron passes 25_000 for fast returns
 }) {
   const startedAt = new Date().toISOString();
+  // Attribute every RapidAPI call in this invocation to the campaign being scanned.
+  setCostCampaign(campaignAirtableId);
   const cutoffMs = Date.now() - (daysBack * 24 * 60 * 60 * 1000);
 
   // Load campaign for context

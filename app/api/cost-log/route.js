@@ -1,31 +1,38 @@
 export const dynamic = "force-dynamic";
 export const fetchCache = "force-no-store";
+export const maxDuration = 60;
 
-// ─── COST LOG API ───────────────────────────────────────────────────────────
+// ─── COST + ACTIVITY API ────────────────────────────────────────────────────
 //
 // The queryable surface over the per-call rows written by lib/llm-cost-log.js.
-// Lives in the backend on purpose — one place holds every campaign's LLM spend,
-// across both providers, so "what did this actually cost" is one request away.
+// Lives in the backend on purpose — one place holds every campaign's spend and
+// activity, across all three providers, so "what did this actually cost and
+// what did the operator actually do" is one request away.
 //
 //   POST /api/cost-log            ingest one call
 //     Authorization: Bearer <SIDEKICK_API_KEY>
-//     { route, model, usage, campaignId?, postKey?, meta? }
-//     `usage` accepts either provider shape (OpenAI prompt_/completion_tokens
-//     or Anthropic input_/output_tokens + cache fields).
+//     { route, model, usage, campaignId?, postKey?, action?, meta? }
+//     or for a zero-cost funnel milestone:
+//     { kind: "activity", route, action?, campaignId?, postKey?, meta? }
 //
-//   GET /api/cost-log?key=<CRON_SECRET>&days=7[&campaign=veloka][&route=...]
-//     Aggregated readback: totals, per-day, per-route, per-model, per-campaign,
-//     plus the derived per-post unit cost.
+//   GET /api/cost-log?key=<CRON_SECRET>&days=7[&campaign=][&provider=]
+//     Everything the dashboard needs, aggregated server-side: spend, unit
+//     economics, the pipeline funnel, and operator behaviour.
 //
-// Read auth is CRON_SECRET (admin/operator), write auth is SIDEKICK_API_KEY
-// (the app reporting its own usage) — deliberately different scopes.
+// Read auth is CRON_SECRET (operator), write auth is SIDEKICK_API_KEY (the app
+// reporting its own usage) — deliberately different scopes.
 
-import { logLLMCall, COST_LOG_TABLE, MASTER_BASE_ID } from "@/lib/llm-cost-log";
+import { logLLMCall, logActivity, COST_LOG_TABLE, MASTER_BASE_ID, RAPIDAPI_PLANS, ACTIVE_RAPIDAPI_PLAN, SHADOW_MODEL } from "@/lib/llm-cost-log";
 
 const AT_API = "https://api.airtable.com/v0";
 const AIRTABLE_KEY = process.env.AIRTABLE_API_KEY;
 const SIDEKICK_KEY = process.env.SIDEKICK_API_KEY;
 const CRON_SECRET = process.env.CRON_SECRET;
+
+// A gap longer than this between calls starts a new working session.
+const SESSION_GAP_MS = 30 * 60 * 1000;
+// Below this many observations a ratio is noise, and the UI is told to say so.
+const MIN_SAMPLE_FOR_RATIO = 5;
 
 // ─── POST: ingest ───────────────────────────────────────────────────────────
 export async function POST(request) {
@@ -42,18 +49,25 @@ export async function POST(request) {
     return Response.json({ ok: false, error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const { route, model, usage, campaignId, postKey, meta } = body || {};
+  const { kind, route, model, usage, campaignId, postKey, action, meta } = body || {};
+
+  // Zero-cost funnel milestones (comment published, task handled) carry no
+  // usage and must not be rejected for lacking one.
+  if (kind === "activity") {
+    if (!route) return Response.json({ ok: false, error: "route is required" }, { status: 400 });
+    const result = await logActivity({ route, action, campaignId, postKey, meta });
+    return Response.json({ ok: result.ok !== false, ...result });
+  }
+
   if (!route || !model || !usage) {
     return Response.json({ ok: false, error: "route, model and usage are required" }, { status: 400 });
   }
 
-  // Awaited here (unlike the hot-path helper) so the caller gets a definite
-  // answer about whether the row landed.
-  const result = await logLLMCall({ route, model, usage, campaignId, postKey, meta });
+  const result = await logLLMCall({ route, model, usage, campaignId, postKey, action, meta });
   return Response.json({ ok: result.ok !== false, ...result });
 }
 
-// ─── GET: aggregate ─────────────────────────────────────────────────────────
+// ─── Airtable read ──────────────────────────────────────────────────────────
 async function listRows(sinceISO) {
   const rows = [];
   let offset = null;
@@ -66,9 +80,9 @@ async function listRows(sinceISO) {
     });
     if (!res.ok) {
       const txt = await res.text();
-      // A missing table just means nothing has been logged yet — that is an
-      // empty result, not an error the operator needs to debug.
-      if (res.status === 404 || txt.includes("TABLE_NOT_FOUND")) return [];
+      // A missing table means nothing has been logged yet. That is an empty
+      // result, not an error the operator needs to debug.
+      if (res.status === 404 || txt.includes("TABLE_NOT_FOUND") || txt.includes("NOT_FOUND")) return [];
       throw new Error(`Airtable ${res.status}: ${txt.slice(0, 200)}`);
     }
     const data = await res.json();
@@ -78,23 +92,37 @@ async function listRows(sinceISO) {
   return rows;
 }
 
+// ─── Aggregation helpers ────────────────────────────────────────────────────
+function newBucket() {
+  return { calls: 0, units: 0, inTok: 0, outTok: 0, cacheTok: 0, cost: 0, shadow: 0 };
+}
 function bump(map, key, f) {
-  if (!key) key = "unknown";
-  if (!map[key]) map[key] = { calls: 0, inTok: 0, outTok: 0, cost: 0 };
-  const t = map[key];
+  const k = key || "unknown";
+  if (!map[k]) map[k] = newBucket();
+  const t = map[k];
   t.calls += 1;
+  t.units += Number(f.Units) || 1;
   t.inTok += Number(f["Input Tokens"]) || 0;
   t.outTok += Number(f["Output Tokens"]) || 0;
+  t.cacheTok += (Number(f["Cache Write Tokens"]) || 0) + (Number(f["Cache Read Tokens"]) || 0);
   t.cost += Number(f["Cost USD"]) || 0;
+  t.shadow += Number(f["Shadow Cost USD"]) || 0;
 }
-
-const sortByCost = (o) =>
-  Object.fromEntries(
-    Object.entries(o)
-      .map(([k, v]) => [k, { ...v, cost: Number(v.cost.toFixed(6)) }])
+const r6 = (n) => Number((n || 0).toFixed(6));
+function finish(map) {
+  return Object.fromEntries(
+    Object.entries(map)
+      .map(([k, v]) => [k, { ...v, cost: r6(v.cost), shadow: r6(v.shadow) }])
       .sort((a, b) => b[1].cost - a[1].cost)
   );
+}
+function safeMeta(raw) {
+  try { return JSON.parse(raw || "{}"); } catch { return {}; }
+}
+const ratio = (num, den) =>
+  den >= MIN_SAMPLE_FOR_RATIO ? Number((num / den).toFixed(4)) : null;
 
+// ─── GET: everything the dashboard needs ────────────────────────────────────
 export async function GET(request) {
   const url = new URL(request.url);
   const key = url.searchParams.get("key") || "";
@@ -107,55 +135,188 @@ export async function GET(request) {
 
   const days = Math.min(Math.max(parseInt(url.searchParams.get("days") || "7", 10) || 7, 1), 90);
   const campaignFilter = (url.searchParams.get("campaign") || "").toLowerCase();
-  const routeFilter = (url.searchParams.get("route") || "").toLowerCase();
+  const providerFilter = (url.searchParams.get("provider") || "").toLowerCase();
   const since = new Date(Date.now() - days * 86400000).toISOString();
 
   try {
     let records = await listRows(since);
-    if (campaignFilter) {
-      records = records.filter((r) => String(r.fields?.Campaign || "").toLowerCase() === campaignFilter);
-    }
-    if (routeFilter) {
-      records = records.filter((r) => String(r.fields?.Route || "").toLowerCase() === routeFilter);
-    }
+    if (campaignFilter) records = records.filter((r) => String(r.fields?.Campaign || "").toLowerCase() === campaignFilter);
+    if (providerFilter) records = records.filter((r) => String(r.fields?.Provider || "").toLowerCase() === providerFilter);
 
-    const byDay = {}, byRoute = {}, byModel = {}, byCampaign = {};
-    const posts = new Set();
-    let totalCost = 0, totalIn = 0, totalOut = 0;
+    const byProvider = {}, byDay = {}, byRoute = {}, byModel = {}, byCampaign = {}, byHour = {};
+    const postsTouched = new Set();
+    const postsWorked = new Set();     // a post that reached a comment draft
+    const postsPublished = new Set();  // a post whose comment actually went out
+    const anglesByPost = {}, chatByPost = {}, draftsByPost = {};
+    const timestamps = [];
+    let totalCost = 0, totalShadow = 0, totalIn = 0, totalOut = 0, totalCache = 0;
+    let drafts = 0, regenerates = 0, scoringCalls = 0, scoringWithFeedback = 0;
+    let rapidCalls = 0, rapidEmptyBodies = 0;
 
     for (const rec of records) {
       const f = rec.fields || {};
+      const provider = String(f.Provider || "other");
+      const route = String(f.Route || "unknown");
+      const meta = safeMeta(f.Meta);
+      const postKey = String(f["Post Key"] || "");
+
+      bump(byProvider, provider, f);
       bump(byDay, f.Day, f);
-      bump(byRoute, f.Route, f);
-      bump(byModel, f.Model, f);
+      bump(byRoute, route, f);
+      if (provider !== "activity") bump(byModel, f.Model, f);
       bump(byCampaign, f.Campaign || "(unattributed)", f);
+      bump(byHour, String(f.Hour ?? "?"), f);
+
       totalCost += Number(f["Cost USD"]) || 0;
+      totalShadow += Number(f["Shadow Cost USD"]) || 0;
       totalIn += Number(f["Input Tokens"]) || 0;
       totalOut += Number(f["Output Tokens"]) || 0;
-      if (f["Post Key"]) posts.add(String(f["Post Key"]));
+      totalCache += (Number(f["Cache Write Tokens"]) || 0) + (Number(f["Cache Read Tokens"]) || 0);
+
+      if (f["Called At"]) timestamps.push(Date.parse(f["Called At"]));
+      if (postKey) postsTouched.add(postKey);
+
+      if (provider === "rapidapi") {
+        rapidCalls += Number(f.Units) || 1;
+        if (meta.emptyBody) rapidEmptyBodies += 1;
+      }
+      if (route.includes("score")) {
+        scoringCalls += 1;
+        if (meta.hasReviewerFeedback) scoringWithFeedback += 1;
+      }
+      if (route === "generate-comment") {
+        drafts += 1;
+        if (meta.regenerate) regenerates += 1;
+        if (postKey) {
+          postsWorked.add(postKey);
+          draftsByPost[postKey] = (draftsByPost[postKey] || 0) + 1;
+        }
+      }
+      if (route === "comment-angles" && postKey) anglesByPost[postKey] = (anglesByPost[postKey] || 0) + 1;
+      if (route === "post-chat" && postKey) chatByPost[postKey] = (chatByPost[postKey] || 0) + 1;
+      if (route === "comment-published" && postKey) postsPublished.add(postKey);
     }
 
+    // ── Working sessions: a gap over SESSION_GAP_MS starts a new one ──
+    timestamps.sort((a, b) => a - b);
+    const sessions = [];
+    for (const t of timestamps) {
+      const last = sessions[sessions.length - 1];
+      if (!last || t - last.end > SESSION_GAP_MS) sessions.push({ start: t, end: t, calls: 1 });
+      else { last.end = t; last.calls += 1; }
+    }
+    const sessionMinutes = sessions.map((s) => (s.end - s.start) / 60000);
+    const totalActiveMin = sessionMinutes.reduce((a, b) => a + b, 0);
+
     const dayCount = Object.keys(byDay).length || 1;
+    const sum = (o) => Object.values(o).reduce((a, b) => a + b, 0);
+
+    // ── Plan quota burn-down for the ACTIVE RapidAPI plan ──
+    const plan = RAPIDAPI_PLANS[ACTIVE_RAPIDAPI_PLAN] || RAPIDAPI_PLANS.Pro;
+    const rapidMonthlyProjected = (rapidCalls / dayCount) * 30.44;
 
     return Response.json({
       ok: true,
       window: { days, since, daysWithActivity: dayCount },
+
       totals: {
-        calls: records.length,
+        rows: records.length,
+        costUSD: r6(totalCost),
+        // What the same work would cost with scoring moved to the shadow model.
+        shadowCostUSD: r6(totalShadow),
+        shadowModel: SHADOW_MODEL,
         inputTokens: totalIn,
         outputTokens: totalOut,
-        costUSD: Number(totalCost.toFixed(6)),
-        distinctPosts: posts.size,
-        // The number that matters for pricing a client: real spend divided by
-        // real posts worked, not an assumed per-post figure.
-        costPerPostUSD: posts.size ? Number((totalCost / posts.size).toFixed(6)) : null,
-        avgCostPerDayUSD: Number((totalCost / dayCount).toFixed(6)),
+        cacheTokens: totalCache,
+        avgCostPerDayUSD: r6(totalCost / dayCount),
         projectedMonthlyUSD: Number(((totalCost / dayCount) * 30.44).toFixed(2)),
+        projectedMonthlyShadowUSD: Number(((totalShadow / dayCount) * 30.44).toFixed(2)),
       },
-      byDay: sortByCost(byDay),
-      byRoute: sortByCost(byRoute),
-      byModel: sortByCost(byModel),
-      byCampaign: sortByCost(byCampaign),
+
+      // Unit economics — the numbers that price a client. Null where the
+      // denominator is too small to mean anything yet.
+      unitEconomics: {
+        postsScored: scoringCalls,
+        postsTouched: postsTouched.size,
+        postsWorked: postsWorked.size,
+        postsPublished: postsPublished.size,
+        costPerPostScored: scoringCalls ? r6(totalCost / scoringCalls) : null,
+        costPerPostWorked: postsWorked.size ? r6(totalCost / postsWorked.size) : null,
+        costPerCommentPublished: postsPublished.size ? r6(totalCost / postsPublished.size) : null,
+        rapidapiCostPerPost: scoringCalls ? r6((byProvider.rapidapi?.cost || 0) / scoringCalls) : null,
+      },
+
+      // The pipeline, stage by stage. Drop-off between stages is the point.
+      funnel: {
+        rapidapiCalls: rapidCalls,
+        rapidapiEmptyBodies: rapidEmptyBodies,
+        postsScored: scoringCalls,
+        postsOpened: sum(Object.keys(anglesByPost).map(() => 1)) || Object.keys(anglesByPost).length,
+        postsDrafted: postsWorked.size,
+        commentsPublished: postsPublished.size,
+      },
+
+      // Operator behaviour. Ratios return null below the sample floor rather
+      // than presenting noise as signal.
+      behaviour: {
+        draftsGenerated: drafts,
+        regenerates,
+        regenerateRate: ratio(regenerates, drafts),
+        anglesRequests: sum(Object.values(anglesByPost)),
+        anglesPerPost: ratio(sum(Object.values(anglesByPost)), Object.keys(anglesByPost).length),
+        chatTurns: sum(Object.values(chatByPost)),
+        chatTurnsPerPost: ratio(sum(Object.values(chatByPost)), Object.keys(chatByPost).length),
+        draftsPerWorkedPost: ratio(drafts, postsWorked.size),
+        scoringWithReviewerFeedback: scoringWithFeedback,
+        sessions: sessions.length,
+        totalActiveMinutes: Math.round(totalActiveMin),
+        avgSessionMinutes: sessions.length ? Number((totalActiveMin / sessions.length).toFixed(1)) : null,
+        callsPerActiveHour: totalActiveMin > 0 ? Number((records.length / (totalActiveMin / 60)).toFixed(1)) : null,
+        sampleFloor: MIN_SAMPLE_FOR_RATIO,
+      },
+
+      rapidapiPlan: {
+        active: ACTIVE_RAPIDAPI_PLAN,
+        price: plan.price,
+        quota: plan.quota,
+        ratePerCall: Number(plan.rate.toFixed(6)),
+        callsInWindow: rapidCalls,
+        projectedMonthlyCalls: Math.round(rapidMonthlyProjected),
+        projectedQuotaUsed: Number((rapidMonthlyProjected / plan.quota).toFixed(4)),
+        allPlans: RAPIDAPI_PLANS,
+      },
+
+      byProvider: finish(byProvider),
+      byDay: finish(byDay),
+      byRoute: finish(byRoute),
+      byModel: finish(byModel),
+      byCampaign: finish(byCampaign),
+      byHour: finish(byHour),
+
+      // Newest-first detail rows for the drill-down table.
+      recent: records
+        .map((r) => r.fields || {})
+        .sort((a, b) => String(b["Called At"] || "").localeCompare(String(a["Called At"] || "")))
+        .slice(0, 300)
+        .map((f) => ({
+          calledAt: f["Called At"] || "",
+          provider: f.Provider || "",
+          route: f.Route || "",
+          model: f.Model || "",
+          inTok: Number(f["Input Tokens"]) || 0,
+          outTok: Number(f["Output Tokens"]) || 0,
+          cost: Number(f["Cost USD"]) || 0,
+          shadow: Number(f["Shadow Cost USD"]) || 0,
+          postKey: f["Post Key"] || "",
+          campaign: f.Campaign || "",
+          meta: f.Meta || "",
+        })),
+
+      caveats: [
+        "RapidAPI is a monthly subscription. Attributed per-call cost is a share of a bill you already pay, not incremental spend.",
+        `Shadow cost models scoring on ${SHADOW_MODEL}. It is a projection, not a bill.`,
+        `Ratios are suppressed below ${MIN_SAMPLE_FOR_RATIO} observations and shown as no-data rather than as a misleading number.`,
+      ],
     });
   } catch (e) {
     return Response.json({ ok: false, error: e.message }, { status: 500 });
