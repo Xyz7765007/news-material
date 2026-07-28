@@ -147,11 +147,16 @@ export async function GET(request) {
     const postsTouched = new Set();
     const postsWorked = new Set();     // a post that reached a comment draft
     const postsPublished = new Set();  // a post whose comment actually went out
+    // The angle carousel auto-generates a draft for all 3 angles on card mount,
+    // so raw generate-comment rows are ~3x per post BY CONSTRUCTION and measure
+    // nothing about the operator. Only Meta.regenerate === true is a real
+    // rejection, and the honest denominator is DISTINCT POSTS, not raw drafts.
+    const postsRegenerated = new Set();
     const anglesByPost = {}, chatByPost = {}, draftsByPost = {};
     const timestamps = [];
     let totalCost = 0, totalShadow = 0, totalIn = 0, totalOut = 0, totalCache = 0;
     let drafts = 0, regenerates = 0, scoringCalls = 0, scoringWithFeedback = 0;
-    let rapidCalls = 0, rapidEmptyBodies = 0;
+    let rapidCalls = 0, rapidEmptyBodies = 0, unpricedRows = 0;
 
     for (const rec of records) {
       const f = rec.fields || {};
@@ -184,9 +189,14 @@ export async function GET(request) {
         scoringCalls += 1;
         if (meta.hasReviewerFeedback) scoringWithFeedback += 1;
       }
+      if (!String(f["Priced As"] || "") && provider !== "activity") unpricedRows += 1;
+
       if (route === "generate-comment") {
         drafts += 1;
-        if (meta.regenerate) regenerates += 1;
+        if (meta.regenerate) {
+          regenerates += 1;
+          if (postKey) postsRegenerated.add(postKey);
+        }
         if (postKey) {
           postsWorked.add(postKey);
           draftsByPost[postKey] = (draftsByPost[postKey] || 0) + 1;
@@ -261,7 +271,14 @@ export async function GET(request) {
       behaviour: {
         draftsGenerated: drafts,
         regenerates,
-        regenerateRate: ratio(regenerates, drafts),
+        // Denominator is DISTINCT POSTS, not raw drafts. The angle carousel
+        // auto-generates one draft per angle on card mount, so raw drafts are
+        // ~3x per post by construction and a raw ratio would understate
+        // rejection by roughly a third while looking authoritative.
+        postsWithDraft: postsWorked.size,
+        postsRegenerated: postsRegenerated.size,
+        regenerateRate: ratio(postsRegenerated.size, postsWorked.size),
+        regeneratesPerRegeneratedPost: ratio(regenerates, postsRegenerated.size),
         anglesRequests: sum(Object.values(anglesByPost)),
         anglesPerPost: ratio(sum(Object.values(anglesByPost)), Object.keys(anglesByPost).length),
         chatTurns: sum(Object.values(chatByPost)),
@@ -286,7 +303,17 @@ export async function GET(request) {
         allPlans: RAPIDAPI_PLANS,
       },
 
-      byProvider: finish(byProvider),
+      // Rows with no price on record are counted at $0, so every total is low
+      // until the model is added to PRICING. The UI must say this out loud.
+      integrity: { unpricedRows },
+
+      // `activity` rows are zero-cost funnel milestones, not a cost source.
+      // Including them in a spend composition injects a $0 category that reads
+      // as "this provider is free" rather than "this is not a provider".
+      byProvider: finish(
+        Object.fromEntries(Object.entries(byProvider).filter(([p]) => p !== "activity"))
+      ),
+      activityEvents: byProvider.activity ? byProvider.activity.calls : 0,
       byDay: finish(byDay),
       byRoute: finish(byRoute),
       byModel: finish(byModel),
