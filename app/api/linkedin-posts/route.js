@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import { trackOpenAIUsage } from "@/lib/ai-usage";
+import { trackLLMCall } from "@/lib/llm-cost-log";
 import { pickLeadField } from "@/lib/lead-fields";
 import { checkRoleFreshness } from "@/lib/role-freshness";
 import { fetchActiveRelevanceRules } from "@/lib/relevance-rules";
@@ -884,6 +885,17 @@ async function scorePost({ post, lead, campaignContext, systemPromptOverride, ca
       ],
     });
     trackOpenAIUsage({ campaignId, completion: c, action: "score_linkedin_post" });
+    // Per-call row alongside the cumulative counter above — same call, two
+    // granularities. The rollup answers "what has this campaign spent"; this
+    // answers "what does one scored post cost". Fire-and-forget.
+    trackLLMCall({
+      route: "score_linkedin_post",
+      model: c.model || process.env.LINKEDIN_SCORING_MODEL || "gpt-5.4-mini",
+      usage: c.usage,
+      campaignId,
+      postKey: post.url || post.urn || "",
+      meta: { hasReviewerFeedback: !!fb, category: categoryHint || "" },
+    });
     const raw = c.choices?.[0]?.message?.content || "{}";
     let parsed;
     try { parsed = JSON.parse(raw); } catch (e) {
