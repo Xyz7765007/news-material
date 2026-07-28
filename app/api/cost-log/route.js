@@ -170,6 +170,8 @@ export async function GET(request) {
     let totalCost = 0, totalShadow = 0, totalIn = 0, totalOut = 0, totalCache = 0;
     let drafts = 0, regenerates = 0, scoringCalls = 0, scoringWithFeedback = 0;
     let rapidCalls = 0, rapidEmptyBodies = 0, unpricedRows = 0;
+    let rapidFailures = 0, lastRapidError = "";
+    const rapidFailureCodes = {};
 
     for (const rec of records) {
       const f = rec.fields || {};
@@ -195,8 +197,15 @@ export async function GET(request) {
       if (postKey) postsTouched.add(postKey);
 
       if (provider === "rapidapi") {
-        rapidCalls += Number(f.Units) || 1;
+        rapidCalls += Number(f.Units) || 0;
         if (meta.emptyBody) rapidEmptyBodies += 1;
+        // A provider failure must surface as a failure, never as a quiet week.
+        if (meta.failed) {
+          rapidFailures += 1;
+          const code = `${meta.status || "?"}`;
+          rapidFailureCodes[code] = (rapidFailureCodes[code] || 0) + 1;
+          if (meta.error) lastRapidError = String(meta.error).slice(0, 200);
+        }
       }
       if (route.includes("score")) {
         scoringCalls += 1;
@@ -270,6 +279,15 @@ export async function GET(request) {
       },
 
       // The pipeline, stage by stage. Drop-off between stages is the point.
+      // Provider health. Surfaced at the top level, not buried in the funnel,
+      // because a dead subscription invalidates every number below it.
+      providerHealth: {
+        rapidapiFailures: rapidFailures,
+        rapidapiFailureCodes: rapidFailureCodes,
+        lastRapidapiError: lastRapidError,
+        rapidapiEmptyBodies: rapidEmptyBodies,
+      },
+
       funnel: {
         rapidapiCalls: rapidCalls,
         rapidapiEmptyBodies: rapidEmptyBodies,

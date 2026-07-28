@@ -271,6 +271,20 @@ async function rapidCall(path, params, { retries = 3, timeoutMs = 45000 } = {}) 
           await new Promise(res => setTimeout(res, 1500 * (attempt + 1)));
           continue;
         }
+        // Log the failure as a zero-cost row. A dead subscription (403), an
+        // exhausted quota, or a provider outage otherwise looks EXACTLY like a
+        // quiet week: the scan returns no posts and writes nothing, so the
+        // dashboard shows silence and the operator concludes nobody posted.
+        // Cost is 0 because a rejected request is not billed; the row exists so
+        // the failure is visible.
+        trackAPICall({
+          route: path.includes("/posts") ? "rapidapi_user_posts" : "rapidapi_user_profile",
+          host: RAPIDAPI_HOST,
+          campaignId: _costCampaignId,
+          units: 0,
+          action: `error_${r.status}`,
+          meta: { path, status: r.status, error: text.slice(0, 200), failed: true },
+        });
         return { ok: false, status: r.status, error: text.slice(0, 300) };
       }
       // Bill the call. RapidAPI charges per request that reaches the API, so a
