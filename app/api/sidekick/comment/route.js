@@ -168,16 +168,31 @@ async function resolveAccountId(accountId, baseId) {
       );
       if (r.ok) {
         const d = await r.json();
-        const row = (d.records || []).find(
-          (rec) => (rec.fields?.["Airtable Base ID"] || "").trim() === baseId.trim()
-        );
+        // FIELD NAME BUG, fixed 2026-07-28. This matched "Airtable Base ID",
+        // which does not exist on the Campaigns table — the field is "Base ID".
+        // So this lookup ALWAYS missed and every caller silently fell through to
+        // the env/hardcoded fallback below. Harmless while Veloka was the only
+        // campaign; with a second user it meant everyone posted as Kunal.
+        // Both spellings are accepted so a renamed field cannot re-break it.
+        const row = (d.records || []).find((rec) => {
+          const f = rec.fields || {};
+          const v = (f["Base ID"] || f["Airtable Base ID"] || "").trim();
+          return v && v === baseId.trim();
+        });
         const id = row?.fields?.["LinkedIn Account ID"];
         if (id) return id;
       }
     } catch { /* fall through */ }
   }
-  if (process.env.VELOKA_UNIPILE_ACCOUNT_ID) return process.env.VELOKA_UNIPILE_ACCOUNT_ID;
-  if (baseId === VELOKA_BASE) return VELOKA_ACCOUNT_FALLBACK;
+  // BOTH fallbacks are scoped to the Veloka base (2026-07-28). The env check
+  // used to be unconditional, so ANY campaign with no configured account
+  // resolved to Kunal's personal LinkedIn and would have published a second
+  // user's comments under his name. A campaign that has not connected an
+  // account must resolve to "" and be told to connect one.
+  if (baseId === VELOKA_BASE) {
+    if (process.env.VELOKA_UNIPILE_ACCOUNT_ID) return process.env.VELOKA_UNIPILE_ACCOUNT_ID;
+    return VELOKA_ACCOUNT_FALLBACK;
+  }
   return "";
 }
 
