@@ -49,13 +49,13 @@ export async function POST(request) {
     return Response.json({ ok: false, error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const { kind, route, model, usage, campaignId, postKey, action, meta } = body || {};
+  const { kind, route, model, usage, campaignId, user, userLabel, postKey, action, meta } = body || {};
 
   // Zero-cost funnel milestones (comment published, task handled) carry no
   // usage and must not be rejected for lacking one.
   if (kind === "activity") {
     if (!route) return Response.json({ ok: false, error: "route is required" }, { status: 400 });
-    const result = await logActivity({ route, action, campaignId, postKey, meta });
+    const result = await logActivity({ route, action, campaignId, user, userLabel, postKey, meta });
     return Response.json({ ok: result.ok !== false, ...result });
   }
 
@@ -63,7 +63,7 @@ export async function POST(request) {
     return Response.json({ ok: false, error: "route, model and usage are required" }, { status: 400 });
   }
 
-  const result = await logLLMCall({ route, model, usage, campaignId, postKey, action, meta });
+  const result = await logLLMCall({ route, model, usage, campaignId, user, userLabel, postKey, action, meta });
   return Response.json({ ok: result.ok !== false, ...result });
 }
 
@@ -156,7 +156,24 @@ export async function GET(request) {
     if (campaignFilter) records = records.filter((r) => String(r.fields?.Campaign || "").toLowerCase() === campaignFilter);
     if (providerFilter) records = records.filter((r) => String(r.fields?.Provider || "").toLowerCase() === providerFilter);
 
-    const byProvider = {}, byDay = {}, byRoute = {}, byModel = {}, byCampaign = {}, byHour = {};
+    const byProvider = {}, byDay = {}, byRoute = {}, byModel = {}, byCampaign = {}, byHour = {}, byUser = {};
+    // Per-user streams. COST and ACTIVITY are accumulated separately on
+    // purpose: 'what did this person spend' and 'what did this person do'
+    // are different questions, and averaging them into one number answers
+    // neither. One event stream feeds both so they can never disagree.
+    const users = {};
+    const userOf = (f) => String(f.User || '') || '(no session)';
+    function userBucket(f) {
+      const k = userOf(f);
+      if (!users[k]) users[k] = {
+        user: k, label: String(f['User Label'] || '') || k, campaign: String(f.Campaign || ''),
+        cost: { calls: 0, costUSD: 0, inTok: 0, outTok: 0, byProvider: {}, byRoute: {} },
+        activity: { events: 0, postsTouched: new Set(), postsWorked: new Set(), postsPublished: new Set(),
+                    drafts: 0, regenerates: 0, postsRegenerated: new Set(), angles: 0, chats: 0,
+                    firstSeen: '', lastSeen: '', timestamps: [] },
+      };
+      return users[k];
+    }
     const postsTouched = new Set();
     const postsWorked = new Set();     // a post that reached a comment draft
     const postsPublished = new Set();  // a post whose comment actually went out
@@ -186,6 +203,35 @@ export async function GET(request) {
       if (provider !== "activity") bump(byModel, f.Model, f);
       bump(byCampaign, f.Campaign || "(unattributed)", f);
       bump(byHour, String(f.Hour ?? "?"), f);
+      bump(byUser, userOf(f), f);
+
+      // ── per-user split ──
+      const ub = userBucket(f);
+      const rowCost = Number(f["Cost USD"]) || 0;
+      if (provider !== "activity") {
+        ub.cost.calls += 1;
+        ub.cost.costUSD += rowCost;
+        ub.cost.inTok += Number(f["Input Tokens"]) || 0;
+        ub.cost.outTok += Number(f["Output Tokens"]) || 0;
+        ub.cost.byProvider[provider] = (ub.cost.byProvider[provider] || 0) + rowCost;
+        ub.cost.byRoute[route] = (ub.cost.byRoute[route] || 0) + rowCost;
+      }
+      ub.activity.events += 1;
+      if (f["Called At"]) {
+        const ts = String(f["Called At"]);
+        ub.activity.timestamps.push(Date.parse(ts));
+        if (!ub.activity.firstSeen || ts < ub.activity.firstSeen) ub.activity.firstSeen = ts;
+        if (!ub.activity.lastSeen || ts > ub.activity.lastSeen) ub.activity.lastSeen = ts;
+      }
+      if (postKey) ub.activity.postsTouched.add(postKey);
+      if (route === "generate-comment") {
+        ub.activity.drafts += 1;
+        if (postKey) ub.activity.postsWorked.add(postKey);
+        if (meta.regenerate) { ub.activity.regenerates += 1; if (postKey) ub.activity.postsRegenerated.add(postKey); }
+      }
+      if (route === "comment-angles") ub.activity.angles += 1;
+      if (route === "post-chat") ub.activity.chats += 1;
+      if (route === "comment-published" && postKey) ub.activity.postsPublished.add(postKey);
 
       totalCost += Number(f["Cost USD"]) || 0;
       totalShadow += Number(f["Shadow Cost USD"]) || 0;
@@ -341,6 +387,59 @@ export async function GET(request) {
       // `activity` rows are zero-cost funnel milestones, not a cost source.
       // Including them in a spend composition injects a $0 category that reads
       // as "this provider is free" rather than "this is not a provider".
+      // ── PER-USER, cost and activity kept as separate objects ──
+      users: Object.values(users)
+        .map((u) => {
+          const ts = u.activity.timestamps.sort((a, b) => a - b);
+          const sess = [];
+          for (const t of ts) {
+            const last = sess[sess.length - 1];
+            if (!last || t - last.end > SESSION_GAP_MS) sess.push({ start: t, end: t });
+            else last.end = t;
+          }
+          const activeMin = sess.reduce((a, x) => a + (x.end - x.start) / 60000, 0);
+          const worked = u.activity.postsWorked.size;
+          const published = u.activity.postsPublished.size;
+          return {
+            user: u.user,
+            label: u.label,
+            campaign: u.campaign,
+            // What this person SPENT.
+            cost: {
+              calls: u.cost.calls,
+              costUSD: r6(u.cost.costUSD),
+              inputTokens: u.cost.inTok,
+              outputTokens: u.cost.outTok,
+              costPerWorkedPost: worked ? r6(u.cost.costUSD / worked) : null,
+              costPerPublishedComment: published ? r6(u.cost.costUSD / published) : null,
+              byProvider: Object.fromEntries(Object.entries(u.cost.byProvider).map(([k, v]) => [k, r6(v)])),
+              byRoute: Object.fromEntries(
+                Object.entries(u.cost.byRoute).sort((a, b) => b[1] - a[1]).map(([k, v]) => [k, r6(v)])
+              ),
+            },
+            // What this person DID. No money in here by design.
+            activity: {
+              events: u.activity.events,
+              postsTouched: u.activity.postsTouched.size,
+              postsWorked: worked,
+              commentsPublished: published,
+              draftsGenerated: u.activity.drafts,
+              regenerations: u.activity.regenerates,
+              postsRegenerated: u.activity.postsRegenerated.size,
+              regenerateRate: ratio(u.activity.postsRegenerated.size, worked),
+              publishRate: ratio(published, worked),
+              angleRequests: u.activity.angles,
+              chatTurns: u.activity.chats,
+              sessions: sess.length,
+              activeMinutes: Math.round(activeMin),
+              firstSeen: u.activity.firstSeen,
+              lastSeen: u.activity.lastSeen,
+            },
+          };
+        })
+        .sort((a, b) => b.cost.costUSD - a.cost.costUSD),
+
+      byUser: finish(byUser),
       byProvider: finish(
         Object.fromEntries(Object.entries(byProvider).filter(([p]) => p !== "activity"))
       ),
