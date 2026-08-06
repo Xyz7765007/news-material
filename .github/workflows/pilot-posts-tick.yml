@@ -1,0 +1,65 @@
+# Pilot Posts Tick — resume driver for the two sidekick-posts pilot testers.
+#
+# WHY A SECOND TICK FILE INSTEAD OF EXTRA STEPS IN linkedin-posts-tick.yml.
+# That workflow drives Material's scan and is load-bearing for a live client.
+# Its budget is timeout-minutes: 7 against a curl that can hold for 350s;
+# adding two more campaigns to the same job can exceed the timeout and start
+# failing a run that Material depends on. Separate file, separate concurrency
+# group, separate budget — Material's tick keeps working exactly as it did.
+#
+# WHAT THIS FIXES. A linkedin-posts scan processes ~22 leads per 300s function
+# and then parks its progress in the campaign row. Nothing resumes it on its
+# own. Without a tick covering these two campaigns, a scan started for Nirav or
+# Rishabh advances one chunk and stops — looking, from the outside, exactly
+# like a scan that is still running. That failure already cost a 6h silent
+# stall once (2026-06-10, documented in linkedin-posts-tick.yml).
+#
+# Resume is a GET with key/base/campaign query params. The route's POST switch
+# has NO resume mode; a POST bounces. Both campaigns are ticked every run and
+# a campaign with no scan in flight returns IDLE, so this is a no-op except
+# while a scan is actually going.
+#
+# Required secret: CRON_SECRET (already set on this repo for the other ticks).
+
+name: Pilot Posts Tick
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: pilot-posts-tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    # Two campaigns x up to 350s each, plus slack. Must exceed the sum, not the
+    # single-curl budget, or the second campaign is the one that gets cut.
+    timeout-minutes: 14
+    strategy:
+      max-parallel: 1
+      matrix:
+        include:
+          - name: nirav
+            base: app2dS8otxaHx346y
+            campaign: recClRSVAnoS4xk7G
+          - name: rishabh
+            base: appefxdXz1pvF9L9i
+            campaign: reczsqz4e3etoxNHj
+    steps:
+      - name: Resume tick (${{ matrix.name }})
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "$CRON_SECRET" ]; then echo "::error::CRON_SECRET secret not set"; exit 1; fi
+          resp=$(curl -sS -m 350 \
+            "https://news-material-two.vercel.app/api/linkedin-posts?key=$CRON_SECRET&base=${{ matrix.base }}&campaign=${{ matrix.campaign }}" \
+            || echo '{"curl":"failed"}')
+          echo "$resp" | head -c 2000
+          case "$resp" in
+            *'"curl":"failed"'*) echo "::warning::${{ matrix.name }} tick request failed";;
+            *'"status":"running"'*) echo "::notice::${{ matrix.name }} processed a chunk";;
+            *) echo "::notice::${{ matrix.name }} idle or scan not running";;
+          esac
