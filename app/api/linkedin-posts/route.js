@@ -1690,7 +1690,54 @@ async function runLinkedInPostScan({
         };
       });
 
-      const { results: created, errors: createErrors } = await atCreateBatch(baseId, "Tasks", records);
+      // ── LAST-MOMENT DEDUP RE-CHECK ──────────────────────────────────────
+      // `existingTaskUrls` is a snapshot taken once at the top of the run, so
+      // it cannot know about a task another process wrote while this run was
+      // scoring. The resume lock above closes the common case; this closes the
+      // rest (a cron tick racing a UI-started scan, two campaigns' runs
+      // overlapping, a retried invocation). Cost is one filtered list call per
+      // lead that actually has tasks — rare — and it buys an invariant the
+      // operator can rely on: one task per post URL, per rule.
+      //
+      // Deliberately NOT fatal. If this lookup throws, we fall through and
+      // create anyway: a duplicate is bad, but silently dropping a real task
+      // because Airtable blipped is worse.
+      let freshRecords = records;
+      const concurrentlyTakenUrls = new Set();
+      try {
+        const urlsToCheck = records
+          .map(r => (r.fields?.URL || "").trim())
+          .filter(Boolean);
+        if (urlsToCheck.length) {
+          const escapedRule2 = (taskRuleName || "").replace(/"/g, '\\"');
+          const urlClause = urlsToCheck
+            .map(u => `{URL} = "${String(u).replace(/"/g, '\\"')}"`)
+            .join(", ");
+          const dupFormula = `AND({Task Rule} = "${escapedRule2}", OR(${urlClause}))`;
+          const already = await atList(baseId, "Tasks", { filterByFormula: dupFormula, fields: ["URL"] });
+          const takenUrls = new Set(
+            (already || []).map(rec => String(rec.fields?.URL || "").trim()).filter(Boolean)
+          );
+          if (takenUrls.size) {
+            freshRecords = records.filter(r => !takenUrls.has((r.fields?.URL || "").trim()));
+            const skipped = records.length - freshRecords.length;
+            if (skipped > 0) {
+              for (const u of takenUrls) { existingTaskUrls.add(u); concurrentlyTakenUrls.add(u); }
+              progress.posts_deduped = (progress.posts_deduped || 0) + skipped;
+              rejectionReasons["deduped_created_concurrently"] =
+                (rejectionReasons["deduped_created_concurrently"] || 0) + skipped;
+              console.warn(`[linkedin-posts] Last-moment dedup dropped ${skipped} task(s) for ${leadName} — already created by a concurrent run.`);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn(`[linkedin-posts] Last-moment dedup check failed (creating anyway): ${e.message}`);
+      }
+
+      const { results: created, errors: createErrors } =
+        freshRecords.length > 0
+          ? await atCreateBatch(baseId, "Tasks", freshRecords)
+          : { results: [], errors: [] };
       progress.tasks_created += created.length;
 
       // Flip the "pending_task_creation" samples to final state based on what Airtable did.
@@ -1702,6 +1749,11 @@ async function runLinkedInPostScan({
           if (sample.lead !== leadName) continue;
           if (createdUrls.has(sample.post_url)) {
             sample.outcome = "task_created";
+          } else if (concurrentlyTakenUrls.has(sample.post_url)) {
+            // Dropped by the last-moment dedup, NOT a failure. The task exists —
+            // another run created it. Reporting this as a failure would send the
+            // operator hunting a bug that isn't there.
+            sample.outcome = "deduped_concurrent";
           } else {
             sample.outcome = "task_creation_failed";
             sample.error = createErrors[0] || "Task not in Airtable response";
@@ -2233,6 +2285,35 @@ export async function GET(request) {
     }
     if (prior.leads_remaining === 0) {
       return NextResponse.json({ status: "DONE", message: "No leads remaining" });
+    }
+
+    // ── CONCURRENT-RESUME LOCK ──────────────────────────────────────────
+    // The POST scan path has had this since it was written; this path never
+    // did, and the asymmetry produced a real duplicate task on 2026-08-07
+    // (two records for the same post URL, created 9 seconds apart).
+    //
+    // WHY A SECOND RESUME DUPLICATES RATHER THAN NO-OPS. Each invocation
+    // reads `existingTaskUrls` ONCE at the top of the run and dedups against
+    // that snapshot. Two overlapping resumes both snapshot before either
+    // writes, so both see the post as new and both create it. Skipping a
+    // lead is recoverable — the next tick picks it up; double-creating is
+    // not, because the operator sees the same post twice and can comment
+    // twice on one prospect's post.
+    //
+    // 30s matches the POST path: progress is written after every lead
+    // (~5-15s), so a genuinely live scan always has a fresh updated_at,
+    // while a finished-but-not-marked run ages out quickly enough that the
+    // 5-minute tick is never blocked by a stale lock.
+    if (prior.status === "running" && prior.updated_at) {
+      const ageMs = Date.now() - new Date(prior.updated_at).getTime();
+      if (!isNaN(ageMs) && ageMs < 30 * 1000) {
+        return NextResponse.json({
+          status: "BUSY",
+          message: `Another resume is mid-chunk (last progress write ${Math.round(ageMs / 1000)}s ago). Skipping this tick.`,
+          leads_done: prior.leads_done,
+          leads_remaining: prior.leads_remaining,
+        });
+      }
     }
 
     // Resume. Prefer what the run actually started with (saved in progress); when a
