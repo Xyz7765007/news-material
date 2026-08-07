@@ -35,9 +35,28 @@ concurrency:
 jobs:
   tick:
     runs-on: ubuntu-latest
-    # Two campaigns x up to 350s each, plus slack. Must exceed the sum, not the
-    # single-curl budget, or the second campaign is the one that gets cut.
-    timeout-minutes: 14
+    # FOUR campaigns x up to 350s each, plus slack. Must exceed the SUM, not the
+    # single-curl budget, or the last campaign in the matrix is the one that
+    # gets cut — and it would get cut silently, looking like an idle campaign.
+    #
+    # In practice a tick costs nowhere near this: a campaign with no scan in
+    # flight returns IDLE immediately, so the bill is ~350s for the one scan
+    # actually running plus three instant no-ops. The ceiling only matters if
+    # all four ever scan at once.
+    #
+    # WHY max-parallel STAYS 1 AT FOUR CAMPAIGNS. Running them concurrently
+    # would keep wall time flat, but the posts provider soft-rate-limits
+    # parallel bulk fetching by returning empty HTTP 200 bodies rather than
+    # 429s — which the scan records as "this lead has no posts" and marks done.
+    # That failure is invisible and lossy (diagnosed 2026-06-22; see
+    # .learnings/2026-06-22-linkedin-posts-silent-zero-fetch.md). A slower tick
+    # is recoverable; a hollow scan is not.
+    #
+    # If all four do end up scanning together, this job can outlast the 5-minute
+    # cron. That is survivable rather than a backlog: GitHub holds only ONE
+    # pending run per concurrency group, so ticks get less frequent instead of
+    # piling up. Onboarding testers one at a time avoids it entirely.
+    timeout-minutes: 25
     strategy:
       max-parallel: 1
       matrix:
@@ -48,6 +67,13 @@ jobs:
           - name: rishabh
             base: appefxdXz1pvF9L9i
             campaign: reczsqz4e3etoxNHj
+          # Alpha testers added 2026-08-07.
+          - name: sammy
+            base: appVQ7oxmSZ2Q0B7z
+            campaign: recLvKDhqGi5nLszm
+          - name: rahul
+            base: app4yPsHELEL3B88L
+            campaign: recdGs1UDvopu83Mu
     steps:
       - name: Resume tick (${{ matrix.name }})
         env:
