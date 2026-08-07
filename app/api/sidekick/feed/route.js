@@ -44,6 +44,15 @@ function authOk(request) {
 //
 // The chatbot can decide how to render — typically display `lead_name` as the
 // big subject + `company` as smaller context underneath.
+// Engagement-count coercion: a finite number passes through; a clean integer
+// string ('27') parses; anything else (blank, garbage, undefined) stays null so
+// the card hides the metric rather than showing a misleading 0.
+function toCount(v) {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string" && /^\d+$/.test(v.trim())) return parseInt(v.trim(), 10);
+  return null;
+}
+
 function formatCard(record) {
   const f = record.fields || {};
   return {
@@ -66,8 +75,11 @@ function formatCard(record) {
     // Engagement counts on the underlying post (Kunal Jun16). Numbers (incl. 0)
     // when the scan captured them; null when not, so the card can hide the
     // metric rather than show a misleading 0. linkedin_engagement tasks only.
-    post_likes: typeof f["Post Likes"] === "number" ? f["Post Likes"] : null,
-    post_comments: typeof f["Post Comments"] === "number" ? f["Post Comments"] : null,
+    // Coerced, not typeof-gated: pilot-tester bases (Nirav, Rishabh) carry
+    // Post Likes/Comments as TEXT fields, so typecast stores '27' and a strict
+    // number check hid the metric on every card (2026-08-07).
+    post_likes: toCount(f["Post Likes"]),
+    post_comments: toCount(f["Post Comments"]),
     score_reason: f["Score Reason"] || "",
     movement_type: f["Movement Type"] || "",
     url: f.URL || f["Post URL"] || f["Signal URL"] || "",
