@@ -1293,6 +1293,20 @@ async function runLinkedInPostScan({
     consecutive_empty_raw: prior?.consecutive_empty_raw || 0,
     rate_limited_lead_ids: prior?.rate_limited_lead_ids || [],
     errors: prior?.errors || [],
+    // Seeded from prior like every other counter above. These two were NOT, and
+    // because `rejection_reasons` is later assigned wholesale
+    // (`progress.rejection_reasons = rejectionReasons`) rather than merged, each
+    // resume silently OVERWROTE the accumulated map with just its own chunk's
+    // counts. Every long scan resumes, so in practice a finished 225-lead scan
+    // reported an empty rejection map and a handful of samples — the operator
+    // lost the entire "why did nothing qualify" audit trail, which is the single
+    // most useful thing progress carries when a queue comes back empty.
+    // (Found 2026-08-07 while diagnosing a scan that scored 22 posts and reported
+    // zero rejections — an impossible pair that only makes sense as data loss.)
+    // recent_samples stays capped at 20 by the existing slice, so seeding it
+    // cannot grow unbounded.
+    rejection_reasons: prior?.rejection_reasons || {},
+    recent_samples: prior?.recent_samples || [],
     completed_lead_ids: Array.from(completedLeadIds),
     // Scan config persisted so external cron resume knows how to call runLinkedInPostScan
     score_threshold: effectiveThreshold,

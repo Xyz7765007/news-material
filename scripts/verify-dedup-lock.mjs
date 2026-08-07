@@ -78,5 +78,51 @@ eq(dupFormula("R", ['ht"tp']).includes('\\"'), true, "a quote in a URL is escape
 eq(dupFormula("A", [A]) === dupFormula("B", [A]), false,
   "two different rules produce different formulas — dedup is per-rule, not global");
 
+// ── 4. progress counters survive a resume ───────────────────────────────────
+// The constructor seeds every counter from `prior`. `rejection_reasons` and
+// `recent_samples` were missing from that list while being assigned WHOLESALE
+// later, so each resume overwrote the accumulated map with its own chunk.
+function newProgress(prior) {
+  return {
+    leads_done: prior?.leads_done || 0,
+    posts_fetched: prior?.posts_fetched || 0,
+    rejection_reasons: prior?.rejection_reasons || {},
+    recent_samples: prior?.recent_samples || [],
+  };
+}
+// One chunk of work, mirroring the route: read the map, add to it, assign back.
+function runChunk(progress, { fetched = 0, rejections = {}, samples = [] }) {
+  const rejectionReasons = progress.rejection_reasons || {};
+  for (const [k, v] of Object.entries(rejections)) {
+    rejectionReasons[k] = (rejectionReasons[k] || 0) + v;
+  }
+  progress.posts_fetched += fetched;
+  for (const s of samples) progress.recent_samples.unshift(s);
+  if (progress.recent_samples.length > 20) progress.recent_samples = progress.recent_samples.slice(0, 20);
+  progress.rejection_reasons = rejectionReasons;
+  return progress;
+}
+
+let p = runChunk(newProgress(null), { fetched: 40, rejections: { below_threshold_58: 2 }, samples: [{ id: 1 }] });
+p = runChunk(newProgress(p), { fetched: 20, rejections: { below_threshold_58: 1, below_threshold_4: 3 }, samples: [{ id: 2 }] });
+p = runChunk(newProgress(p), { fetched: 14, rejections: {}, samples: [] });
+
+eq(p.posts_fetched, 74, "posts_fetched accumulates across three resumes");
+eq(p.rejection_reasons, { below_threshold_58: 3, below_threshold_4: 3 },
+  "rejection counts accumulate instead of being overwritten by the last chunk");
+eq(p.recent_samples.length, 2, "samples from earlier chunks survive a later empty chunk");
+// The exact shape of the bug: a final chunk with no scored posts used to zero the map.
+eq(Object.keys(runChunk(newProgress(p), { fetched: 0 }).rejection_reasons).length, 2,
+  "a trailing empty chunk no longer wipes the audit trail");
+// The impossible pair that exposed it.
+const impossible = runChunk(newProgress(null), { fetched: 22, rejections: {} });
+eq(impossible.posts_fetched > 0 && Object.keys(impossible.rejection_reasons).length === 0, true,
+  "22 scored with 0 rejections is reproducible ONLY when the map starts empty — the symptom");
+// Cap still holds, so seeding cannot grow the array without bound.
+let capped = newProgress(null);
+for (let i = 0; i < 30; i++) capped = runChunk(newProgress(capped), { samples: [{ id: i }] });
+eq(capped.recent_samples.length, 20, "recent_samples stays capped at 20 across many resumes");
+eq(capped.recent_samples[0].id, 29, "newest sample is first");
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
