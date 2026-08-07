@@ -774,6 +774,54 @@ const CATEGORY_SCORE_CEILING = {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
+// PER-SCAN CATEGORY POLICY (opt-in, added 2026-08-07)
+//
+// WHY THIS EXISTS. The three constants above encode one judgement: that
+// hiring posts, farewells, awards and the rest are never buying signals. That
+// judgement is correct for Veloka and Material, whose leads' recruiting posts
+// are somebody else's noise. It is exactly wrong for the sidekick-posts pilot
+// tester whose entire business IS SDR hiring and training — for him, a sales
+// leader posting "we're hiring SDRs" is the single moment his product is
+// needed, and it was his most-engaged real comment.
+//
+// `hiring` is blocked by FIVE independent gates: hardSkip in categorizePost,
+// membership in NEVER_TASK_CATEGORIES, a ceiling of 10 in
+// CATEGORY_SCORE_CEILING, a ceiling of 10 in scorePost's postTypeCeiling, and
+// absence from VALID_TASK_POST_TYPES. Plus a -100 penalty that floors the
+// score to 0 anyway. No threshold reaches past that, so this is not something
+// a relevance prompt can fix.
+//
+// The rule here: a scan that passes NOTHING gets byte-identical behaviour to
+// before. Every relaxation is explicit, per-scan, and named by the caller.
+// Nobody inherits another tenant's exemption — the same principle the
+// per-tester relevance files exist to enforce.
+// ═══════════════════════════════════════════════════════════════════════════
+function buildCategoryPolicy(overrides) {
+  const o = overrides && typeof overrides === "object" ? overrides : {};
+  const norm = v => new Set((Array.isArray(v) ? v : []).map(s => String(s || "").trim().toLowerCase()).filter(Boolean));
+  const allowCategories = norm(o.allowCategories);
+  const allowPostTypes = norm(o.allowPostTypes);
+  const ceilings = (o.ceilings && typeof o.ceilings === "object") ? o.ceilings : {};
+
+  return {
+    active: allowCategories.size > 0 || allowPostTypes.size > 0 || Object.keys(ceilings).length > 0,
+    allowCategories, allowPostTypes, ceilings,
+    // An allowed category stops being hard-skipped, so the post actually reaches the model.
+    isHardSkip: cat => !!cat.hardSkip && !allowCategories.has(cat.category),
+    isNeverTask: category => NEVER_TASK_CATEGORIES.has(category) && !allowCategories.has(category),
+    isValidPostType: postType => VALID_TASK_POST_TYPES.has(postType) || allowPostTypes.has(String(postType || "").toLowerCase()),
+    ceilingFor: category => {
+      const override = ceilings[category];
+      return typeof override === "number" ? override : CATEGORY_SCORE_CEILING[category];
+    },
+    // The -100 penalty would floor an allowed category back to 0 even after the
+    // ceiling is raised. Neutralising it is what makes the exemption real
+    // rather than cosmetic; a raised ceiling alone would look applied and score 0.
+    penaltyFor: cat => allowCategories.has(cat.category) ? 0 : cat.penalty,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // OPENAI SCORING
 // ═══════════════════════════════════════════════════════════════════════════
 //
@@ -874,7 +922,7 @@ OUTPUT JSON (no other text, no markdown):
 }`;
 }
 
-async function scorePost({ post, lead, campaignContext, systemPromptOverride, categoryHint, campaignId = null, reviewerFeedback = "" }) {
+async function scorePost({ post, lead, campaignContext, systemPromptOverride, categoryHint, campaignId = null, reviewerFeedback = "", postTypeCeilings = null }) {
   const openai = new OpenAI({ apiKey: OPENAI_KEY });
   const f = lead.fields || {};
   const fullName = f.Name || f["Full Name"] || ((f["First Name"] || "") + " " + (f["Last Name"] || "")).trim() || "Unknown";
@@ -957,6 +1005,16 @@ async function scorePost({ post, lead, campaignContext, systemPromptOverride, ca
       pain_point: 100, project_announcement: 95, question_to_network: 90,
       other: 70,
     };
+    // Per-scan overrides, if the caller passed any. Same rule as the pre-filter
+    // policy: no overrides means this table is used exactly as before. This is
+    // the SECOND of two independent cap layers on a post_type, so a scan that
+    // lifted only the pre-filter ceiling would still be capped here — both have
+    // to move together or the exemption does nothing.
+    if (postTypeCeilings && typeof postTypeCeilings === "object") {
+      for (const [k, v] of Object.entries(postTypeCeilings)) {
+        if (typeof v === "number") postTypeCeiling[String(k).toLowerCase()] = v;
+      }
+    }
     const ceiling = postTypeCeiling[postType];
     if (ceiling != null && score > ceiling) {
       sanityFlags.push(`post_type="${postType}" → capped ${ceiling}`);
@@ -1036,6 +1094,31 @@ async function readProgress(campaignAirtableId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// PER-TENANT SCORING CONFIG — stored as app data on the campaign row.
+//
+// Field names are read in ONE place so a rename is a one-line change and can
+// never drift between the reader, the writer and the scan.
+// ═══════════════════════════════════════════════════════════════════════════
+const SCORING_FIELDS = {
+  prompt: "LinkedIn Relevance Prompt",   // long text — this tenant's scoring bar
+  threshold: "LinkedIn Score Threshold", // number   — posts below it never become tasks
+  daysBack: "LinkedIn Days Back",        // number   — post recency window
+  isolated: "Scoring Isolated",          // checkbox — true = never fall back to the built-in prompt
+};
+
+function readScoringConfigFields(fields = {}) {
+  const prompt = String(fields[SCORING_FIELDS.prompt] || "").trim();
+  const threshold = fields[SCORING_FIELDS.threshold];
+  const daysBack = fields[SCORING_FIELDS.daysBack];
+  return {
+    prompt: prompt || null,
+    threshold: typeof threshold === "number" ? threshold : null,
+    daysBack: typeof daysBack === "number" ? daysBack : null,
+    isolated: !!fields[SCORING_FIELDS.isolated],
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // MAIN SCAN FUNCTION
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1043,30 +1126,93 @@ async function runLinkedInPostScan({
   baseId,
   campaignAirtableId,
   leadIds,        // optional: specific lead Airtable IDs (mutually exclusive with whole-campaign)
-  scoreThreshold = 70, // posts below this (after category adjustment) are NOT turned into tasks
-  daysBack = 7,
+  // ⚠ NO DEFAULTS ON THESE THREE — they are resolved below against the campaign row.
+  // A default here would silently outrank the tenant's own stored config.
+  scoreThreshold, // posts below this (after category adjustment) are NOT turned into tasks
+  daysBack,
   taskRuleName = "LinkedIn Post Engagement",
   systemPromptOverride,
+  // OPT-IN per-scan relaxation of the category gates. Omitted = untouched
+  // defaults for every existing campaign. See buildCategoryPolicy.
+  categoryOverrides = null,
   resume = false, // if true, skip leads that already appear in progress.completed
   timeBudgetMs = 270_000, // 270s default for UI runs; cron passes 25_000 for fast returns
 }) {
   const startedAt = new Date().toISOString();
   // Attribute every RapidAPI call in this invocation to the campaign being scanned.
   setCostCampaign(campaignAirtableId);
-  const cutoffMs = Date.now() - (daysBack * 24 * 60 * 60 * 1000);
+
+  // Resolve the category policy ONCE for this invocation. On a resume the
+  // caller re-supplies it from persisted progress, so chunk 2 onward scores by
+  // the same rules as chunk 1 — an override that only applied to the first 22
+  // leads would produce a queue with two different bars in it and nothing on
+  // screen would say so.
+  const catPolicy = buildCategoryPolicy(categoryOverrides);
 
   // Load campaign for context
   let campaignContext = "";
   let campaignName = "";
   let reviewerFeedback = ""; // Signal Review demote/promote memory for linkedin_engagement
+  // ─── PER-TENANT SCORING CONFIG (see resolveScoringConfig below) ───
+  let campScoring = {};
   if (campaignAirtableId) {
     const camp = await atGet(MASTER_BASE_ID, "Campaigns", campaignAirtableId);
     if (camp) {
       campaignContext = camp.fields?.["Email Reference"] || camp.fields?.["ICP Description"] || camp.fields?.["Campaign Context"] || "";
       campaignName = camp.fields?.Name || camp.fields?.["Campaign Name"] || "";
       reviewerFeedback = camp.fields?.["LinkedIn Posts Feedback"] || "";
+      campScoring = readScoringConfigFields(camp.fields);
     }
   }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // SCORING CONFIG RESOLUTION — the tenancy boundary for post relevance.
+  //
+  // The app is multi-tenant and each user's bar is DIFFERENT. Storing that bar
+  // as app data on the user's own campaign row (rather than in a caller, a
+  // config file or this code) is what lets user #437 be onboarded with one
+  // write and zero deploys — and it makes EVERY entry point resolve the same
+  // bar, which the caller-passes-it model did not:
+  //
+  //   - POST {action:"scan"} took the prompt off the request body,
+  //   - POST {action:"scan", resume:true} did too, and then OVERWROTE the
+  //     persisted config with whatever it got. A resume tick that forgot to
+  //     re-send the prompt silently reverted that tenant to the built-in
+  //     default — i.e. to ANOTHER client's bar — for every remaining lead.
+  //   - GET (cron) rehydrated from saved progress, so it drifted differently.
+  //
+  // Now all three land here. An explicit body value still wins (one-off
+  // experiments, and it keeps existing callers byte-identical), then the
+  // tenant's stored config, then the built-in default.
+  //
+  // FAIL CLOSED: a campaign flagged `Scoring Isolated` with no prompt of its
+  // own ABORTS instead of falling through to the default. That flag is set on
+  // every multi-tenant user at provisioning. The asymmetry it protects: an
+  // empty queue is a visible problem someone fixes, whereas a queue scored on
+  // another client's criteria looks exactly like the product working — and
+  // reads to the user as the product's judgement.
+  // ═══════════════════════════════════════════════════════════════════════
+  if (campScoring.isolated && !String(systemPromptOverride || campScoring.prompt || "").trim()) {
+    throw new Error(
+      `Campaign ${campaignAirtableId} is marked "Scoring Isolated" but has no "LinkedIn Relevance Prompt". ` +
+      `Refusing to scan: falling back to the built-in prompt would score this user's posts against another tenant's bar. ` +
+      `Set their prompt with {action:"set_scoring_config"}.`
+    );
+  }
+  const effectivePrompt =
+    (systemPromptOverride && systemPromptOverride.trim()) ? systemPromptOverride
+    : (campScoring.prompt || null);
+  const effectiveThreshold =
+    typeof scoreThreshold === "number" ? scoreThreshold
+    : typeof campScoring.threshold === "number" ? campScoring.threshold
+    : 70;
+  const effectiveDaysBack =
+    typeof daysBack === "number" ? daysBack
+    : typeof campScoring.daysBack === "number" ? campScoring.daysBack
+    : 7;
+  // From here down these three are the ONLY values used. The parameters are
+  // deliberately not reassigned so the distinction stays visible while reading.
+  const cutoffMs = Date.now() - (effectiveDaysBack * 24 * 60 * 60 * 1000);
 
   // Note: old-task cleanup is handled at the handler level (see the "scan" case in POST),
   // not here. If autoCleanupDays was passed, stale tasks have already been deleted before
@@ -1149,10 +1295,14 @@ async function runLinkedInPostScan({
     errors: prior?.errors || [],
     completed_lead_ids: Array.from(completedLeadIds),
     // Scan config persisted so external cron resume knows how to call runLinkedInPostScan
-    score_threshold: scoreThreshold,
-    days_back: daysBack,
+    score_threshold: effectiveThreshold,
+    days_back: effectiveDaysBack,
     task_rule_name: taskRuleName,
-    system_prompt_override: systemPromptOverride || null,
+    system_prompt_override: effectivePrompt || null,
+    // Persisted for the same reason the prompt and threshold are: the resume
+    // tick calls back in with only what progress remembers. Null for every scan
+    // that did not pass one, which is every existing campaign.
+    category_overrides: catPolicy.active ? categoryOverrides : null,
     // Persist the scan's lead scope. On a FRESH scan (resume=false) use THIS run's leadIds —
     // a new scoped run must NOT inherit a previous completed scan's scope (that hijacks it back
     // onto the old lead set). On resume, preserve the original scope so cron-triggered resumes
@@ -1301,8 +1451,8 @@ async function runLinkedInPostScan({
 
     if (fetchedPosts.length === 0) {
       const reason = postsResult.undatableCount
-        ? `${postsResult.rawReturnedCount} posts returned, ${postsResult.undatableCount} had no parseable date, others older than ${daysBack} days`
-        : `no posts in last ${daysBack} days`;
+        ? `${postsResult.rawReturnedCount} posts returned, ${postsResult.undatableCount} had no parseable date, others older than ${effectiveDaysBack} days`
+        : `no posts in last ${effectiveDaysBack} days`;
       progress.last_log = `[${i + 1}/${leads.length}] ${leadName}: ${reason}`;
       progress.completed_lead_ids.push(lead.id);
       progress.leads_done++;
@@ -1329,14 +1479,14 @@ async function runLinkedInPostScan({
       rollupCategoryCounts[cat.category] = (rollupCategoryCounts[cat.category] || 0) + 1;
 
       // Hard skip: definitely-not-a-signal categories never hit OpenAI. Saves cost + prevents false positives.
-      if (cat.hardSkip) {
+      if (catPolicy.isHardSkip(cat)) {
         progress.posts_filtered_out++;
         rejectionReasons[`skipped_${cat.category}`] = (rejectionReasons[`skipped_${cat.category}`] || 0) + 1;
         continue;
       }
 
       // Also skip "never-task" categories even without hardSkip — just count and move on
-      if (NEVER_TASK_CATEGORIES.has(cat.category)) {
+      if (catPolicy.isNeverTask(cat.category)) {
         progress.posts_filtered_out++;
         rejectionReasons[`skipped_${cat.category}`] = (rejectionReasons[`skipped_${cat.category}`] || 0) + 1;
         continue;
@@ -1348,10 +1498,11 @@ async function runLinkedInPostScan({
       await writeProgress(campaignAirtableId, progress);
 
       const scored = await scorePost({
-        post, lead, campaignContext, systemPromptOverride,
+        post, lead, campaignContext, effectivePrompt,
         categoryHint: cat.category,
         campaignId: campaignAirtableId,
         reviewerFeedback,
+        postTypeCeilings: catPolicy.active ? catPolicy.ceilings : null,
       });
       progress.posts_scored++;
 
@@ -1365,24 +1516,24 @@ async function runLinkedInPostScan({
       // 2. Apps-Script category ceiling (belt-and-braces — prevents AI+AI-post-type agreement error)
       // 3. Category penalty (subtractive adjustment on top of ceiling)
       let adjusted = scored.relevance_score;
-      const ceiling = CATEGORY_SCORE_CEILING[cat.category];
+      const ceiling = catPolicy.ceilingFor(cat.category);
       if (ceiling != null && adjusted > ceiling) adjusted = ceiling;
-      adjusted = Math.max(0, Math.min(100, adjusted + cat.penalty));
+      adjusted = Math.max(0, Math.min(100, adjusted + catPolicy.penaltyFor(cat)));
 
       // Determine final outcome (same logic as task creation at line 1132-1136)
-      const wouldCreateTask = adjusted >= scoreThreshold
-        && VALID_TASK_POST_TYPES.has(scored.post_type)
-        && !NEVER_TASK_CATEGORIES.has(cat.category);
+      const wouldCreateTask = adjusted >= effectiveThreshold
+        && catPolicy.isValidPostType(scored.post_type)
+        && !catPolicy.isNeverTask(cat.category);
 
       const reasonCode = wouldCreateTask
         ? "task_created"
-        : adjusted < scoreThreshold
-          ? (scored.relevance_score >= scoreThreshold
+        : adjusted < effectiveThreshold
+          ? (scored.relevance_score >= effectiveThreshold
               ? `ai_scored_${scored.relevance_score}_but_capped_by_${cat.category}_to_${adjusted}`
               : `below_threshold_${adjusted}`)
-          : NEVER_TASK_CATEGORIES.has(cat.category)
+          : catPolicy.isNeverTask(cat.category)
             ? `score_${adjusted}_but_category_${cat.category}_never_creates_tasks`
-            : !VALID_TASK_POST_TYPES.has(scored.post_type)
+            : !catPolicy.isValidPostType(scored.post_type)
               ? `score_${adjusted}_but_post_type_${scored.post_type}_not_engagement_worthy`
               : `dropped_${adjusted}`;
       rejectionReasons[reasonCode] = (rejectionReasons[reasonCode] || 0) + 1;
@@ -1403,7 +1554,7 @@ async function runLinkedInPostScan({
       // without having to look up individual tasks. Especially useful for debugging "why nothing passed".
       // Outcome is optimistic here — will flip to "task_creation_failed" later if Airtable rejects.
       // For now: "would_create_task" (pending batch write) or "dropped" (decision final).
-      const willAttemptTask = adjusted >= scoreThreshold && VALID_TASK_POST_TYPES.has(scored.post_type) && !NEVER_TASK_CATEGORIES.has(cat.category);
+      const willAttemptTask = adjusted >= effectiveThreshold && catPolicy.isValidPostType(scored.post_type) && !catPolicy.isNeverTask(cat.category);
       if (!progress.recent_samples) progress.recent_samples = [];
       progress.recent_samples.unshift({
         lead: leadName,
@@ -1427,9 +1578,9 @@ async function runLinkedInPostScan({
 
     // Step 4: Only post_types that CAN be buying signals create tasks
     const taskWorthy = scoredPosts.filter(sp =>
-      sp.adjusted_score >= scoreThreshold &&
-      VALID_TASK_POST_TYPES.has(sp.post_type) &&
-      !NEVER_TASK_CATEGORIES.has(sp.category)
+      sp.adjusted_score >= effectiveThreshold &&
+      catPolicy.isValidPostType(sp.post_type) &&
+      !catPolicy.isNeverTask(sp.category)
     );
 
     // ── Role-freshness gate ──────────────────────────────────────
@@ -1582,7 +1733,7 @@ async function runLinkedInPostScan({
     try {
       const ARCHIVE_ON = process.env.LINKEDIN_SUBTHRESHOLD_ARCHIVE !== "false";
       const RETAIN_FLOOR = parseInt(process.env.LINKEDIN_RETAIN_FLOOR) || 40;
-      const isTaskWorthy = sp => sp.adjusted_score >= scoreThreshold && VALID_TASK_POST_TYPES.has(sp.post_type) && !NEVER_TASK_CATEGORIES.has(sp.category);
+      const isTaskWorthy = sp => sp.adjusted_score >= effectiveThreshold && catPolicy.isValidPostType(sp.post_type) && !catPolicy.isNeverTask(sp.category);
       const nonQual = ARCHIVE_ON ? scoredPosts.filter(sp => !isTaskWorthy(sp) && sp.adjusted_score >= RETAIN_FLOOR) : [];
       if (nonQual.length) {
         const todayStr2 = new Date().toISOString().slice(0, 10);
@@ -1598,7 +1749,7 @@ async function runLinkedInPostScan({
             "Signal Status": "unqualified", Score: sp.adjusted_score, "Scan Target": leadName,
             "Lead Title": pickLeadField(f, "title"), Email: pickLeadField(f, "email"),
             "LinkedIn URL": pickLeadField(f, "linkedinUrl"), ...eng,
-            Signal: [postUrl ? `🔗 ${postUrl}` : null, `📝 ${sp.structured_sentence}`, ``, `💬 Suggested comment: ${sp.suggested_comment}`, ``, `🔍 Evidence: "${sp.evidence_quote}"`, ``, `💡 ${sp.rationale}`, ``, `📊 Score ${sp.adjusted_score}/100 (below ${scoreThreshold} bar) · type ${sp.post_type} · category ${sp.category}`].filter(v => v !== null).join("\n"),
+            Signal: [postUrl ? `🔗 ${postUrl}` : null, `📝 ${sp.structured_sentence}`, ``, `💬 Suggested comment: ${sp.suggested_comment}`, ``, `🔍 Evidence: "${sp.evidence_quote}"`, ``, `💡 ${sp.rationale}`, ``, `📊 Score ${sp.adjusted_score}/100 (below ${effectiveThreshold} bar) · type ${sp.post_type} · category ${sp.category}`].filter(v => v !== null).join("\n"),
             "Post Text": (sp.post.text || "").slice(0, 3000),
             "Score Reason": `below_threshold ${sp.adjusted_score} (cat ${sp.category}, type ${sp.post_type})`,
             URL: postUrl, "Post URL": postUrl, "Signal URL": postUrl,
@@ -1660,6 +1811,86 @@ export async function POST(request) {
         if (!campaignAirtableId) return NextResponse.json({ error: "campaignAirtableId required" }, { status: 400 });
         const progress = await readProgress(campaignAirtableId);
         return NextResponse.json({ ok: true, progress });
+      }
+
+      // ─── PER-TENANT SCORING CONFIG: read ───
+      // Onboarding user #437 is these two actions, not a deploy.
+      case "get_scoring_config": {
+        const { campaignAirtableId } = body;
+        if (!campaignAirtableId) return NextResponse.json({ error: "campaignAirtableId required" }, { status: 400 });
+        const camp = await atGet(MASTER_BASE_ID, "Campaigns", campaignAirtableId);
+        if (!camp) return NextResponse.json({ error: "campaign not found" }, { status: 404 });
+        const cfg = readScoringConfigFields(camp.fields);
+        return NextResponse.json({
+          ok: true,
+          campaign: camp.fields?.Name || camp.fields?.["Campaign Name"] || null,
+          config: {
+            ...cfg,
+            // The prompt can be thousands of chars; return a fingerprint by default so
+            // callers can verify WHICH bar is set without hauling it around. Pass
+            // includePrompt:true to read it back in full.
+            prompt: body.includePrompt ? cfg.prompt : null,
+            prompt_chars: cfg.prompt ? cfg.prompt.length : 0,
+            prompt_set: !!cfg.prompt,
+          },
+          effective_if_scanned_now: {
+            threshold: typeof cfg.threshold === "number" ? cfg.threshold : 70,
+            days_back: typeof cfg.daysBack === "number" ? cfg.daysBack : 7,
+            // The whole point of the isolated flag, stated plainly for the caller.
+            prompt_source: cfg.prompt ? "this campaign" : (cfg.isolated ? "NONE — scan will refuse" : "built-in default (shared)"),
+          },
+        });
+      }
+
+      // ─── PER-TENANT SCORING CONFIG: write ───
+      // PARTIAL BY DESIGN: only the keys present in the body are written, so
+      // updating a threshold cannot blank a 6KB relevance prompt.
+      case "set_scoring_config": {
+        const { campaignAirtableId, relevancePrompt, scoreThreshold, daysBack, isolated } = body;
+        if (!campaignAirtableId) return NextResponse.json({ error: "campaignAirtableId required" }, { status: 400 });
+
+        const fields = {};
+        if (typeof relevancePrompt === "string") {
+          const trimmed = relevancePrompt.trim();
+          // Refuse to store a stub as if it were a bar. A 40-char prompt scores as
+          // confidently as a good one and there is no error to notice afterwards.
+          if (trimmed && trimmed.length < 200) {
+            return NextResponse.json({
+              error: `relevancePrompt is only ${trimmed.length} chars — too short to be a real scoring bar. ` +
+                     `Send the full criteria, or send "" to deliberately clear it.`,
+            }, { status: 400 });
+          }
+          fields[SCORING_FIELDS.prompt] = trimmed;
+        }
+        if (typeof scoreThreshold === "number") {
+          if (scoreThreshold < 1 || scoreThreshold > 100) {
+            return NextResponse.json({ error: "scoreThreshold must be 1-100" }, { status: 400 });
+          }
+          fields[SCORING_FIELDS.threshold] = scoreThreshold;
+        }
+        if (typeof daysBack === "number") {
+          if (daysBack < 1 || daysBack > 90) {
+            return NextResponse.json({ error: "daysBack must be 1-90" }, { status: 400 });
+          }
+          fields[SCORING_FIELDS.daysBack] = daysBack;
+        }
+        if (typeof isolated === "boolean") fields[SCORING_FIELDS.isolated] = isolated;
+
+        if (!Object.keys(fields).length) {
+          return NextResponse.json({ error: "nothing to set — pass relevancePrompt, scoreThreshold, daysBack and/or isolated" }, { status: 400 });
+        }
+
+        // atUpdateWithAutoCreate creates any missing field on the master Campaigns
+        // table, so a brand-new tenant needs no schema step before this call.
+        await atUpdateWithAutoCreate(MASTER_BASE_ID, "Campaigns", campaignAirtableId, fields);
+
+        const after = await atGet(MASTER_BASE_ID, "Campaigns", campaignAirtableId);
+        const cfg = readScoringConfigFields(after?.fields || {});
+        return NextResponse.json({
+          ok: true,
+          updated: Object.keys(fields),
+          config: { ...cfg, prompt: null, prompt_chars: cfg.prompt ? cfg.prompt.length : 0, prompt_set: !!cfg.prompt },
+        });
       }
 
       // Returns the live default scoring prompt + sanity-check rules + output schema.
@@ -1824,7 +2055,7 @@ export async function POST(request) {
         // Kick off a scan. This is a long-running op (can take several minutes for large campaigns).
         // Vercel has a 60s limit on Hobby, 300s on Pro — so we process as much as we can within the
         // budget, leaving progress state. User hits "resume" to continue.
-        const { baseId, campaignAirtableId, leadIds, scoreThreshold, daysBack, taskRuleName, systemPromptOverride, resume, force, autoCleanupDays, autoCleanupExcludePushed } = body;
+        const { baseId, campaignAirtableId, leadIds, scoreThreshold, daysBack, taskRuleName, systemPromptOverride, categoryOverrides, resume, force, autoCleanupDays, autoCleanupExcludePushed } = body;
         if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
         if (!campaignAirtableId) return NextResponse.json({ error: "campaignAirtableId required" }, { status: 400 });
         if (!OPENAI_KEY) return NextResponse.json({ error: "OPENAI_API_KEY not set" }, { status: 400 });
@@ -1872,12 +2103,16 @@ export async function POST(request) {
           }
         }
 
+        // Pass these THROUGH — do not default them here. An explicit body value still
+        // wins, but `undefined` must stay undefined so the campaign's own stored
+        // config is what fills the gap, not a hardcoded 70/7 from this call site.
         const result = await runLinkedInPostScan({
           baseId, campaignAirtableId, leadIds,
-          scoreThreshold: typeof scoreThreshold === "number" ? scoreThreshold : 70,
-          daysBack: typeof daysBack === "number" ? daysBack : 7,
+          scoreThreshold: typeof scoreThreshold === "number" ? scoreThreshold : undefined,
+          daysBack: typeof daysBack === "number" ? daysBack : undefined,
           taskRuleName: taskRuleName || "LinkedIn Post Engagement",
           systemPromptOverride,
+          categoryOverrides: categoryOverrides || null,
           resume: !!resume,
         });
         if (cleanedUp > 0) result.auto_cleaned_up = cleanedUp;
@@ -2000,11 +2235,16 @@ export async function GET(request) {
       return NextResponse.json({ status: "DONE", message: "No leads remaining" });
     }
 
-    // Resume. Pull scoreThreshold/daysBack/systemPromptOverride from the prior progress if available,
-    // otherwise use safe defaults. The scan function reads these as args.
-    const scoreThreshold = typeof prior.score_threshold === "number" ? prior.score_threshold : 70;
-    const daysBack = typeof prior.days_back === "number" ? prior.days_back : 7;
+    // Resume. Prefer what the run actually started with (saved in progress); when a
+    // field is absent, pass undefined so runLinkedInPostScan resolves it from the
+    // campaign's own scoring config. Defaulting to 70/7 here would outrank that
+    // config and re-introduce the drift between this path and the POST one.
+    const scoreThreshold = typeof prior.score_threshold === "number" ? prior.score_threshold : undefined;
+    const daysBack = typeof prior.days_back === "number" ? prior.days_back : undefined;
     const ruleName = prior.task_rule_name || taskRuleName;
+    // Carry the category policy across the resume boundary. Without this the
+    // tick would silently revert to the shared defaults partway through a scan.
+    const categoryOverrides = prior.category_overrides || null;
 
     // Use a SHORT time budget (25s) when called from cron so cron-job.org's 30s HTTP
     // timeout doesn't register as "Failed" on every tick. Processes ~3 leads per call.
@@ -2017,6 +2257,7 @@ export async function GET(request) {
       daysBack,
       taskRuleName: ruleName,
       systemPromptOverride: prior.system_prompt_override || null,
+      categoryOverrides,
       resume: true,
       timeBudgetMs: 25_000,
     });
