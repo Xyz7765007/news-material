@@ -1775,9 +1775,26 @@ async function runLinkedInPostScan({
         // written when the provider actually returned a number; null is omitted
         // so the card can distinguish "no data" from a genuine 0. Columns are
         // auto-stripped by atCreateBatch on bases that haven't run setup-fix.
+        // WRITTEN AS STRINGS ON PURPOSE — this is the fix for a two-day bug.
+        //
+        // These columns are `number` on Veloka and `singleLineText` on every
+        // pilot base. Airtable's typecast does NOT coerce a raw JSON number
+        // into a singleLineText column: it returns INVALID_VALUE_FOR_COLUMN,
+        // the auto-heal strips the field, and the task is created silently
+        // missing its engagement counts. That is exactly why Veloka has counts
+        // and the pilot bases never did.
+        //
+        // A string works for BOTH column types — typecast converts "9" to 9 for
+        // a number column — so this is correct everywhere rather than a
+        // per-base special case.
+        //
+        // It took three wrong diagnoses to find because every probe went
+        // through /api/airtable, whose sanitizeFields() stringifies values
+        // before writing. The proxy was silently doing the very coercion the
+        // scan was missing, so the probe could never reproduce the failure.
         const engagementFields = {};
-        if (typeof sp.post.likes === "number") engagementFields["Post Likes"] = sp.post.likes;
-        if (typeof sp.post.comments === "number") engagementFields["Post Comments"] = sp.post.comments;
+        if (typeof sp.post.likes === "number") engagementFields["Post Likes"] = String(sp.post.likes);
+        if (typeof sp.post.comments === "number") engagementFields["Post Comments"] = String(sp.post.comments);
 
         return {
           fields: {
@@ -1954,8 +1971,10 @@ async function runLinkedInPostScan({
         const archRecords = nonQual.map(sp => {
           const postUrl = sp.post.url || "";
           const eng = {};
-          if (typeof sp.post.likes === "number") eng["Post Likes"] = sp.post.likes;
-          if (typeof sp.post.comments === "number") eng["Post Comments"] = sp.post.comments;
+          // Strings, for the same reason as the task path above — a raw number
+          // is rejected by a singleLineText column and silently stripped.
+          if (typeof sp.post.likes === "number") eng["Post Likes"] = String(sp.post.likes);
+          if (typeof sp.post.comments === "number") eng["Post Comments"] = String(sp.post.comments);
           const postDateStr = (() => { const d = new Date(sp.post.date || nowISO2); return isNaN(d.getTime()) ? todayStr2 : d.toISOString().slice(0, 10); })();
           return { fields: {
             Name: leadName, Company: leadCompany, "Task Rule": taskRuleName,
