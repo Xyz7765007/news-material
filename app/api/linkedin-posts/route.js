@@ -130,6 +130,16 @@ async function atCreateBatch(baseId, table, records) {
     return { ok: false, error: `${r.status}: ${errText}`, strippedFields };
   }
 
+  // Fields that CARRY THE SIGNAL ITSELF. Stripping one of these still produces a
+  // task Airtable accepts and the feed renders, so the loss is invisible unless
+  // we say so — the operator sees a card with no post body, or engagement counts
+  // that silently became "no data". Not in CRITICAL_FIELDS because aborting the
+  // record would lose the whole task, which is worse; we create it AND shout.
+  // (Samarth 2026-08-07: "please dont lose any data like the post content and
+  // the likes and comments count.")
+  const DATA_BEARING_FIELDS = new Set(["Post Text", "Post Likes", "Post Comments", "Post Date", "URL"]);
+  const strippedDataFields = new Set();
+
   for (let i = 0; i < records.length; i += 10) {
     const batch = records.slice(i, i + 10);
     const result = await tryBatchWithStripping(batch);
@@ -137,13 +147,18 @@ async function atCreateBatch(baseId, table, records) {
       results.push(...result.records);
       if (result.strippedFields.length > 0) {
         console.log(`[linkedin-posts] Batch succeeded after stripping: ${result.strippedFields.join(", ")}`);
+        for (const f of result.strippedFields) {
+          if (DATA_BEARING_FIELDS.has(f)) strippedDataFields.add(f);
+        }
       }
     } else {
       console.error(`[linkedin-posts] Task batch failed permanently:`, result.error);
       errors.push(result.error);
     }
   }
-  return { results, errors };
+  // Returned so the caller can surface it in progress.errors. A console.warn is
+  // not a report — nobody reads Vercel logs while triaging an empty-looking card.
+  return { results, errors, strippedDataFields: Array.from(strippedDataFields) };
 }
 
 // Auto-create missing fields + retry (for status-progress field on Campaigns, or scoring fields on Leads)
@@ -1748,11 +1763,52 @@ async function runLinkedInPostScan({
         console.warn(`[linkedin-posts] Last-moment dedup check failed (creating anyway): ${e.message}`);
       }
 
-      const { results: created, errors: createErrors } =
+      const { results: created, errors: createErrors, strippedDataFields } =
         freshRecords.length > 0
           ? await atCreateBatch(baseId, "Tasks", freshRecords)
-          : { results: [], errors: [] };
+          : { results: [], errors: [], strippedDataFields: [] };
       progress.tasks_created += created.length;
+
+      // ── DATA-LOSS REPORTING ─────────────────────────────────────────────
+      // Two ways the post body or its engagement counts can go missing without
+      // anything looking wrong, both silent before this:
+      //
+      //   (a) Airtable rejected the column and the auto-heal stripped it. The
+      //       task is created and renders; the post body or counts are just
+      //       gone.
+      //   (b) We had the numbers in hand and they did not survive into the
+      //       stored record. This is the unexplained 2026-08-07 case: the
+      //       provider returned likes=41/comments=0, the fields exist on the
+      //       base and accept numbers, yet the created task came back empty.
+      //
+      // Null engagement is LEGITIMATE when the provider simply didn't return
+      // counts — Kunal's rule is that a false "0 comments" reads as a real
+      // signal, so we never default to 0. That is exactly why this check
+      // compares against what we ACTUALLY HAD rather than against zero: it
+      // fires only when data we held failed to land.
+      if (strippedDataFields && strippedDataFields.length) {
+        progress.errors.push(
+          `⚠️ DATA LOSS for ${leadName}: Airtable rejected ${strippedDataFields.join(", ")} — task(s) created WITHOUT ${strippedDataFields.length > 1 ? "those fields" : "that field"}. Run setup-fix on this base.`
+        );
+      }
+      if (created.length) {
+        const byUrl = new Map(created.map(rec => [String(rec.fields?.URL || "").trim(), rec]));
+        for (const sp of taskWorthy) {
+          const rec = byUrl.get((sp.post?.url || "").trim());
+          if (!rec) continue;
+          const lost = [];
+          if (typeof sp.post.likes === "number" && rec.fields?.["Post Likes"] === undefined) lost.push("Post Likes");
+          if (typeof sp.post.comments === "number" && rec.fields?.["Post Comments"] === undefined) lost.push("Post Comments");
+          const wantedText = (sp.post.text || "").slice(0, 3000);
+          if (wantedText && !String(rec.fields?.["Post Text"] || "").trim()) lost.push("Post Text");
+          if (lost.length) {
+            progress.errors.push(
+              `⚠️ DATA LOSS for ${leadName}: had ${lost.join(", ")} from the provider but the stored task is missing ${lost.length > 1 ? "them" : "it"} (task ${rec.id}).`
+            );
+            console.error(`[linkedin-posts] Engagement/post data did not persist for ${leadName} (${rec.id}): ${lost.join(", ")}`);
+          }
+        }
+      }
 
       // Flip the "pending_task_creation" samples to final state based on what Airtable did.
       if (progress.recent_samples) {

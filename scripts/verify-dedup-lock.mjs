@@ -124,5 +124,45 @@ for (let i = 0; i < 30; i++) capped = runChunk(newProgress(capped), { samples: [
 eq(capped.recent_samples.length, 20, "recent_samples stays capped at 20 across many resumes");
 eq(capped.recent_samples[0].id, 29, "newest sample is first");
 
+// ── 5. data-loss detection ──────────────────────────────────────────────────
+// Fires only when data we HELD failed to land. Null engagement from the provider
+// is legitimate (Kunal: never fake a 0), so comparing against zero would cry wolf
+// on every post that genuinely has no counts.
+const DATA_BEARING = new Set(["Post Text", "Post Likes", "Post Comments", "Post Date", "URL"]);
+const strippedDataFields = f => f.filter(x => DATA_BEARING.has(x));
+
+eq(strippedDataFields(["Post URL", "Signal URL"]), [],
+  "stripping fields that carry no signal is not reported as data loss");
+eq(strippedDataFields(["Post URL", "Post Likes"]), ["Post Likes"],
+  "a stripped engagement column IS reported");
+eq(strippedDataFields(["Post Text"]), ["Post Text"], "a stripped post body IS reported");
+
+function lostFields(post, storedFields) {
+  const lost = [];
+  if (typeof post.likes === "number" && storedFields["Post Likes"] === undefined) lost.push("Post Likes");
+  if (typeof post.comments === "number" && storedFields["Post Comments"] === undefined) lost.push("Post Comments");
+  const wantedText = (post.text || "").slice(0, 3000);
+  if (wantedText && !String(storedFields["Post Text"] || "").trim()) lost.push("Post Text");
+  return lost;
+}
+// The exact 2026-08-07 case: provider gave 41/0, stored record has neither.
+eq(lostFields({ likes: 41, comments: 0, text: "hello world" }, { "Post Text": "hello world" }),
+  ["Post Likes", "Post Comments"], "the real incident is detected");
+eq(lostFields({ likes: 41, comments: 0, text: "x" }, { "Post Likes": "41", "Post Comments": "0", "Post Text": "x" }),
+  [], "a fully-persisted task reports nothing");
+// comments: 0 is a REAL value and must be tracked, not treated as absent.
+eq(lostFields({ likes: 41, comments: 0, text: "x" }, { "Post Likes": "41", "Post Text": "x" }),
+  ["Post Comments"], "a genuine zero that failed to store is still data loss");
+// The provider not returning counts is not a defect — do not cry wolf.
+eq(lostFields({ likes: null, comments: null, text: "x" }, { "Post Text": "x" }), [],
+  "null engagement from the provider is legitimate, never reported");
+eq(lostFields({ likes: undefined, comments: undefined, text: "x" }, { "Post Text": "x" }), [],
+  "undefined engagement is legitimate too");
+// Losing the post body is the worst case — the card has nothing to show.
+eq(lostFields({ likes: null, comments: null, text: "a real post" }, { "Post Text": "" }),
+  ["Post Text"], "an empty stored body when we had text IS data loss");
+eq(lostFields({ likes: null, comments: null, text: "" }, {}), [],
+  "no text to begin with is not a loss");
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
