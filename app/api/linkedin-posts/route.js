@@ -120,6 +120,12 @@ async function atCreateBatch(baseId, table, records) {
           return { ok: false, error: `Critical field "${badField}" rejected by Airtable. Fix the schema or value type. Error: ${errText.slice(0, 200)}`, strippedFields };
         }
         console.warn(`[linkedin-posts] Stripping bad field "${badField}" from Tasks batch (attempt ${strippedFields.length + 1}). Error: ${errText.slice(0, 200)}`);
+        // Keep WHY Airtable rejected it, not just which field. "Airtable
+        // rejected Post Likes" sent me hunting a missing column twice when the
+        // column existed and accepted the same value on a single-record write —
+        // the reason lives in this string and was only ever going to a log
+        // nobody reads while triaging.
+        stripReasons.push(`${badField}: ${errText.replace(/\s+/g, " ").slice(0, 220)}`);
         const stripped = batch.map(rec => {
           const f = { ...rec.fields };
           delete f[badField];
@@ -140,6 +146,7 @@ async function atCreateBatch(baseId, table, records) {
   // the likes and comments count.")
   const DATA_BEARING_FIELDS = new Set(["Post Text", "Post Likes", "Post Comments", "Post Date", "URL"]);
   const strippedDataFields = new Set();
+  const stripReasons = [];
 
   for (let i = 0; i < records.length; i += 10) {
     const batch = records.slice(i, i + 10);
@@ -159,7 +166,7 @@ async function atCreateBatch(baseId, table, records) {
   }
   // Returned so the caller can surface it in progress.errors. A console.warn is
   // not a report — nobody reads Vercel logs while triaging an empty-looking card.
-  return { results, errors, strippedDataFields: Array.from(strippedDataFields) };
+  return { results, errors, strippedDataFields: Array.from(strippedDataFields), stripReasons };
 }
 
 // Auto-create missing fields + retry (for status-progress field on Campaigns, or scoring fields on Leads)
@@ -1847,10 +1854,10 @@ async function runLinkedInPostScan({
         console.warn(`[linkedin-posts] Last-moment dedup check failed (creating anyway): ${e.message}`);
       }
 
-      const { results: created, errors: createErrors, strippedDataFields } =
+      const { results: created, errors: createErrors, strippedDataFields, stripReasons } =
         freshRecords.length > 0
           ? await atCreateBatch(baseId, "Tasks", freshRecords)
-          : { results: [], errors: [], strippedDataFields: [] };
+          : { results: [], errors: [], strippedDataFields: [], stripReasons: [] };
       progress.tasks_created += created.length;
 
       // ── DATA-LOSS REPORTING ─────────────────────────────────────────────
@@ -1872,7 +1879,7 @@ async function runLinkedInPostScan({
       // fires only when data we held failed to land.
       if (strippedDataFields && strippedDataFields.length) {
         progress.errors.push(
-          `⚠️ DATA LOSS for ${leadName}: Airtable rejected ${strippedDataFields.join(", ")} — task(s) created WITHOUT ${strippedDataFields.length > 1 ? "those fields" : "that field"}. Run setup-fix on this base.`
+          `⚠️ DATA LOSS for ${leadName}: Airtable rejected ${strippedDataFields.join(", ")} — task(s) created WITHOUT ${strippedDataFields.length > 1 ? "those fields" : "that field"}. Airtable said: ${(stripReasons || []).join(" | ").slice(0, 400) || "(no reason captured)"}`
         );
       }
       if (created.length) {
