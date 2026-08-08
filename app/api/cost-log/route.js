@@ -466,6 +466,14 @@ export async function GET(request) {
           shadow: Number(f["Shadow Cost USD"]) || 0,
           postKey: f["Post Key"] || "",
           campaign: f.Campaign || "",
+          // The event feed omitted these, so the Users lens could show a
+          // per-user TOTAL but nothing underneath it — "see each user's cost
+          // and activity individually in detail" stopped at the aggregate.
+          // The underlying rows have carried User all along.
+          user: f.User || "",
+          userLabel: f["User Label"] || "",
+          action: f.Action || "",
+          kind: f.Kind || "",
           meta: f.Meta || "",
         })),
 

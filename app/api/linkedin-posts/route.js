@@ -247,6 +247,25 @@ let rapidMinIntervalMs = 1200; // starts at 1.2s, grows after 429s
 let _costCampaignId = "";
 export function setCostCampaign(id) { _costCampaignId = String(id || ""); }
 
+// Owner attribution for the SAME rows. The cost tracker was built around a
+// browser session, so every interactive call carries a User — but the scan is
+// server-side and cron-driven, has no session, and is where nearly all the
+// money goes. Measured 2026-08-08: 96.6% of 30-day spend ($109.49 of $113.30)
+// and 99% of that day's spend sat in a "(no session)" bucket, which made
+// "show me this user's cost" unanswerable for the part that actually costs.
+//
+// A scan runs for exactly one campaign, and a campaign has exactly one owner,
+// so the campaign row is the honest source. Read from `Owner User` /
+// `Owner Label` on the master Campaigns row — NOT hardcoded here, because a
+// hardcoded tenant in a multi-tenant app is what billed a pilot user to Veloka
+// once already. No owner on the row attributes to "", never to a guess.
+let _costUser = "";
+let _costUserLabel = "";
+export function setCostUser(user, label) {
+  _costUser = String(user || "");
+  _costUserLabel = String(label || user || "");
+}
+
 async function rapidCall(path, params, { retries = 3, timeoutMs = 45000 } = {}) {
   if (!RAPIDAPI_KEY) return { ok: false, status: 0, error: "RAPIDAPI_KEY not set in Vercel env" };
   const qs = new URLSearchParams(params).toString();
@@ -297,6 +316,8 @@ async function rapidCall(path, params, { retries = 3, timeoutMs = 45000 } = {}) 
           route: path.includes("/posts") ? "rapidapi_user_posts" : "rapidapi_user_profile",
           host: RAPIDAPI_HOST,
           campaignId: _costCampaignId,
+          user: _costUser,
+          userLabel: _costUserLabel,
           units: 0,
           action: `error_${r.status}`,
           meta: { path, status: r.status, error: text.slice(0, 200), failed: true },
@@ -310,6 +331,8 @@ async function rapidCall(path, params, { retries = 3, timeoutMs = 45000 } = {}) 
         route: path.includes("/posts") ? "rapidapi_user_posts" : "rapidapi_user_profile",
         host: RAPIDAPI_HOST,
         campaignId: _costCampaignId,
+        user: _costUser,
+        userLabel: _costUserLabel,
         action: path,
         meta: { path, page: params?.page || "", emptyBody: text.length < 40 },
       });
@@ -997,6 +1020,10 @@ async function scorePost({ post, lead, campaignContext, systemPromptOverride, ca
       model: c.model || process.env.LINKEDIN_SCORING_MODEL || "gpt-5.4-mini",
       usage: c.usage,
       campaignId,
+      // Same owner attribution as the RapidAPI rows — scoring is server-side
+      // too, so without this every scored post lands in "(no session)".
+      user: _costUser,
+      userLabel: _costUserLabel,
       postKey: post.url || post.urn || "",
       meta: { hasReviewerFeedback: !!fb, category: categoryHint || "" },
     });
@@ -1187,6 +1214,8 @@ async function runLinkedInPostScan({
       campaignContext = camp.fields?.["Email Reference"] || camp.fields?.["ICP Description"] || camp.fields?.["Campaign Context"] || "";
       campaignName = camp.fields?.Name || camp.fields?.["Campaign Name"] || "";
       reviewerFeedback = camp.fields?.["LinkedIn Posts Feedback"] || "";
+      // Owner for cost attribution — see setCostUser above.
+      setCostUser(camp.fields?.["Owner User"] || "", camp.fields?.["Owner Label"] || "");
       campScoring = readScoringConfigFields(camp.fields);
     }
   }
