@@ -481,6 +481,7 @@ export async function GET(request) {
         "RapidAPI is a monthly subscription. Attributed per-call cost is a share of a bill you already pay, not incremental spend.",
         `Shadow cost models scoring on ${SHADOW_MODEL}. It is a projection, not a bill.`,
         `Ratios are suppressed below ${MIN_SAMPLE_FOR_RATIO} observations and shown as no-data rather than as a misleading number.`,
+        "Server-side scan spend was attributed to a user from 2026-08-08 08:20 UTC. Rows before that carry no user and sit under \"(no session)\" — they are real spend, not an error, and are deliberately not back-filled because the owner cannot be recovered from the row. Read per-user totals as from-that-point-forward.",
       ],
     });
   } catch (e) {
