@@ -84,6 +84,27 @@ export async function fetchPreferences(baseId, itemType, limit = 15) {
   const formulaType = safeType.replace(/"/g, "");
   const cap = Math.min(Math.max(parseInt(limit, 10) || 15, 1), 50);
 
+  // THE SCOPE FILTER APPLIES TO VOICE TYPES ONLY.
+  //
+  // It exists to stop a one-off steer ("mention the 1m figure") from being
+  // applied to EVERY future comment draft. That reasoning holds for comment /
+  // dm / connection_note, which are injected into a generator that rewrites
+  // them into new copy.
+  //
+  // It is exactly backwards for the SCORING types. A skip reason is ALWAYS
+  // about one specific lead — that is what it IS — and "not a sales leader"
+  // or "vendor product launches are not useful to me" is precisely the
+  // correction the scan needs. Caught during QA 2026-08-07: the classifier
+  // stamped both test skip reasons "specific" and the filter then removed
+  // them, so feedback that had just been rescued from one silent drop was
+  // being silently dropped again one layer down.
+  //
+  // The judgement about which notes generalise is made where it belongs —
+  // in the scoring prompt, which is told to weigh them and not let a one-off
+  // remark override the bar.
+  const SCORING_TYPES = new Set(["task_feedback", "skip_reason"]);
+  const scopeClause = SCORING_TYPES.has(safeType) ? "" : `, {Scope} != "specific"`;
+
   const params = new URLSearchParams({
     // Only STANDING feedback is injected into future prompts.
     //
@@ -98,7 +119,7 @@ export async function fetchPreferences(baseId, itemType, limit = 15) {
     // "unclassified". Both must keep flowing exactly as they do today, so the
     // filter is a denylist of one value, not an allowlist. Nothing regresses;
     // the only change is that post-specific steers stop leaking forward.
-    filterByFormula: `AND({Item Type} = "${formulaType}", {Scope} != "specific")`,
+    filterByFormula: `AND({Item Type} = "${formulaType}"${scopeClause})`,
     "sort[0][field]": "Created At",
     "sort[0][direction]": "desc",
     pageSize: String(cap),
