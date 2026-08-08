@@ -105,10 +105,35 @@ export async function fetchPreferences(baseId, itemType, limit = 15) {
   });
 
   try {
-    const r = await fetch(`${AT_API}/${baseId}/${encodeURIComponent(FEEDBACK_TABLE)}?${params.toString()}`, {
+    let r = await fetch(`${AT_API}/${baseId}/${encodeURIComponent(FEEDBACK_TABLE)}?${params.toString()}`, {
       headers: { Authorization: `Bearer ${AIRTABLE_KEY}` },
       cache: "no-store",
     });
+    // ── FALLBACK: the Scope column may not exist on this base ──────────
+    // Scope was added to the schema after these tables were created, and
+    // setup-fix reports an existing table as "already_complete" without
+    // backfilling the new field. Airtable 422s on an unknown field in
+    // filterByFormula, and the old `if (!r.ok) return []` turned that into
+    // an empty list — silently switching the ENTIRE feedback loop off for
+    // every item type on that base, which is exactly what happened in
+    // production on 2026-08-07: comment prefs went from 5 notes to 0 and
+    // nothing reported an error.
+    //
+    // Retry without the Scope clause. The cost is that one-off steers are
+    // not filtered out on a base missing the column — the pre-Scope
+    // behaviour, which is strictly better than losing every note.
+    if (!r.ok && String(formulaType)) {
+      const fallback = new URLSearchParams(params);
+      fallback.set("filterByFormula", `{Item Type} = "${formulaType}"`);
+      const r2 = await fetch(`${AT_API}/${baseId}/${encodeURIComponent(FEEDBACK_TABLE)}?${fallback.toString()}`, {
+        headers: { Authorization: `Bearer ${AIRTABLE_KEY}` },
+        cache: "no-store",
+      });
+      if (r2.ok) {
+        console.warn(`[preferences] Scope filter failed on ${baseId} (likely missing column) — falling back to unfiltered read. Run setup-fix to add Scope.`);
+        r = r2;
+      }
+    }
     if (!r.ok) return [];
     const data = await r.json();
     return (data.records || []).map(rec => {
