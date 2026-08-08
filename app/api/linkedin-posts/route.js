@@ -6,6 +6,7 @@ import { pickLeadField } from "@/lib/lead-fields";
 import { checkRoleFreshness } from "@/lib/role-freshness";
 import { fetchActiveRelevanceRules } from "@/lib/relevance-rules";
 import { LINKEDIN_CONNECTORS_ENABLED, connectorDisabledResponse } from "@/lib/connector-flags";
+import { fetchPreferences } from "@/app/api/sidekick/preferences/route.js";
 
 // Role-freshness gate: confirm a lead still belongs to the company before we
 // create an engagement task (Kunal, 2026-06-04 — never surface "engage with
@@ -937,7 +938,7 @@ OUTPUT JSON (no other text, no markdown):
 }`;
 }
 
-async function scorePost({ post, lead, campaignContext, systemPromptOverride, categoryHint, campaignId = null, reviewerFeedback = "", postTypeCeilings = null }) {
+async function scorePost({ post, lead, campaignContext, systemPromptOverride, categoryHint, campaignId = null, reviewerFeedback = "", operatorFeedback = "", postTypeCeilings = null }) {
   const openai = new OpenAI({ apiKey: OPENAI_KEY });
   const f = lead.fields || {};
   const fullName = f.Name || f["Full Name"] || ((f["First Name"] || "") + " " + (f["Last Name"] || "")).trim() || "Unknown";
@@ -962,6 +963,16 @@ async function scorePost({ post, lead, campaignContext, systemPromptOverride, ca
   const fb = String(reviewerFeedback || "").trim().slice(0, 4000);
   if (fb) {
     systemPrompt += `\n\nREVIEWER FEEDBACK — human corrections on past post scoring for this campaign (most recent last). DEMOTED = the AI's score was too HIGH for that post; score similar posts LOWER. PROMOTED = too LOW; score similar posts HIGHER. Apply these corrections; do NOT repeat these mistakes:\n${fb}`;
+  }
+  // Operator feedback given on the CARD — what they said about a lead, and why
+  // they skipped one. Framed as evidence to weigh rather than as a rule, because
+  // these notes are written in passing about one lead and are not always meant
+  // as a general policy. Judging which of them generalise is the model's job;
+  // the alternative — applying every note as a hard rule — is how one throwaway
+  // remark quietly reshapes an entire queue.
+  const ofb = String(operatorFeedback || "").trim().slice(0, 3000);
+  if (ofb) {
+    systemPrompt += `\n\nOPERATOR FEEDBACK — notes this operator left on leads and on posts they skipped, most recent last. A "WHY THEY SKIPPED" note is a direct statement that a post like that should NOT have reached them, so weigh it heavily against similar posts. An "ABOUT A LEAD" note tells you what they care about in a prospect. USE YOUR JUDGEMENT about which notes state a general preference and which were about one specific post — apply the general ones, and do not let a one-off remark override the scoring bar above:\n${ofb}`;
   }
 
   try {
@@ -1178,6 +1189,49 @@ async function runLinkedInPostScan({
       reviewerFeedback = camp.fields?.["LinkedIn Posts Feedback"] || "";
       campScoring = readScoringConfigFields(camp.fields);
     }
+  }
+
+  // ─── OPERATOR FEEDBACK FROM THE CARD → SCORING ────────────────────────
+  // Until 2026-08-07 the ONLY feedback scoring ever saw was `reviewerFeedback`
+  // — Signal Review demotes/promotes made in the SignalScope admin UI. The
+  // feedback the operator gives on the CARD, in the app they actually use, went
+  // to the `Sidekick Feedback` table and was read by nothing. Veloka had 22
+  // stored task_feedback notes that no prompt had ever seen.
+  //
+  // Two types are loaded, and they mean opposite things:
+  //   task_feedback — what the operator said ABOUT A LEAD or a surfaced task.
+  //   skip_reason   — why they skipped one. This is the sharper signal, because
+  //                   it is a direct statement that something should NOT have
+  //                   scored well enough to appear.
+  //
+  // Only STANDING notes are used. fetchPreferences already filters to
+  // Scope = generic/unclassified and excludes one-off steers, which is what
+  // stops "wrong angle for THIS post" from being applied to every future scan.
+  //
+  // Best-effort and non-fatal: fetchPreferences never throws and returns [] on
+  // a missing table, so a base that has not run setup-fix scores exactly as it
+  // does today rather than failing.
+  let operatorFeedback = "";
+  try {
+    const [leadNotes, skipNotes] = await Promise.all([
+      fetchPreferences(baseId, "task_feedback", 12),
+      fetchPreferences(baseId, "skip_reason", 12),
+    ]);
+    const lines = [];
+    for (const n of leadNotes || []) {
+      const t = String(n.feedback_text || "").trim();
+      if (t) lines.push(`ABOUT A LEAD${n.lead_name ? ` (${n.lead_name})` : ""}: ${t}`);
+    }
+    for (const n of skipNotes || []) {
+      const t = String(n.feedback_text || "").trim();
+      if (t) lines.push(`WHY THEY SKIPPED${n.lead_name ? ` (${n.lead_name})` : ""}: ${t}`);
+    }
+    operatorFeedback = lines.join("\n").slice(0, 3000);
+    if (operatorFeedback) {
+      progress.last_log = `Loaded ${lines.length} operator feedback note(s) into scoring.`;
+    }
+  } catch (e) {
+    console.warn(`[linkedin-posts] Operator feedback load failed (scoring continues): ${e.message}`);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -1531,6 +1585,7 @@ async function runLinkedInPostScan({
         categoryHint: cat.category,
         campaignId: campaignAirtableId,
         reviewerFeedback,
+        operatorFeedback,
         postTypeCeilings: catPolicy.active ? catPolicy.ceilings : null,
       });
       progress.posts_scored++;

@@ -37,7 +37,16 @@ const SIDEKICK_API_KEY = process.env.SIDEKICK_API_KEY;
 const AT_API = "https://api.airtable.com/v0";
 
 const FEEDBACK_TABLE = "Sidekick Feedback";
-const VALID_ITEM_TYPES = ["comment", "connection_note", "dm"];
+// task_feedback and skip_reason were MISSING here until 2026-08-07, and the
+// consequence was silent: the write path has accepted task_feedback for weeks,
+// so Veloka had 22 stored task_feedback notes that this reader returned
+// count:0 for — indistinguishable from passing a nonsense item_type. Operator
+// feedback on a LEAD was being captured and then read by nothing.
+//
+// Adding them here does NOT mix them into comment drafting. Every query filters
+// on an exact Item Type match, so `?item_type=comment` still returns only
+// comment notes. This only makes the other two retrievable at all.
+const VALID_ITEM_TYPES = ["comment", "connection_note", "dm", "task_feedback", "skip_reason"];
 
 function authOk(request) {
   if (!SIDEKICK_API_KEY) return false;
@@ -53,6 +62,8 @@ function normalizeItemType(raw) {
   if (t === "dm" || /^dm\s*[123]$/.test(t) || /^dm[123]$/.test(t)) return "dm";
   if (t === "connection_note" || t === "connection note") return "connection_note";
   if (t === "comment") return "comment";
+  if (t === "task_feedback" || t === "task feedback") return "task_feedback";
+  if (t === "skip_reason" || t === "skip reason") return "skip_reason";
   return null;
 }
 
@@ -74,7 +85,20 @@ export async function fetchPreferences(baseId, itemType, limit = 15) {
   const cap = Math.min(Math.max(parseInt(limit, 10) || 15, 1), 50);
 
   const params = new URLSearchParams({
-    filterByFormula: `{Item Type} = "${formulaType}"`,
+    // Only STANDING feedback is injected into future prompts.
+    //
+    // These notes are handed to the comment generator and override the voice
+    // rules, so a one-off steer ("mention the 1m figure", "wrong angle for a
+    // CFO") applied to every later draft is contamination, not learning. The
+    // capture route labels each note generic | specific | unclassified.
+    //
+    // Excluding only "specific" is deliberate rather than requiring
+    // "generic": legacy rows written before Scope existed have a BLANK value,
+    // and rows written while the classifier was unreachable are
+    // "unclassified". Both must keep flowing exactly as they do today, so the
+    // filter is a denylist of one value, not an allowlist. Nothing regresses;
+    // the only change is that post-specific steers stop leaking forward.
+    filterByFormula: `AND({Item Type} = "${formulaType}", {Scope} != "specific")`,
     "sort[0][field]": "Created At",
     "sort[0][direction]": "desc",
     pageSize: String(cap),

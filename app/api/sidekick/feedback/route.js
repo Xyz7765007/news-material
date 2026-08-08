@@ -48,6 +48,66 @@ export const maxDuration = 30;
 const AIRTABLE_KEY = process.env.AIRTABLE_API_KEY;
 const SIDEKICK_API_KEY = process.env.SIDEKICK_API_KEY;
 const AT_API = "https://api.airtable.com/v0";
+const OPENAI_KEY = process.env.OPENAI_API_KEY;
+
+// ── Scope classifier ───────────────────────────────────────────────
+// "generic"      -> a standing rule about how comments should read. Applies to
+//                   any future post. THIS is what gets fed back into the prompt.
+// "specific"     -> about this one post/comment: a fact, a figure, this lead,
+//                   this angle. Retained for audit, never injected.
+// "unclassified" -> the model could not be reached. Treated as generic by
+//                   preferences so behaviour never regresses on an outage.
+const SCOPE_SYSTEM = `You label one piece of operator feedback about an AI-drafted LinkedIn comment.
+
+Decide whether the feedback is a STANDING rule or a ONE-OFF steer.
+
+"generic" = a rule about how comments should be written that would still make sense
+applied to a completely different post. Voice, tone, length, structure, formatting,
+things to always do or never do. Examples: "stop using em dashes", "too long, keep it
+under 25 words", "never open with praise", "always end on a question", "stop sounding
+salesy", "don't summarise the post back to them".
+
+"specific" = tied to THIS post, THIS lead or THIS draft, and would be wrong or
+meaningless applied to another post. Examples: "mention the 1m figure", "he already
+said that in the post", "this is the wrong angle for a CFO", "the number is 84 not 48",
+"ask about their Q3 launch instead".
+
+If the feedback contains BOTH a standing rule and a post-specific correction, label it
+"generic" only if the standing rule is the main point; otherwise "specific".
+When genuinely torn, choose "specific" - a missed standing rule costs one repeat of a
+correction, whereas a wrongly promoted one-off contaminates every future comment.
+
+Return ONLY JSON: {"scope":"generic"|"specific","why":"max 12 words"}`;
+
+async function classifyScope(note, span) {
+  if (!OPENAI_KEY) return "unclassified";
+  try {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-5.4-mini",
+        temperature: 0,
+        // gpt-5.4-mini silently returns empty on max_tokens — this MUST be
+        // max_completion_tokens (the May-16 outage).
+        max_completion_tokens: 60,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: SCOPE_SYSTEM },
+          { role: "user", content: `Highlighted text the operator reacted to:\n"""${(span || "(none)").slice(0, 600)}"""\n\nTheir feedback:\n"""${note.slice(0, 1200)}"""` },
+        ],
+      }),
+      cache: "no-store",
+    });
+    if (!r.ok) return "unclassified";
+    const d = await r.json();
+    const parsed = JSON.parse(d.choices?.[0]?.message?.content || "{}");
+    return parsed.scope === "generic" || parsed.scope === "specific" ? parsed.scope : "unclassified";
+  } catch {
+    // Never let classification failure lose the operator's feedback.
+    return "unclassified";
+  }
+}
 
 const FEEDBACK_TABLE = "Sidekick Feedback";
 // comment / connection_note / dm are STYLE feedback read back as generation
@@ -56,7 +116,7 @@ const FEEDBACK_TABLE = "Sidekick Feedback";
 // junior"). It is captured durably but deliberately NOT in the style-pref
 // taxonomy — the preferences reader whitelists the three style types, so
 // task_feedback can never leak into comment/DM generation.
-const VALID_ITEM_TYPES = ["comment", "connection_note", "dm", "task_feedback"];
+const VALID_ITEM_TYPES = ["comment", "connection_note", "dm", "task_feedback", "skip_reason"];
 
 function authOk(request) {
   if (!SIDEKICK_API_KEY) return false;
@@ -71,6 +131,13 @@ function normalizeItemType(raw) {
   if (t === "connection_note" || t === "connection note") return "connection_note";
   if (t === "comment") return "comment";
   if (t === "task_feedback" || t === "task feedback") return "task_feedback";
+  // skip_reason was REJECTED with a 400 until 2026-08-07 while the card UI was
+  // still sending it (SideKick.jsx sends skip_reason when the operator gives a
+  // reason for skipping a lead). The browser does not surface that 400, so the
+  // operator typed a reason, saw it accepted, and it was thrown away. Why the
+  // reason someone skipped a lead matters: it is the clearest statement of what
+  // should NOT have scored, which is exactly what the scan needs to learn from.
+  if (t === "skip_reason" || t === "skip reason") return "skip_reason";
   return null;
 }
 
@@ -99,12 +166,32 @@ export async function POST(request) {
   // Name is the primary field — make the Airtable UI row readable.
   const nameSnippet = `${itemType}: ${note.slice(0, 50).replace(/\s+/g, " ").trim()}`;
 
+  // ═══════════════════════════════════════════════════════════════════
+  // SCOPE CLASSIFICATION — generic standing rule vs one-off steer.
+  //
+  // Why this exists: /api/sidekick/preferences hands the last N notes to the
+  // comment generator, which applies them to EVERY future draft and lets them
+  // override the voice rules. Without a scope, "mention the 1m figure" (about
+  // one post) is applied with exactly the same force as "never use em dashes"
+  // (a standing rule), so a single steer quietly contaminates every later
+  // comment. Samarth 2026-08-07: generic content feedback should feed the
+  // prompt for new comments - which means something has to decide what is
+  // generic, and that is this.
+  //
+  // FAILS OPEN TO TODAY'S BEHAVIOUR. If the model is unavailable (the
+  // insufficient_quota outage earlier today is the live example) the note is
+  // stored "unclassified", and preferences INCLUDES unclassified. So an AI
+  // outage degrades to exactly the current behaviour rather than silently
+  // switching the learning loop off.
+  const scope = await classifyScope(note, span);
+
   const fields = {
     Name: nameSnippet.slice(0, 100),
     "Item Type": itemType,
     "Quoted Span": span,
     "Feedback Text": note,
     "Created At": nowISO,
+    Scope: scope,
   };
   if (lead_name) fields["Lead Name"] = String(lead_name).slice(0, 200);
   if (lead_company) fields["Lead Company"] = String(lead_company).slice(0, 200);
