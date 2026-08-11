@@ -2356,7 +2356,14 @@ export async function POST(request) {
         // Accepts EITHER { baseId, leadId } OR a raw { urn } (Kunal Jun16
         // engagement-count verification — lets us confirm the provider's real
         // like/comment field names against any known URN without a lead row).
-        const { baseId, leadId, urn: rawUrn, username } = body;
+        // `daysBack` and `maxPages` added 2026-08-11: this is the only path that
+        // returns posts WITHOUT running the OpenAI scorer, which makes it the
+        // right fetcher when a human is doing the scoring. Both default to the
+        // previous hardcoded values, so every existing debug call behaves
+        // exactly as before.
+        const { baseId, leadId, urn: rawUrn, username, daysBack, maxPages } = body;
+        const tpDays = Number.isFinite(Number(daysBack)) && Number(daysBack) > 0 ? Number(daysBack) : 7;
+        const tpPages = Number.isFinite(Number(maxPages)) && Number(maxPages) > 0 ? Math.min(Number(maxPages), 3) : 1;
         let urn = rawUrn;
         let cached = false;
         // Resolve a bare { username } (e.g. "williamhgates") → URN via the
@@ -2375,8 +2382,8 @@ export async function POST(request) {
           urn = urnResult.urn;
           cached = !!urnResult.cached;
         }
-        const cutoffMs = Date.now() - (7 * 86400000);
-        const posts = await fetchPostsForUrn(urn, cutoffMs, 1);
+        const cutoffMs = Date.now() - (tpDays * 86400000);
+        const posts = await fetchPostsForUrn(urn, cutoffMs, tpPages);
         // Echo the RAW first-post keys + a preview so we can confirm which field
         // carries reactions/comments (the scan logs this too, but this is easier).
         let raw_first_post_keys = null, raw_first_post_preview = null;
