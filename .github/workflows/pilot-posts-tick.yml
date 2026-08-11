@@ -1,4 +1,5 @@
-# Pilot Posts Tick — resume driver for the two sidekick-posts pilot testers.
+# Pilot Posts Tick — resume driver for the sidekick-posts pilot testers
+# (five as of 2026-08-11: nirav, rishabh, sammy, rahul, roopam).
 #
 # WHY A SECOND TICK FILE INSTEAD OF EXTRA STEPS IN linkedin-posts-tick.yml.
 # That workflow drives Material's scan and is load-bearing for a live client.
@@ -35,16 +36,19 @@ concurrency:
 jobs:
   tick:
     runs-on: ubuntu-latest
-    # FOUR campaigns x up to 350s each, plus slack. Must exceed the SUM, not the
+    # FIVE campaigns x up to 350s each, plus slack. Must exceed the SUM, not the
     # single-curl budget, or the last campaign in the matrix is the one that
     # gets cut — and it would get cut silently, looking like an idle campaign.
+    # Raised 25 -> 30 when Roopam was added on 2026-08-11: 5 x 350s is ~29
+    # minutes, which the old ceiling did not cover. The matrix and the budget
+    # have to move together or adding a tester quietly starves the last one.
     #
     # In practice a tick costs nowhere near this: a campaign with no scan in
     # flight returns IDLE immediately, so the bill is ~350s for the one scan
-    # actually running plus three instant no-ops. The ceiling only matters if
-    # all four ever scan at once.
+    # actually running plus four instant no-ops. The ceiling only matters if
+    # all five ever scan at once.
     #
-    # WHY max-parallel STAYS 1 AT FOUR CAMPAIGNS. Running them concurrently
+    # WHY max-parallel STAYS 1 AT FIVE CAMPAIGNS. Running them concurrently
     # would keep wall time flat, but the posts provider soft-rate-limits
     # parallel bulk fetching by returning empty HTTP 200 bodies rather than
     # 429s — which the scan records as "this lead has no posts" and marks done.
@@ -52,11 +56,11 @@ jobs:
     # .learnings/2026-06-22-linkedin-posts-silent-zero-fetch.md). A slower tick
     # is recoverable; a hollow scan is not.
     #
-    # If all four do end up scanning together, this job can outlast the 5-minute
+    # If all five do end up scanning together, this job can outlast the 5-minute
     # cron. That is survivable rather than a backlog: GitHub holds only ONE
     # pending run per concurrency group, so ticks get less frequent instead of
     # piling up. Onboarding testers one at a time avoids it entirely.
-    timeout-minutes: 25
+    timeout-minutes: 30
     strategy:
       max-parallel: 1
       matrix:
@@ -74,6 +78,10 @@ jobs:
           - name: rahul
             base: app4yPsHELEL3B88L
             campaign: recdGs1UDvopu83Mu
+          # Alpha tester added 2026-08-11.
+          - name: roopam
+            base: apppThWqVVB9PvZgE
+            campaign: reclb4SapKCZHZv9f
     steps:
       - name: Resume tick (${{ matrix.name }})
         env:
