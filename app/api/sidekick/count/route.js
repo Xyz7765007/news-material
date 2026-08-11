@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { postDateGate } from "@/lib/feed-post-age";
 import { fetchActiveRelevanceRules, withSuppression } from "@/lib/relevance-rules.js";
 
 // ═══════════════════════════════════════════════════════════════════
@@ -55,7 +56,10 @@ export async function GET(request) {
   // out after 7 days; all other types remain regardless of age. linkedin_engagement
   // ALSO ages out by the underlying post's publish date ({Post Date}); archived
   // tasks ({Archived At} set) are excluded. (2026-06-09 post-freshness gate.)
-  const POST_DATE_GATE = `NOT(AND(FIND("linkedin_engagement", {Task Type}), NOT({Post Date} = BLANK()), NOT(IS_AFTER({Post Date}, DATEADD(NOW(), -7, 'days')))))`;
+  // Per-campaign now — lib/feed-post-age.js. Default 7, so an un-listed base
+  // builds the identical string it did before. Must match /api/sidekick/feed
+  // exactly or the badge and the card stack disagree.
+  const POST_DATE_GATE = postDateGate(baseId);
   let PENDING_FILTER = `AND({Handled At} = BLANK(), {Archived At} = BLANK(), {LinkedIn URL} != BLANK(), ${POST_DATE_GATE}, OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
   // Legacy fallback for bases that haven't run setup-fix (no Post Date/Archived At).
   let LEGACY_PENDING_FILTER = `AND({Handled At} = BLANK(), {LinkedIn URL} != BLANK(), OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;

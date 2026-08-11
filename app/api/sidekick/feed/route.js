@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { postDateGate } from "@/lib/feed-post-age";
 import { fetchActiveRelevanceRules, withSuppression, roleFitScoreFor } from "@/lib/relevance-rules.js";
 
 // ═══════════════════════════════════════════════════════════════════
@@ -123,8 +124,12 @@ function formatCard(record) {
 //      handled) — aged-out post tasks get an Archived At stamp + a Signal
 //      Archive copy (surfaced in the in-app Signal Review tab) so they leave the
 //      feed but stay queryable and analytics-clean.
-const POST_DATE_GATE = `NOT(AND(FIND("linkedin_engagement", {Task Type}), NOT({Post Date} = BLANK()), NOT(IS_AFTER({Post Date}, DATEADD(NOW(), -7, 'days')))))`;
-const PENDING_FILTER = `AND({Handled At} = BLANK(), {Archived At} = BLANK(), {LinkedIn URL} != BLANK(), ${POST_DATE_GATE}, OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
+// POST_DATE_GATE is now per-campaign — see lib/feed-post-age.js. Default is
+// still 7 days, so every base except an explicitly listed one produces the
+// exact filter string it did before. Both this route and /api/sidekick/count
+// build it from the same helper; they MUST stay byte-identical or the badge
+// and the card stack disagree.
+const buildPendingFilter = (baseId) => `AND({Handled At} = BLANK(), {Archived At} = BLANK(), {LinkedIn URL} != BLANK(), ${postDateGate(baseId)}, OR(AND(NOT(FIND("engagement", {Task Type})), NOT(FIND("lead_movement", {Task Type}))), IS_AFTER({Created}, DATEADD(NOW(), -7, 'days'))))`;
 // Legacy filter (pre-2026-06-09): used as a graceful fallback for campaign bases
 // that haven't run setup-fix yet, so the new {Post Date}/{Archived At} fields
 // don't exist. Without this fallback, the new formula would 422 and take the
@@ -154,7 +159,7 @@ export async function GET(request) {
   // un-migrated bases behave EXACTLY as before (zero suppression). role_fit
   // rules don't suppress; they override the served score below.
   const relevanceRules = await fetchActiveRelevanceRules(baseId);
-  const FILTER = withSuppression(PENDING_FILTER, relevanceRules);
+  const FILTER = withSuppression(buildPendingFilter(baseId), relevanceRules);
   const LEGACY_FILTER = withSuppression(LEGACY_PENDING_FILTER, relevanceRules);
 
   // Filter (PENDING_FILTER above): pending tasks, excluding stale GA-engagement (>7d)
