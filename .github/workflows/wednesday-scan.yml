@@ -19,8 +19,25 @@
 name: wednesday-scan
 
 on:
-  schedule:
-    - cron: "0 6 * * 3"
+  # ── SCHEDULE STOPPED 2026-08-17 (Samarth) ──
+  # Material's weekly scan is run by hand now, so the automation was firing a
+  # second scan on top of the manual one every Wednesday: duplicate RapidAPI
+  # spend (one call per lead per run) and a Tasks table growing twice as fast
+  # as anyone expected.
+  #
+  # DELIBERATELY COMMENTED, NOT DELETED. This file is the only place the
+  # Material scan's arguments and its abort behaviour are written down, and
+  # turning the automation back on should be uncommenting two lines rather
+  # than reconstructing it. The manual route is unchanged: the Actions tab's
+  # "Run workflow" button below, or the Scan button in the UI.
+  #
+  # NOTE the resume tick (linkedin-posts-tick.yml, every 5 minutes) is
+  # deliberately LEFT RUNNING. It only ever continues a scan somebody already
+  # started, and without it a manually-started Material scan advances one
+  # chunk of ~22 leads and then stalls silently — the exact failure that cost
+  # six hours in June.
+  # schedule:
+  #   - cron: "0 6 * * 3"
   workflow_dispatch:
 
 concurrency:

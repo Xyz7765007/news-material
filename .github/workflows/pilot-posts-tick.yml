@@ -1,5 +1,5 @@
 # Pilot Posts Tick — resume driver for the sidekick-posts pilot testers
-# (five as of 2026-08-11: nirav, rishabh, sammy, rahul, roopam).
+# (six as of 2026-08-17: nirav, rishabh, sammy, rahul, roopam, kunal).
 #
 # WHY A SECOND TICK FILE INSTEAD OF EXTRA STEPS IN linkedin-posts-tick.yml.
 # That workflow drives Material's scan and is load-bearing for a live client.
@@ -36,19 +36,26 @@ concurrency:
 jobs:
   tick:
     runs-on: ubuntu-latest
-    # FIVE campaigns x up to 350s each, plus slack. Must exceed the SUM, not the
+    # SIX campaigns x up to 350s each, plus slack. Must exceed the SUM, not the
     # single-curl budget, or the last campaign in the matrix is the one that
     # gets cut — and it would get cut silently, looking like an idle campaign.
     # Raised 25 -> 30 when Roopam was added on 2026-08-11: 5 x 350s is ~29
     # minutes, which the old ceiling did not cover. The matrix and the budget
     # have to move together or adding a tester quietly starves the last one.
+    # Raised 30 -> 40 when Kunal was added on 2026-08-17: 6 x 350s is 35
+    # minutes, so 30 would have cut HIS tick — the last entry in the matrix,
+    # and the one that was just added to fix his coverage. Exactly the silent
+    # starvation this comment has warned about twice now.
     #
     # In practice a tick costs nowhere near this: a campaign with no scan in
     # flight returns IDLE immediately, so the bill is ~350s for the one scan
-    # actually running plus four instant no-ops. The ceiling only matters if
-    # all five ever scan at once.
+    # actually running plus five instant no-ops. The ceiling only matters if
+    # all six ever scan at once — and the cadence that now starts these scans
+    # (sidekick-feed/.github/workflows/scan-cadence.yml) holds a 48-hour floor
+    # per reader, so six simultaneous scans needs six readers to come due on
+    # the same Monday. Possible, hence the headroom.
     #
-    # WHY max-parallel STAYS 1 AT FIVE CAMPAIGNS. Running them concurrently
+    # WHY max-parallel STAYS 1 AT SIX CAMPAIGNS. Running them concurrently
     # would keep wall time flat, but the posts provider soft-rate-limits
     # parallel bulk fetching by returning empty HTTP 200 bodies rather than
     # 429s — which the scan records as "this lead has no posts" and marks done.
@@ -56,11 +63,11 @@ jobs:
     # .learnings/2026-06-22-linkedin-posts-silent-zero-fetch.md). A slower tick
     # is recoverable; a hollow scan is not.
     #
-    # If all five do end up scanning together, this job can outlast the 5-minute
+    # If all six do end up scanning together, this job can outlast the 5-minute
     # cron. That is survivable rather than a backlog: GitHub holds only ONE
     # pending run per concurrency group, so ticks get less frequent instead of
     # piling up. Onboarding testers one at a time avoids it entirely.
-    timeout-minutes: 30
+    timeout-minutes: 40
     strategy:
       max-parallel: 1
       matrix:
@@ -82,6 +89,16 @@ jobs:
           - name: roopam
             base: apppThWqVVB9PvZgE
             campaign: reclb4SapKCZHZv9f
+          # Kunal added 2026-08-17. He was the one person on sidekick-feed with
+          # NO resume coverage, so a scan started for him advanced a single
+          # chunk of ~22 leads and then stopped — indistinguishable from a scan
+          # still running. That gap matters more now that sidekick-feed's
+          # scan-cadence workflow starts these scans automatically; its tick
+          # refuses to start a scan for any campaign missing from this matrix,
+          # so this entry is what makes his cadence work at all.
+          - name: kunal
+            base: appPcAzAyMmtNNEmT
+            campaign: recV0RlBHUmrhtVq2
     steps:
       - name: Resume tick (${{ matrix.name }})
         env:
