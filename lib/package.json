@@ -1,0 +1,4 @@
+{
+  "//": "lib/ is pure ESM (`export const` / `export function`, no require anywhere). The repo root package.json has no `type`, so plain Node resolves these .js files as CommonJS and every scripts/*.mjs test dies at import with `Unexpected token 'export'` — which is why this backend had no runnable tests at all. This scoped marker makes Node agree with what the files already are. It does not touch the app: Next/webpack resolves the same field and these modules are already ESM to it, and the root stays CommonJS so next.config.js / postcss.config.js / tailwind.config.js keep working. Same pattern, same reason, as sidekick-feed/lib/package.json.",
+  "type": "module"
+}

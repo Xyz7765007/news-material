@@ -1248,6 +1248,14 @@ async function runLinkedInPostScan({
   // a missing table, so a base that has not run setup-fix scores exactly as it
   // does today rather than failing.
   let operatorFeedback = "";
+  // Held here and applied to progress.last_log AFTER `progress` exists (it is
+  // declared ~130 lines below). Writing to `progress` from inside this block
+  // threw a temporal-dead-zone ReferenceError that the catch below swallowed,
+  // so the ONE case where the notes loaded successfully was reported as
+  // "Operator feedback load failed" — the exact opposite of the truth, and a
+  // false lead for anyone triaging why a scan ignored feedback. The notes
+  // themselves were always fine: operatorFeedback is assigned before the throw.
+  let operatorFeedbackNote = "";
   try {
     const [leadNotes, skipNotes] = await Promise.all([
       fetchPreferences(baseId, "task_feedback", 12),
@@ -1264,7 +1272,7 @@ async function runLinkedInPostScan({
     }
     operatorFeedback = lines.join("\n").slice(0, 3000);
     if (operatorFeedback) {
-      progress.last_log = `Loaded ${lines.length} operator feedback note(s) into scoring.`;
+      operatorFeedbackNote = `Loaded ${lines.length} operator feedback note(s) into scoring.`;
     }
   } catch (e) {
     console.warn(`[linkedin-posts] Operator feedback load failed (scoring continues): ${e.message}`);
@@ -1429,6 +1437,10 @@ async function runLinkedInPostScan({
     original_lead_ids: resume ? (prior?.original_lead_ids || null) : (leadIds || null),
     last_log: "Scan started",
   };
+  // Now that `progress` exists, surface the operator-feedback load (see the
+  // note where operatorFeedbackNote is declared). Empty string = nothing was
+  // loaded, so "Scan started" stands exactly as it did before.
+  if (operatorFeedbackNote) progress.last_log = operatorFeedbackNote;
   await writeProgress(campaignAirtableId, progress);
 
   if (leads.length === 0) {
@@ -1617,7 +1629,19 @@ async function runLinkedInPostScan({
       await writeProgress(campaignAirtableId, progress);
 
       const scored = await scorePost({
-        post, lead, campaignContext, effectivePrompt,
+        // NAMED EXPLICITLY, and it must stay that way. Between 2026-08-07 and
+        // 2026-08-18 this read `effectivePrompt` as a shorthand property, so
+        // the object carried a key scorePost does not destructure and the
+        // parameter it DOES destructure (systemPromptOverride) arrived
+        // undefined. Every scan silently fell back to the built-in default
+        // prompt: the admin UI's Custom Prompt was accepted and ignored, the
+        // per-tenant bar set by {action:"set_scoring_config"} was ignored, and
+        // `Scoring Isolated` — whose whole job is to refuse to score a tenant
+        // against somebody else's criteria — passed its check and then scored
+        // them against exactly that. Nothing failed loudly; progress even
+        // recorded system_prompt_override as if it had been used.
+        post, lead, campaignContext,
+        systemPromptOverride: effectivePrompt,
         categoryHint: cat.category,
         campaignId: campaignAirtableId,
         reviewerFeedback,

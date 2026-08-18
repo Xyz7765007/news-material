@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "test": "node scripts/test-lib-modules.mjs && node scripts/test-relevance-rules.mjs && node scripts/test-feed-post-age.mjs && node scripts/test-lead-fields.mjs && node scripts/test-route-contracts.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",
