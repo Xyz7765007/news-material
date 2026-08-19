@@ -385,6 +385,35 @@ async function getUrnForLead(lead, baseId) {
   return { urn, username };
 }
 
+// Defensively pull a human-usable summary out of the provider's raw profile
+// payload (get_profile action). The provider nests under data / data.profile
+// depending on endpoint version and renames fields across schema revisions
+// (same reality as extractCount below), so every field checks a candidate
+// list — mirroring lib/linkedin-fetch.js's normalizeProfile candidates — and
+// nulls out when nothing matches. Callers always get the raw payload
+// alongside, so a missing summary field is inspectable, never silent.
+function extractProfileSummary(raw) {
+  const p = raw?.data?.profile || raw?.data || raw?.profile || raw || {};
+  const str = (v) => (typeof v === "string" && v.trim() ? v.trim() : null);
+  const name = str(p.full_name) || str(p.fullName) || str(p.name)
+    || str([str(p.first_name || p.firstName), str(p.last_name || p.lastName)].filter(Boolean).join(" "));
+  const headline = str(p.headline) || str(p.sub_title) || str(p.subTitle) || str(p.occupation);
+  // Current role: prefer an explicitly-current experience entry, then the
+  // first experience, then the provider's flat fields.
+  const expRaw = Array.isArray(p.experiences) ? p.experiences
+    : Array.isArray(p.experience) ? p.experience
+    : Array.isArray(p.positions) ? p.positions : [];
+  const currentExp = expRaw.find(e => e && (e.is_current === true || e.isCurrent === true)) || expRaw[0] || null;
+  const currentTitle = str(currentExp?.title) || str(currentExp?.position) || str(currentExp?.job_title)
+    || str(p.job_title) || str(p.position) || str(p.title);
+  const currentCompany = str(currentExp?.company) || str(currentExp?.company_name) || str(currentExp?.companyName)
+    || str(p.company) || str(p.company_name)
+    || str(p.current_company?.name) || str(typeof p.current_company === "string" ? p.current_company : null);
+  const location = str(p.location) || str(p.location_name) || str(p.geo_location) || str(p.geoLocation)
+    || str([str(p.city), str(p.country)].filter(Boolean).join(", "));
+  return { name, headline, currentTitle, currentCompany, location };
+}
+
 // Extract an engagement count (likes/comments/reposts) from a provider post
 // object. Field names vary across the RapidAPI schema, so we check a wide set
 // of candidates incl. nested social-count objects. Returns an INTEGER when a
@@ -2516,6 +2545,65 @@ export async function POST(request) {
           }
         } catch {}
         return NextResponse.json({ ok: true, urn, cached, posts, raw_first_post_keys, raw_first_post_preview, raw_first_post_activity, raw_first_post_content_keys, raw_first_post_social });
+      }
+
+      case "get_profile": {
+        // Fetch a lead's CURRENT LinkedIn profile (name / headline / current
+        // role / company) — added 2026-08-20 for the P&G lead-movement
+        // role-verification work. test_profile hits the same endpoint but
+        // discards everything except the URN; this returns the raw provider
+        // payload plus a defensively-extracted summary. Strictly read-only:
+        // no AI call, no Tasks written, no Airtable writes of its own — the
+        // only write is getUrnForLead's existing sanctioned URN-cache write.
+        // The profile fetch goes through rapidCall so the per-route cost row
+        // (rapidapi_user_profile) is logged exactly like every other call.
+        // Accepts { baseId, leadId } OR { username } OR { urn }.
+        const { baseId, leadId, urn: rawUrn, username: rawUsername } = body;
+        let username = typeof rawUsername === "string" && rawUsername.trim() ? rawUsername.trim() : null;
+        let urn = rawUrn || null;
+        let cached = false;
+        let resolvedLeadId = null;
+
+        if (!username && !urn) {
+          if (!baseId || !leadId) return NextResponse.json({ error: "Provide { username }, { urn }, or { baseId, leadId }" }, { status: 400 });
+          const lead = await atGet(baseId, "Leads", leadId);
+          if (!lead) return NextResponse.json({ error: "Lead not found" }, { status: 404 });
+          resolvedLeadId = leadId;
+          const f = lead.fields || {};
+          // Same URL fields + username parsing getUrnForLead relies on.
+          username = extractLinkedInUsername(f["LinkedIn URL"] || f["Linkedin URL"] || "");
+          // Reuse getUrnForLead for the URN: a cache hit costs nothing; a miss
+          // resolves + performs its existing cache write so the next scan
+          // skips a call. (On a miss this means one extra profile call — the
+          // accepted price of reusing the helper over duplicating its
+          // urn-parse + cache-write logic here.)
+          const urnResult = await getUrnForLead(lead, baseId);
+          if (!urnResult.error) { urn = urnResult.urn; cached = !!urnResult.cached; }
+          if (!username && !urn) return NextResponse.json({ ok: false, error: urnResult.error || "Lead has no usable LinkedIn URL" });
+        }
+
+        // The provider keys profiles on username; a bare { urn } input is
+        // passed through best-effort (if the provider rejects it, its error
+        // comes back verbatim in the standard { ok:false, error } shape).
+        const pr = await rapidCall("/api/v1/user/profile", username ? { username } : { urn });
+        if (!pr.ok) return NextResponse.json({ ok: false, error: `Profile fetch failed (${pr.status}): ${pr.error}` });
+
+        // Surface the URN when the profile response carries one and we don't
+        // already have it (username path) — same shape list as getUrnForLead.
+        if (!urn) {
+          urn = pr.data?.data?.urn || pr.data?.data?.profile_urn || pr.data?.data?.entity_urn
+            || pr.data?.urn || pr.data?.profile_urn || pr.data?.entity_urn
+            || pr.data?.data?.profile?.urn || null;
+        }
+
+        return NextResponse.json({
+          ok: true,
+          ...(resolvedLeadId ? { leadId: resolvedLeadId } : {}),
+          urn: urn || null,
+          cached,
+          profile: pr.data,
+          extracted: extractProfileSummary(pr.data),
+        });
       }
 
       default:

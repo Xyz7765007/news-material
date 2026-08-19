@@ -368,6 +368,52 @@ check(
   true
 );
 
+// ═══════════════════════════════════════════════════════════════════
+// 5. THE get_profile ACTION CONTRACT (added 2026-08-20)
+//
+// get_profile exists so the P&G lead-movement work can verify a lead's
+// CURRENT role — it must stay a read-only lookup. Pinned here: the case
+// exists, a call with no identifiers is a 400 (not a provider call with
+// undefined params), the profile fetch flows through rapidCall (which is
+// where the rapidapi_user_profile cost row is logged — a raw fetch would
+// silently drop the call from the cost model), and the case performs no AI
+// call and no Airtable write of its own (the sole sanctioned write lives
+// inside getUrnForLead). The default case must keep 400-ing unknown actions,
+// or a typo'd action name starts looking like a success.
+// ═══════════════════════════════════════════════════════════════════
+
+const gpAt = scanSrc.indexOf('case "get_profile":');
+check("the linkedin-posts route has a get_profile action", gpAt !== -1, true);
+
+const gpBlock = gpAt === -1 ? "" : scanSrc.slice(gpAt, scanSrc.indexOf("default:", gpAt));
+const gpStripped = stripComments(gpBlock);
+
+check(
+  "get_profile with no identifiers returns a 400",
+  /Provide \{ username \}, \{ urn \}, or \{ baseId, leadId \}[^\n]*status: 400/.test(gpStripped),
+  true
+);
+check(
+  "get_profile fetches the profile through rapidCall (cost-logged), not a raw fetch",
+  /await rapidCall\("\/api\/v1\/user\/profile"/.test(gpStripped) && !/\bfetch\(/.test(gpStripped),
+  true
+);
+check(
+  "get_profile makes no AI call and no Airtable write of its own",
+  /chat\.completions|openaiChat|atCreateBatch\(|atUpdate\(|atUpdateWithAutoCreate\(|method: "PATCH"|method: "POST"/.test(gpStripped),
+  false
+);
+check(
+  "get_profile returns the raw provider payload alongside the extracted summary",
+  /profile: pr\.data/.test(gpStripped) && /extracted: extractProfileSummary\(/.test(gpStripped),
+  true
+);
+check(
+  "an unknown action still returns a 400",
+  /default:\s*return NextResponse\.json\(\{ error: `Unknown action: \$\{action\}` \}, \{ status: 400 \}\);/.test(scanSrc.replace(/\s+/g, " ")),
+  true
+);
+
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) {
   for (const f of failures) console.log("  " + f);
