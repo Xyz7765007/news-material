@@ -1195,6 +1195,25 @@ async function runLinkedInPostScan({
   // OPT-IN per-scan relaxation of the category gates. Omitted = untouched
   // defaults for every existing campaign. See buildCategoryPolicy.
   categoryOverrides = null,
+  // ─── DORMANT-LEAD THROTTLE — OPT-IN, OFF FOR EVERY EXISTING CALLER ───
+  // A number of days, or null. Null/omitted means the scan behaves EXACTLY as
+  // it always has: every lead is fetched on every run.
+  //
+  // WHY IT EXISTS. Measured over 30 days: 26,932 RapidAPI calls produced 824
+  // scored posts. Roughly 97% of the money bought nothing, because most leads
+  // simply do not post, and we re-asked every one of them on every scan.
+  // RapidAPI is 96% of the entire bill.
+  //
+  // WHY IT IS OPT-IN RATHER THAN THE NEW DEFAULT. This scan serves BOTH the
+  // feed app and live client signal work (Material, Veloka, Osome), and those
+  // two want opposite things. A client signal run must keep sweeping every
+  // lead — a missed signal is the product failing. The feed app is a
+  // personalised reader where one lead's silent week costs nothing. Same
+  // engine, same bases (Kunal's feed base IS the Veloka client base), so the
+  // ONLY safe way to separate them is at the caller: sidekick-feed's cadence
+  // passes this, and nothing else does. Same shape and same reasoning as
+  // `categoryOverrides` above.
+  dormantSkipDays = null,
   resume = false, // if true, skip leads that already appear in progress.completed
   timeBudgetMs = 270_000, // 270s default for UI runs; cron passes 25_000 for fast returns
 }) {
@@ -1327,6 +1346,20 @@ async function runLinkedInPostScan({
   // deliberately not reassigned so the distinction stays visible while reading.
   const cutoffMs = Date.now() - (effectiveDaysBack * 24 * 60 * 60 * 1000);
 
+  // ─── Dormant throttle: resolve once, and only from an explicit number ───
+  // A resume re-supplies it from persisted progress (below) for the same reason
+  // the prompt and the category policy are re-supplied: a policy that applied
+  // only to the first chunk would produce one run scanned under two different
+  // rules, with nothing on screen saying so.
+  const LEAD_DORMANT_FIELD = "Last Empty Fetch At";
+  const effectiveDormantDays =
+    Number.isFinite(Number(dormantSkipDays)) && Number(dormantSkipDays) > 0
+      ? Number(dormantSkipDays)
+      : null;
+  const dormantCutoffMs = effectiveDormantDays
+    ? Date.now() - effectiveDormantDays * 86400000
+    : null;
+
   // Note: old-task cleanup is handled at the handler level (see the "scan" case in POST),
   // not here. If autoCleanupDays was passed, stale tasks have already been deleted before
   // this function was called, so the existingTaskUrls dedupe set below will naturally reflect
@@ -1430,6 +1463,11 @@ async function runLinkedInPostScan({
     // tick calls back in with only what progress remembers. Null for every scan
     // that did not pass one, which is every existing campaign.
     category_overrides: catPolicy.active ? categoryOverrides : null,
+    // Persisted for the same reason as the prompt, the threshold and the
+    // category policy: the resume tick calls back in with only what progress
+    // remembers, so without this a run would start under the dormant throttle
+    // and silently finish without it. Null for every scan that did not pass one.
+    dormant_skip_days: effectiveDormantDays,
     // Persist the scan's lead scope. On a FRESH scan (resume=false) use THIS run's leadIds —
     // a new scoped run must NOT inherit a previous completed scan's scope (that hijacks it back
     // onto the old lead set). On resume, preserve the original scope so cron-triggered resumes
@@ -1517,6 +1555,33 @@ async function runLinkedInPostScan({
     const leadName = f.Name || f["Full Name"] || "Unknown";
     const leadCompany = f.Company || "";
 
+    // ─── DORMANT SKIP ───────────────────────────────────────────────────
+    // Placed BEFORE the URN lookup and the posts fetch, because those two are
+    // the only things in this loop that cost money. A lead that came back
+    // empty inside the window is not asked again yet.
+    //
+    // The marker is only ever WRITTEN under this policy too, so a base that has
+    // never run a feed scan carries no such field and behaves exactly as before.
+    // Note the asymmetry that makes this safe to get wrong in one direction: a
+    // stale marker costs one week of not seeing a lead's post, while skipping
+    // the check costs money on every run. Missing the check is the expensive
+    // failure, so the guard is deliberately conservative — no marker, or an
+    // unparseable one, means FETCH.
+    if (dormantCutoffMs) {
+      const lastEmptyRaw = f[LEAD_DORMANT_FIELD];
+      const lastEmptyMs = lastEmptyRaw ? new Date(lastEmptyRaw).getTime() : NaN;
+      if (Number.isFinite(lastEmptyMs) && lastEmptyMs > dormantCutoffMs) {
+        const ageDays = Math.floor((Date.now() - lastEmptyMs) / 86400000);
+        progress.dormant_skipped = (progress.dormant_skipped || 0) + 1;
+        progress.last_log = `[${i + 1}/${leads.length}] ${leadName}: skipped, no posts ${ageDays}d ago (dormant, re-checked every ${effectiveDormantDays}d)`;
+        progress.completed_lead_ids.push(lead.id);
+        progress.leads_done++;
+        progress.leads_remaining--;
+        await writeProgress(campaignAirtableId, progress);
+        continue;
+      }
+    }
+
     progress.current_lead = `${leadName}${leadCompany ? " @ " + leadCompany : ""}`;
     progress.current_lead_step = "fetching_urn";
     progress.last_log = `[${i + 1}/${leads.length}] Fetching profile for ${leadName}...`;
@@ -1584,12 +1649,34 @@ async function runLinkedInPostScan({
       const reason = postsResult.undatableCount
         ? `${postsResult.rawReturnedCount} posts returned, ${postsResult.undatableCount} had no parseable date, others older than ${effectiveDaysBack} days`
         : `no posts in last ${effectiveDaysBack} days`;
+      // Stamp the dormancy marker so the next run inside the window can skip
+      // this lead. Only under the policy — a client signal run must never start
+      // writing per-lead state into a client's Leads table as a side effect.
+      // Best-effort: a failed stamp costs one un-skipped fetch next time, which
+      // is the status quo, so it must never interrupt the scan.
+      if (dormantCutoffMs) {
+        try {
+          await atUpdateWithAutoCreate(baseId, "Leads", lead.id, {
+            [LEAD_DORMANT_FIELD]: new Date().toISOString(),
+          });
+        } catch { /* non-fatal by design — see above */ }
+      }
       progress.last_log = `[${i + 1}/${leads.length}] ${leadName}: ${reason}`;
       progress.completed_lead_ids.push(lead.id);
       progress.leads_done++;
       progress.leads_remaining--;
       await writeProgress(campaignAirtableId, progress);
       continue;
+    }
+
+    // This lead posted, so it is not dormant. Clear any marker it still carries,
+    // or a lead that went quiet once and then came back would keep being skipped
+    // for a week after every single silent run. Only written when a marker is
+    // actually present, so an active lead costs no extra Airtable write at all.
+    if (dormantCutoffMs && f[LEAD_DORMANT_FIELD]) {
+      try {
+        await atUpdateWithAutoCreate(baseId, "Leads", lead.id, { [LEAD_DORMANT_FIELD]: "" });
+      } catch { /* non-fatal — a stale marker only delays this lead by the window */ }
     }
 
     // Step 3: Pre-filter with expanded Apps-Script rules + score the survivors
@@ -2311,7 +2398,7 @@ export async function POST(request) {
         // Kick off a scan. This is a long-running op (can take several minutes for large campaigns).
         // Vercel has a 60s limit on Hobby, 300s on Pro — so we process as much as we can within the
         // budget, leaving progress state. User hits "resume" to continue.
-        const { baseId, campaignAirtableId, leadIds, scoreThreshold, daysBack, taskRuleName, systemPromptOverride, categoryOverrides, resume, force, autoCleanupDays, autoCleanupExcludePushed } = body;
+        const { baseId, campaignAirtableId, leadIds, scoreThreshold, daysBack, taskRuleName, systemPromptOverride, categoryOverrides, dormantSkipDays, resume, force, autoCleanupDays, autoCleanupExcludePushed } = body;
         if (!baseId) return NextResponse.json({ error: "baseId required" }, { status: 400 });
         if (!campaignAirtableId) return NextResponse.json({ error: "campaignAirtableId required" }, { status: 400 });
         if (!OPENAI_KEY) return NextResponse.json({ error: "OPENAI_API_KEY not set" }, { status: 400 });
@@ -2369,6 +2456,9 @@ export async function POST(request) {
           taskRuleName: taskRuleName || "LinkedIn Post Engagement",
           systemPromptOverride,
           categoryOverrides: categoryOverrides || null,
+          // Opt-in dormant throttle. Only sidekick-feed's cadence sends this;
+          // every client signal caller omits it and keeps sweeping every lead.
+          dormantSkipDays: typeof dormantSkipDays === "number" ? dormantSkipDays : null,
           resume: !!resume,
         });
         if (cleanedUp > 0) result.auto_cleaned_up = cleanedUp;
@@ -2537,6 +2627,9 @@ export async function GET(request) {
     // Carry the category policy across the resume boundary. Without this the
     // tick would silently revert to the shared defaults partway through a scan.
     const categoryOverrides = prior.category_overrides || null;
+    // Same rehydration, same reason: without it a throttled run would quietly
+    // revert to fetching every lead from the second chunk onward.
+    const dormantSkipDays = typeof prior.dormant_skip_days === "number" ? prior.dormant_skip_days : null;
 
     // Use a SHORT time budget (25s) when called from cron so cron-job.org's 30s HTTP
     // timeout doesn't register as "Failed" on every tick. Processes ~3 leads per call.
@@ -2550,6 +2643,7 @@ export async function GET(request) {
       taskRuleName: ruleName,
       systemPromptOverride: prior.system_prompt_override || null,
       categoryOverrides,
+      dormantSkipDays,
       resume: true,
       timeBudgetMs: 25_000,
     });

@@ -317,6 +317,57 @@ check("the scan route keeps its connector kill-switch on the scan action", /LINK
 check("the cron GET is key-gated", /if \(key !== CRON_SECRET\)/.test(scanSrc), true);
 check("the cron GET refuses to run when CRON_SECRET is unset", /if \(!CRON_SECRET\) return/.test(scanSrc), true);
 
+// ═══════════════════════════════════════════════════════════════════
+// 4. THE DORMANT THROTTLE IS OPT-IN, AND STAYS OPT-IN
+//
+// The scan engine serves BOTH the feed app and live client signal work
+// (Material, Veloka, Osome) against the same bases — Kunal's feed base IS the
+// Veloka client base. The feed may skip a lead that has not posted recently; a
+// client signal run may not, because there a missed signal is the product
+// failing.
+//
+// The entire boundary is that this parameter DEFAULTS TO NULL and is honoured
+// only when a caller passes a positive number. If that default ever flips, the
+// throttle silently starts applying to client scans, and nobody learns it from
+// an error — they learn it from a signal that never arrived. So it is asserted
+// directly rather than assumed.
+// ═══════════════════════════════════════════════════════════════════
+
+check("dormantSkipDays defaults to null in the scan signature", /dormantSkipDays = null/.test(scanSrc), true);
+check(
+  "it is honoured only as a positive finite number",
+  /Number\.isFinite\(Number\(dormantSkipDays\)\) && Number\(dormantSkipDays\) > 0/.test(scanSrc),
+  true
+);
+check("no policy means no cutoff, so the skip can never run", /const dormantCutoffMs =\s*effectiveDormantDays/.test(scanSrc), true);
+
+// Read, stamp and clear must EACH sit behind the policy gate, or a client run
+// would start reading or writing per-lead state as a side effect.
+check("the skip is gated on the policy", /if \(dormantCutoffMs\) \{[\s\S]{0,500}?lastEmptyRaw/.test(scanSrc), true);
+check(
+  "the stamp is gated on the policy",
+  /if \(dormantCutoffMs\) \{[\s\S]{0,400}?atUpdateWithAutoCreate\(baseId, "Leads"/.test(scanSrc),
+  true
+);
+check(
+  "the clear is gated on the policy AND on a marker already being present",
+  /if \(dormantCutoffMs && f\[LEAD_DORMANT_FIELD\]\)/.test(scanSrc),
+  true
+);
+
+check("the policy is persisted so a resume keeps it", /dormant_skip_days: effectiveDormantDays/.test(scanSrc), true);
+check("the cron resume rehydrates it", /prior\.dormant_skip_days/.test(scanSrc), true);
+check("the POST handler accepts it from the body", /categoryOverrides, dormantSkipDays, resume/.test(scanSrc), true);
+check("skips are counted so the saving is visible in progress", /progress\.dormant_skipped/.test(scanSrc), true);
+
+// A skipped lead must still advance the run, or a throttled scan never finishes
+// and the resume tick loops on it for ever.
+check(
+  "a skipped lead is marked done and the run advances past it",
+  /dormant_skipped[\s\S]{0,700}?completed_lead_ids\.push\(lead\.id\)[\s\S]{0,150}?leads_done\+\+/.test(scanSrc),
+  true
+);
+
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) {
   for (const f of failures) console.log("  " + f);
