@@ -1449,6 +1449,26 @@ async function runLinkedInPostScan({
     console.log(`[linkedin-posts] Resume: skipping ${completedLeadIds.size} already-processed leads, ${leads.length} remaining`);
   }
 
+  // ─── WHAT CARRIES ACROSS A RESUME, AND WHAT MUST NOT ────────────────
+  // Every counter below used to seed from `prior` UNCONDITIONALLY, while
+  // `leads_done` reset to the completed-set size. On a resume that is right and
+  // necessary. On a FRESH scan it made the two halves of the same record
+  // disagree: leads_done said 0 and tasks_created said 10.
+  //
+  // WHAT IT COST (measured 2026-08-19, and it is why this run under-delivered).
+  // sidekick-feed's cadence stops a run once `tasks_created` reaches its
+  // per-run cap. Because that number was a lifetime total, a reader whose
+  // PREVIOUS run ended at the cap started the next one already over it. Kunal
+  // began at 10, produced ONE new post, and was stopped after 22 of his 4,973
+  // leads. Roopam began at 10 and stopped after 33 of 145. The cap silently
+  // became "this reader is finished for ever" rather than "enough for today",
+  // and raising the cap would not have fixed it — the counter would just start
+  // above the higher number instead.
+  //
+  // So: on resume, carry everything (that is the whole point of resuming). On a
+  // fresh scan, start clean, exactly as leads_done already did.
+  const carried = resume ? (prior || {}) : {};
+
   // Initialize progress
   const progress = {
     phase: "starting",
@@ -1460,14 +1480,14 @@ async function runLinkedInPostScan({
     leads_remaining: leads.length,
     current_lead: null,
     current_lead_step: null,
-    posts_fetched: prior?.posts_fetched || 0,
-    posts_scored: prior?.posts_scored || 0,
-    posts_filtered_out: prior?.posts_filtered_out || 0,
-    posts_deduped: prior?.posts_deduped || 0,
-    tasks_created: prior?.tasks_created || 0,
-    consecutive_empty_raw: prior?.consecutive_empty_raw || 0,
-    rate_limited_lead_ids: prior?.rate_limited_lead_ids || [],
-    errors: prior?.errors || [],
+    posts_fetched: carried.posts_fetched || 0,
+    posts_scored: carried.posts_scored || 0,
+    posts_filtered_out: carried.posts_filtered_out || 0,
+    posts_deduped: carried.posts_deduped || 0,
+    tasks_created: carried.tasks_created || 0,
+    consecutive_empty_raw: carried.consecutive_empty_raw || 0,
+    rate_limited_lead_ids: carried.rate_limited_lead_ids || [],
+    errors: carried.errors || [],
     // Seeded from prior like every other counter above. These two were NOT, and
     // because `rejection_reasons` is later assigned wholesale
     // (`progress.rejection_reasons = rejectionReasons`) rather than merged, each
@@ -1480,8 +1500,8 @@ async function runLinkedInPostScan({
     // zero rejections — an impossible pair that only makes sense as data loss.)
     // recent_samples stays capped at 20 by the existing slice, so seeding it
     // cannot grow unbounded.
-    rejection_reasons: prior?.rejection_reasons || {},
-    recent_samples: prior?.recent_samples || [],
+    rejection_reasons: carried.rejection_reasons || {},
+    recent_samples: carried.recent_samples || [],
     completed_lead_ids: Array.from(completedLeadIds),
     // Scan config persisted so external cron resume knows how to call runLinkedInPostScan
     score_threshold: effectiveThreshold,

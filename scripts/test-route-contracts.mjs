@@ -414,6 +414,29 @@ check(
   true
 );
 
+// ═══════════════════════════════════════════════════════════════════
+// 5. A FRESH SCAN STARTS FROM ZERO
+//
+// The per-run counters used to seed from the previous run's progress even on a
+// fresh scan, while `leads_done` reset. sidekick-feed's cadence stops a run
+// when `tasks_created` reaches its per-run cap, so a lifetime counter meant a
+// reader whose last run ended at the cap began the next one already over it:
+// Kunal produced ONE post and was stopped after 22 of 4,973 leads. Raising the
+// cap does not fix that — the counter simply starts above the higher number.
+// ═══════════════════════════════════════════════════════════════════
+
+check("a resume-gated carry object exists", /const carried = resume \? \(prior \|\| \{\}\) : \{\};/.test(scanSrc), true);
+for (const field of [
+  "posts_fetched", "posts_scored", "posts_filtered_out", "posts_deduped",
+  "tasks_created", "consecutive_empty_raw", "rate_limited_lead_ids",
+  "errors", "rejection_reasons", "recent_samples",
+]) {
+  check(`${field} carries only on a resume`, new RegExp(`${field}: carried\\.${field}`).test(scanSrc), true);
+  check(`${field} no longer seeds unconditionally from prior`, new RegExp(`${field}: prior\\?\\.${field}`).test(scanSrc), false);
+}
+// leads_done was always right; it is the reference the others now match.
+check("leads_done still derives from the completed set", /leads_done: completedLeadIds\.size/.test(scanSrc), true);
+
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) {
   for (const f of failures) console.log("  " + f);
